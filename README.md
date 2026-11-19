@@ -1,76 +1,134 @@
-# `@shinick/notion` (`notion` / `nt`)
+<div align="center">
 
-Notion-native Terminal UI, CLI, local HTTP API (`:8791`), and stdio MCP server (18 tools) built in Rust.
+# `@shinick/notion`
+
+**Notion-native terminal workspace & AI agent toolkit — Editorial Pages, Interactive Blocks, Databases (Table/Board/List), CLI · TUI · HTTP API · MCP.**
+
+[![npm version](https://img.shields.io/npm/v/%40shinick%2Fnotion?style=flat-square&color=191919)](https://www.npmjs.com/package/@shinick/notion)
+[![platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-24292F?style=flat-square)](docs/NPM.md)
+[![Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-DEA584?style=flat-square&logo=rust)](Cargo.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-00875A?style=flat-square)](package.json)
+
+<br />
+
+![Notion TUI Demo](assets/demo.gif)
+
+</div>
+
+---
 
 ## Highlights
 
-- **Notion-Native Terminal UI (`notion` / `nt`)**:
-  - Minimal 1-line top Breadcrumb Bar (`Workspace ▾ / Parent / 📄 Page`) with `[Width: Centered|Full]`, `[Sync]`, `[? Help]`
-  - Collapsible Workspace Sidebar (`[` / `Ctrl+B`): **Favorites** (`★`), hierarchical collapsible **Workspace Tree** (`▸`/`▾`, `📄`, `🗂`), **Databases**, and **Recent / Trash**
-  - **Editorial Page Canvas**: centered ~88-column measure by default (`w` toggles Full Width), properties strip with Notion's 10 canonical pill colors, live interactive `to_do` checkboxes (`Space`/`x` -> `PATCH /v1/blocks/{id}`), live expandable `toggle` blocks (`Enter`/`Space`), left-accented tinted Callouts, bordered Code Blocks (`y` copies code), aligned Unicode Tables, inline terminal graphics (Kitty / iTerm2 / Sixel / Halfblock) + `v`/`Alt+V` HD preview, and right-split **Comments Peek Drawer** (`C`)
-  - **Database Views**: switch live between **`1 Table`**, **`2 Board` (Kanban)** with `h`/`l` columns & `m` card moves, and **`3 List`**, plus `f` Filter, `s` Sort, and `n` New Item
-  - **Global Overlays**: `Ctrl+K`/`Ctrl+P` Quick Find & Command Palette, `Ctrl+S` Multi-Workspace Switcher, `Ctrl+,` Settings (5 curated palettes: Clean Dark, Warm Paper, Tokyo Night, Catppuccin, Nord), `Ctrl+F` File Picker with `z` zoxide jump, `u` Link Extractor, `.` Context Menu, `?` Help
-- **Dual Authentication & Multi-Workspace**:
-  - Internal Integration Token (`notion login --token ntn_...` or `NOTION_TOKEN`), validated via `GET /v1/users/me`
-  - Public OAuth 2.0 loopback (`notion login --oauth --client-id <id> --client-secret <secret>`)
-  - OS Keyring storage (`notion-cli`) with `0600` file fallback + `notion workspaces list|use|add|remove`
-- **Local SQLite WAL + FTS5 Cache**:
-  - Workspace-scoped `pages`, `databases`, `blocks`, `comments`, and `pages_fts` with automatic **Korean `<3` char `LIKE` fallback**
-  - Optional single-instance background sync IPC daemon (`notion daemon start|status|stop|restart`)
-- **AI Agent Ready**:
-  - Local HTTP JSON API (`notion serve`, default `127.0.0.1:8791`)
-  - Stdio JSON-RPC 2.0 MCP server (`notion mcp`, 18 tools)
+| Pillar | Capabilities |
+| :--- | :--- |
+| **Minimal-Chrome TUI** | Authentic Notion editorial aesthetic (`notion` / `nt`): 1-line **Breadcrumb Bar**, collapsible **Workspace Sidebar (`[`)** with Favorites & nested tree, **Centered (~88 col) / Full Width (`w`) Page Canvas**, 10 canonical Notion pill colors, live interactive **`to_do` checkboxes (`Space`/`x`)** & **`toggle` blocks**, **Database Table (`1`) / Board Kanban (`2`) / List (`3`) views**, **Comments Peek Drawer (`C`)**, **Quick Find (`Ctrl+K`)**, **Multi-Workspace Switcher (`Ctrl+S`)**, and **5 curated palettes** (`Clean Dark`, `Warm Paper`, `Tokyo Night`, `Catppuccin`, `Nord`). |
+| **High-Res Terminal Images** | Native inline image previews for Notion-hosted & external media via **Kitty Graphics**, **iTerm2**, **Sixel**, and **24-bit Truecolor Half-Block (`▀`)** fallback (`v` HD modal & `notion download`). |
+| **Local SQLite FTS5 + IPC Daemon** | Workspace-scoped SQLite WAL + FTS5 cache (`pages`, `databases`, `blocks`, `comments`, `pages_fts`) with automatic `<3`-char Korean/CJK `LIKE` fallback, plus single-instance background sync IPC daemon (`notion daemon start`). |
+| **4-in-1 Agent Interface** | Same binary powers the **Interactive TUI**, scriptable **`--json` CLI**, local **HTTP JSON API** (`notion serve`, `:8791`), and **stdio MCP server** (`notion mcp`, **18 typed tools** with `confirm: true` archive guard). |
 
-## Install
-
-```bash
-npm install -g @shinick/notion
-```
-
-Both `notion` and `nt` commands are installed and linked directly to the native prebuilt Rust binary on Windows (`x64`/`arm64`), macOS (`arm64`/`x64`), and Linux (`x64`/`arm64`, GLIBC <= 2.28).
+---
 
 ## Quick Start
 
 ```bash
-# 1. Authenticate with an Internal Integration Token (30-second setup)
+# 1. Install globally (links `notion` and `nt` native binaries)
+npm i -g @shinick/notion
+
+# 2. Authenticate — Internal Integration Token (30-second setup) or Public OAuth 2.0
 notion login --token ntn_...
+# Or Public OAuth 2.0 loopback:
+notion login --oauth --client-id "$NOTION_CLIENT_ID" --client-secret "$NOTION_CLIENT_SECRET"
 
-# Or authenticate with Public OAuth 2.0
-notion login --oauth --client-id <id> --client-secret <secret>
-
-# 2. Sync your workspace into SQLite WAL + FTS5
+# 3. Sync your workspace & launch the Notion-native TUI
 notion sync
+notion        # alias: nt
+```
 
-# 3. Launch the Notion-Native Terminal UI
-notion      # or: nt
+---
 
-# 4. Use the CLI
-notion search "Roadmap" --json
+## Keybindings Cheat Sheet
+
+| Key | Action | Context |
+| :--- | :--- | :--- |
+| `[` / `Ctrl+B` | Toggle collapsible Workspace Sidebar | Global |
+| `Tab` / `Shift+Tab` | Cycle focus across Sidebar, Canvas, and Comments Drawer | Global |
+| `j` `k` / `↑` `↓` | Move across sidebar tree, page blocks, or database rows | Global |
+| `Space` / `x` | Check/uncheck live `to_do` block or expand/collapse `toggle` block | Page Canvas |
+| `w` / `f` / `y` | Toggle Centered vs Full Width / Favorite star / Copy code block | Page Canvas |
+| `a` / `n` / `e` | Slash Quick Append (`/h1`, `/todo`, `/callout`) / New Page / `$EDITOR` | Page / Database |
+| `C` | Toggle right-split Comments Peek Drawer & reply inline | Page Canvas |
+| `1` / `2` / `3` | Switch Database views: **Table** / **Board (Kanban)** / **List** | Database |
+| `f` / `s` / `m` | Filter rows / Cycle sort / Move Kanban card to another Status column | Database |
+| `Ctrl+K` / `Ctrl+P` | Quick Find & Command Palette (FTS5 search + workspace commands) | Global |
+| `u` / `Ctrl+F` / `v` | Link Extractor / File Picker (`z` zoxide) / HD Image Preview | Global |
+| `Ctrl+S` / `Ctrl+,` / `?` | Switch Workspace / Settings & Palettes / Keyboard Shortcuts Help | Global |
+
+---
+
+## CLI, HTTP API & MCP
+
+### CLI (`--json` ready)
+
+```bash
+# Search, read, append & export Notion pages
+notion search "Q4 Roadmap" --json
 notion pages list --json
-notion pages get "Product Roadmap"
-notion pages append "Product Roadmap" "/todo Ship v0.1.0"
-notion pages export "Product Roadmap" --out roadmap.md
+notion pages get "Q4 Launch Plan"
+notion pages append "Q4 Launch Plan" "/todo Tag v1.0 release"
+notion pages export "Q4 Launch Plan" --out launch-plan.md
 notion blocks toggle <block-id>
-notion db list
-notion db query "Sprint Tasks" --json
-notion db create-item "Sprint Tasks" --title "Write docs" --status "In Progress"
-notion comments add "Product Roadmap" "Ready for review!"
+
+# Query & create Notion database items
+notion db list --json
+notion db query "Q4 Roadmap" --json
+notion db create-item "Q4 Roadmap" --title "Ship v1.0" --status "In Progress"
+notion comments add "Q4 Launch Plan" "Green light for launch!"
 notion download <url-or-block-id> --json
 
-# 5. Manage multiple workspaces
+# Multi-workspace profiles & background sync daemon
 notion workspaces list
 notion workspaces add work --token ntn_...
 notion workspaces use work
-notion --workspace work pages list
-
-# 6. Run HTTP API (:8791) or MCP Server
-notion serve --port 8791
-notion mcp
+notion daemon start
 ```
 
-## Documentation
+### Local HTTP JSON API (`notion serve`)
 
-- [HTTP API Reference](docs/API.md) & [OpenAPI Spec](docs/openapi.yaml)
-- [MCP Server Tools (18 Tools)](docs/MCP.md)
-- [npm Cross-Platform Packaging](docs/NPM.md)
-- [Release Notes v0.1.0](release-notes/v0.1.0.md)
+```bash
+notion serve --bind 127.0.0.1 --port 8791 --token "$API_TOKEN"
+curl -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:8791/search?q=Roadmap"
+```
+
+Full endpoint catalog and OpenAPI schema: **[docs/API.md](docs/API.md)** · **[docs/openapi.yaml](docs/openapi.yaml)**.
+
+### MCP Server (`notion mcp` — 18 Tools)
+
+```json
+{
+  "mcpServers": {
+    "notion": {
+      "command": "notion",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Full tool catalog and argument schemas: **[docs/MCP.md](docs/MCP.md)** · npm packaging details: **[docs/NPM.md](docs/NPM.md)**.
+
+---
+
+## `@shinick` Enterprise Terminal Suite
+
+| Package | Commands | Workspace | Interfaces |
+| :--- | :--- | :--- | :--- |
+| [`@shinick/teams`](https://www.npmjs.com/package/@shinick/teams) | `teams` | Microsoft Teams (Chats, Channels, Meetings & Threads) | TUI · CLI · HTTP · MCP |
+| [`@shinick/outlook`](https://www.npmjs.com/package/@shinick/outlook) | `outlook`, `ol` | Microsoft Outlook (Mail, Calendar & Contacts) | TUI · CLI · HTTP · MCP |
+| [`@shinick/onenote`](https://www.npmjs.com/package/@shinick/onenote) | `onenote`, `on` | Microsoft OneNote (Notebooks, Sections & Pages) | TUI · CLI · HTTP · MCP |
+| [`@shinick/sharepoint`](https://www.npmjs.com/package/@shinick/sharepoint) | `sharepoint`, `sp` | Microsoft SharePoint & OneDrive (Sites, Libraries & Lists) | TUI · CLI · HTTP · MCP |
+| [`@shinick/atlassian`](https://www.npmjs.com/package/@shinick/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Atlassian Jira (Kanban, Sprints, JQL) & Confluence Wiki | TUI · CLI · HTTP · MCP |
+| **`@shinick/notion`** | `notion`, `nt` | Notion (Editorial Pages, Interactive Blocks & Databases) | TUI · CLI · HTTP · MCP |
+
+---
+
+> **Disclaimer:** Unofficial terminal client for Notion. Not affiliated with, endorsed by, or sponsored by Notion Labs, Inc.
