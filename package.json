@@ -1,0 +1,50 @@
+{
+  "name": "@shinick/notion",
+  "version": "0.1.0",
+  "description": "Notion terminal client & AI agent toolkit — Pages, Blocks, Databases (Table/Board/List), Comments & Multi-Workspace (CLI, TUI, HTTP API, MCP)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shinick-dev/notion.git"
+  },
+  "license": "MIT",
+  "bin": {
+    "notion": "bin/notion.js",
+    "nt": "bin/nt.js"
+  },
+  "files": [
+    "bin/notion.js",
+    "bin/nt.js",
+    "scripts/postinstall.mjs",
+    "docs/NPM.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "notion",
+    "notion-cli",
+    "notion-tui",
+    "nt",
+    "knowledge-base",
+    "kanban",
+    "database",
+    "markdown",
+    "cli",
+    "tui",
+    "mcp"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.mjs",
+    "sync-version": "node scripts/sync-version.mjs",
+    "build:npm": "node scripts/build-npm.mjs"
+  },
+  "optionalDependencies": {
+    "@shinick/notion-win32-x64": "0.1.0",
+    "@shinick/notion-win32-arm64": "0.1.0",
+    "@shinick/notion-darwin-x64": "0.1.0",
+    "@shinick/notion-darwin-arm64": "0.1.0",
+    "@shinick/notion-linux-x64": "0.1.0",
+    "@shinick/notion-linux-arm64": "0.1.0"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "@shinick/notion-darwin-x64",
+  "version": "0.1.0",
+  "description": "Prebuilt notion binary for macOS x64",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shinick-dev/notion.git",
+    "directory": "npm/notion-darwin-x64"
+  },
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin"
+  ]
+}

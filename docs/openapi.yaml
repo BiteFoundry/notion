@@ -1,0 +1,165 @@
+openapi: 3.1.0
+info:
+  title: "@shinick/notion Local HTTP API"
+  version: 0.1.0
+  description: Local HTTP JSON API exposed by `notion serve` (default `127.0.0.1:8791`).
+servers:
+  - url: http://127.0.0.1:8791
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: Service status
+  /api/v1/whoami:
+    get:
+      summary: Current authenticated Notion bot/user & active workspace
+      responses:
+        "200":
+          description: User and workspace metadata
+  /api/v1/workspaces:
+    get:
+      summary: List configured Notion workspace profiles
+      responses:
+        "200":
+          description: Workspace profile registry
+  /api/v1/search:
+    get:
+      summary: Search Notion pages and databases (SQLite FTS5 + Korean <3 char LIKE or remote)
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+        - name: remote
+          in: query
+          schema: { type: boolean, default: false }
+        - name: offline
+          in: query
+          schema: { type: boolean, default: false }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+      responses:
+        "200":
+          description: Search hits
+  /api/v1/pages:
+    get:
+      summary: List workspace pages
+      responses:
+        "200":
+          description: Page list
+    post:
+      summary: Create a Notion page
+      responses:
+        "200":
+          description: Created page
+  /api/v1/pages/{id}:
+    get:
+      summary: Get full Notion page detail (metadata, blocks, comments, markdown, media)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Page detail
+    patch:
+      summary: Update page metadata, properties, or archive state
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Updated page
+  /api/v1/pages/{id}/blocks:
+    get:
+      summary: Get recursive block tree for a page
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Block tree
+    post:
+      summary: Append Markdown or slash-style blocks to a page
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Appended blocks
+  /api/v1/blocks/{id}:
+    patch:
+      summary: Update block text or toggle to_do checkbox
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Updated block
+  /api/v1/databases:
+    get:
+      summary: List Notion databases
+      responses:
+        "200":
+          description: Database list
+  /api/v1/databases/{id}/query:
+    post:
+      summary: Query database rows
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Database rows
+  /api/v1/databases/{id}/items:
+    post:
+      summary: Create a new database item row
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Created item
+  /api/v1/pages/{id}/comments:
+    get:
+      summary: List comments on a page
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Comments list
+    post:
+      summary: Add a comment or discussion reply
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Created comment
+  /api/v1/sync:
+    post:
+      summary: Trigger immediate workspace sync into SQLite WAL + FTS5
+      responses:
+        "200":
+          description: Sync summary
