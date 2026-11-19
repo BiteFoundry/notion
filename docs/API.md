@@ -1,4 +1,4 @@
-# `@shinick/notion` Local HTTP API Reference
+# `@bitefoundry/notion` Local HTTP API Reference
 
 Start the local HTTP JSON API server (default `127.0.0.1:8791`):
 

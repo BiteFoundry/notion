@@ -1,4 +1,4 @@
-//! Standalone `@shinick/notion` (`notion` / `nt`) CLI parser, command dispatcher,
+//! Standalone `@bitefoundry/notion` (`notion` / `nt`) CLI parser, command dispatcher,
 //! and shared domain operations used across CLI, HTTP API (`serve`), and MCP (`mcp`).
 
 use std::{
@@ -1306,7 +1306,7 @@ async fn handle_doctor_cmd(
     if as_json {
         print_json(&report)?;
     } else {
-        println!("@shinick/notion v{}", env!("CARGO_PKG_VERSION"));
+        println!("@bitefoundry/notion v{}", env!("CARGO_PKG_VERSION"));
         println!("  Config:         {}", config::config_file_path().display());
         println!("  SQLite DB:      {} (ok: {})", db_file.display(), storage_ok);
         println!("  Workspace:      {} ({})", ws_name, ws_id);

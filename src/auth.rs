@@ -1,4 +1,4 @@
-//! Authentication & Multi-Workspace credential registry for `@shinick/notion`.
+//! Authentication & Multi-Workspace credential registry for `@bitefoundry/notion`.
 //!
 //! Supports two auth modes cleanly:
 //! 1. Internal Integration Token (`notion login --token ntn_...` / `NOTION_TOKEN`), validated via `GET /v1/users/me`.

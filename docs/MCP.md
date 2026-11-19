@@ -1,4 +1,4 @@
-# `@shinick/notion` MCP Server Reference (18 Tools)
+# `@bitefoundry/notion` MCP Server Reference (18 Tools)
 
 Run the standalone stdio JSON-RPC 2.0 Model Context Protocol server:
 

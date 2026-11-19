@@ -82,7 +82,7 @@ impl MockNotionState {
                     "has_children": false,
                     "to_do": {
                         "checked": false,
-                        "rich_text": [{ "plain_text": "Ship @shinick/notion v0.1.0" }]
+                        "rich_text": [{ "plain_text": "Ship @bitefoundry/notion v0.1.0" }]
                     }
                 }),
                 json!({
@@ -427,7 +427,7 @@ async fn start_mock_notion_server() -> (String, MockNotionState, tokio::task::Jo
                             "has_children": false,
                             "to_do": {
                                 "checked": checked,
-                                "rich_text": [{ "plain_text": "Ship @shinick/notion v0.1.0" }]
+                                "rich_text": [{ "plain_text": "Ship @bitefoundry/notion v0.1.0" }]
                             }
                         }))
                         .into_response();
@@ -470,7 +470,7 @@ async fn start_mock_notion_server() -> (String, MockNotionState, tokio::task::Jo
                         let text = body
                             .pointer("/to_do/rich_text/0/text/content")
                             .and_then(Value::as_str)
-                            .unwrap_or("Ship @shinick/notion v0.1.0");
+                            .unwrap_or("Ship @bitefoundry/notion v0.1.0");
                         return Json(json!({
                             "id": "blk-todo",
                             "type": "to_do",

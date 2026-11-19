@@ -1,4 +1,4 @@
-//! Domain models for standalone `@shinick/notion` — Pages, Blocks, Rich Text, Databases,
+//! Domain models for standalone `@bitefoundry/notion` — Pages, Blocks, Rich Text, Databases,
 //! Comments, Workspaces, Search Hits, and Sync Events.
 
 use std::collections::BTreeMap;

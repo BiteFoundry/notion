@@ -122,7 +122,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     if matches!(action, Action::QuitConfirm) {
         if !matches!(ui.overlays.last(), Some(Overlay::Confirm(_))) {
             ui.overlays.push(Overlay::confirm(
-                "Quit @shinick/notion TUI?",
+                "Quit @bitefoundry/notion TUI?",
                 Some(Action::Quit),
             ));
         }

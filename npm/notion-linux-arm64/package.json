@@ -1,10 +1,10 @@
 {
-  "name": "@shinick/notion-linux-arm64",
+  "name": "@bitefoundry/notion-linux-arm64",
   "version": "0.1.0",
   "description": "Prebuilt notion binary for Linux arm64",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/shinick-dev/notion.git",
+    "url": "git+https://github.com/BiteFoundry/notion.git",
     "directory": "npm/notion-linux-arm64"
   },
   "license": "MIT",

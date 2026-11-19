@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: "@shinick/notion Local HTTP API"
+  title: "@bitefoundry/notion Local HTTP API"
   version: 0.1.0
   description: Local HTTP JSON API exposed by `notion serve` (default `127.0.0.1:8791`).
 servers:

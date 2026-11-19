@@ -261,7 +261,7 @@ pub async fn run(
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("Failed to bind HTTP API server on {addr}"))?;
-    eprintln!("@shinick/notion HTTP API listening on http://{addr}");
+    eprintln!("@bitefoundry/notion HTTP API listening on http://{addr}");
     axum::serve(listener, app)
         .await
         .context("HTTP API server error")

@@ -1,4 +1,4 @@
-//! Overlay stack & HelpOverlay (`?`) for standalone `@shinick/notion` TUI.
+//! Overlay stack & HelpOverlay (`?`) for standalone `@bitefoundry/notion` TUI.
 
 pub mod attachments;
 pub mod command_palette;
@@ -259,7 +259,7 @@ impl HelpOverlay {
             .border_type(BorderType::Rounded)
             .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
-                " @shinick/notion · Keyboard Shortcuts · Esc Close ",
+                " @bitefoundry/notion · Keyboard Shortcuts · Esc Close ",
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));

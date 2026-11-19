@@ -15,7 +15,7 @@ pub const APP_DIR_NAME: &str = "notion-cli";
 pub const KEYRING_SERVICE_NAME: &str = "notion-cli";
 pub const DEFAULT_NOTION_API_BASE_URL: &str = "https://api.notion.com/v1";
 pub const NOTION_API_VERSION: &str = "2022-06-28";
-pub const DEFAULT_GITHUB_REPO: &str = "shinick-dev/notion";
+pub const DEFAULT_GITHUB_REPO: &str = "BiteFoundry/notion";
 pub const DEFAULT_SERVE_PORT: u16 = 8791;
 
 /// TUI page canvas horizontal width mode (`Centered` editorial measure vs `Full` width).

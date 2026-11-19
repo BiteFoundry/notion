@@ -1,10 +1,10 @@
 <div align="center">
 
-# `@shinick/notion`
+# `@bitefoundry/notion`
 
 **Notion-native terminal workspace & AI agent toolkit — Editorial Pages, Interactive Blocks, Databases (Table/Board/List), CLI · TUI · HTTP API · MCP.**
 
-[![npm version](https://img.shields.io/npm/v/%40shinick%2Fnotion?style=flat-square&color=191919)](https://www.npmjs.com/package/@shinick/notion)
+[![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fnotion?style=flat-square&color=191919)](https://www.npmjs.com/package/@bitefoundry/notion)
 [![platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-24292F?style=flat-square)](docs/NPM.md)
 [![Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-DEA584?style=flat-square&logo=rust)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-00875A?style=flat-square)](package.json)
@@ -32,7 +32,7 @@
 
 ```bash
 # 1. Install globally (links `notion` and `nt` native binaries)
-npm i -g @shinick/notion
+npm i -g @bitefoundry/notion
 
 # 2. Authenticate — Internal Integration Token (30-second setup) or Public OAuth 2.0
 notion login --token ntn_...
@@ -118,16 +118,16 @@ Full tool catalog and argument schemas: **[docs/MCP.md](docs/MCP.md)** · npm pa
 
 ---
 
-## `@shinick` Enterprise Terminal Suite
+## `@bitefoundry` Enterprise Terminal Suite
 
 | Package | Commands | Workspace | Interfaces |
 | :--- | :--- | :--- | :--- |
-| [`@shinick/teams`](https://www.npmjs.com/package/@shinick/teams) | `teams` | Microsoft Teams (Chats, Channels, Meetings & Threads) | TUI · CLI · HTTP · MCP |
-| [`@shinick/outlook`](https://www.npmjs.com/package/@shinick/outlook) | `outlook`, `ol` | Microsoft Outlook (Mail, Calendar & Contacts) | TUI · CLI · HTTP · MCP |
-| [`@shinick/onenote`](https://www.npmjs.com/package/@shinick/onenote) | `onenote`, `on` | Microsoft OneNote (Notebooks, Sections & Pages) | TUI · CLI · HTTP · MCP |
-| [`@shinick/sharepoint`](https://www.npmjs.com/package/@shinick/sharepoint) | `sharepoint`, `sp` | Microsoft SharePoint & OneDrive (Sites, Libraries & Lists) | TUI · CLI · HTTP · MCP |
-| [`@shinick/atlassian`](https://www.npmjs.com/package/@shinick/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Atlassian Jira (Kanban, Sprints, JQL) & Confluence Wiki | TUI · CLI · HTTP · MCP |
-| **`@shinick/notion`** | `notion`, `nt` | Notion (Editorial Pages, Interactive Blocks & Databases) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/teams`](https://www.npmjs.com/package/@bitefoundry/teams) | `teams` | Microsoft Teams (Chats, Channels, Meetings & Threads) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook`, `ol` | Microsoft Outlook (Mail, Calendar & Contacts) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/onenote`](https://www.npmjs.com/package/@bitefoundry/onenote) | `onenote`, `on` | Microsoft OneNote (Notebooks, Sections & Pages) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/sharepoint`](https://www.npmjs.com/package/@bitefoundry/sharepoint) | `sharepoint`, `sp` | Microsoft SharePoint & OneDrive (Sites, Libraries & Lists) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Atlassian Jira (Kanban, Sprints, JQL) & Confluence Wiki | TUI · CLI · HTTP · MCP |
+| **`@bitefoundry/notion`** | `notion`, `nt` | Notion (Editorial Pages, Interactive Blocks & Databases) | TUI · CLI · HTTP · MCP |
 
 ---
 

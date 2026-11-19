@@ -1560,7 +1560,7 @@ fn draw_empty_page_welcome(frame: &mut Frame, area: Rect, theme: &Theme) {
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "📄  Welcome to @shinick/notion",
+            "📄  Welcome to @bitefoundry/notion",
             Style::default()
                 .fg(theme.fg_primary)
                 .add_modifier(Modifier::BOLD),

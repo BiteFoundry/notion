@@ -1,10 +1,10 @@
 {
-  "name": "@shinick/notion-win32-x64",
+  "name": "@bitefoundry/notion-win32-x64",
   "version": "0.1.0",
   "description": "Prebuilt notion binary for Windows x64",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/shinick-dev/notion.git",
+    "url": "git+https://github.com/BiteFoundry/notion.git",
     "directory": "npm/notion-win32-x64"
   },
   "license": "MIT",

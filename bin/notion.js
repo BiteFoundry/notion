@@ -6,12 +6,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const PLATFORM_PACKAGES = {
-  'win32-x64': '@shinick/notion-win32-x64',
-  'win32-arm64': '@shinick/notion-win32-arm64',
-  'darwin-x64': '@shinick/notion-darwin-x64',
-  'darwin-arm64': '@shinick/notion-darwin-arm64',
-  'linux-x64': '@shinick/notion-linux-x64',
-  'linux-arm64': '@shinick/notion-linux-arm64',
+  'win32-x64': '@bitefoundry/notion-win32-x64',
+  'win32-arm64': '@bitefoundry/notion-win32-arm64',
+  'darwin-x64': '@bitefoundry/notion-darwin-x64',
+  'darwin-arm64': '@bitefoundry/notion-darwin-arm64',
+  'linux-x64': '@bitefoundry/notion-linux-x64',
+  'linux-arm64': '@bitefoundry/notion-linux-arm64',
 };
 
 function resolveBinary() {
@@ -29,7 +29,7 @@ function resolveBinary() {
   const pkgName = PLATFORM_PACKAGES[key];
   if (!pkgName) {
     console.error(
-      `[@shinick/notion] Unsupported platform: ${key}. Supported: ${Object.keys(PLATFORM_PACKAGES).join(', ')}`,
+      `[@bitefoundry/notion] Unsupported platform: ${key}. Supported: ${Object.keys(PLATFORM_PACKAGES).join(', ')}`,
     );
     process.exit(1);
   }
@@ -45,7 +45,7 @@ function resolveBinary() {
   }
 
   console.error(
-    `[@shinick/notion] Could not locate prebuilt binary from optional dependency "${pkgName}".\n` +
+    `[@bitefoundry/notion] Could not locate prebuilt binary from optional dependency "${pkgName}".\n` +
       `Try reinstalling without --omit=optional, or build from source with \`cargo build --release\`.`,
   );
   process.exit(1);
@@ -55,7 +55,7 @@ const binPath = resolveBinary();
 const result = spawnSync(binPath, process.argv.slice(2), { stdio: 'inherit' });
 
 if (result.error) {
-  console.error(`[@shinick/notion] Failed to launch ${binPath}: ${result.error.message}`);
+  console.error(`[@bitefoundry/notion] Failed to launch ${binPath}: ${result.error.message}`);
   process.exit(1);
 }
 
