@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 
 use crate::models::{
     spans_plain_text, NotionBlock, NotionBlockKind, NotionColor, NotionComment, NotionDatabase,
-    NotionMediaRef, NotionPage, NotionPropertySchema, NotionPropertyValue, RichTextAnnotations,
-    RichTextKind, RichTextSpan, SelectOption,
+    NotionMediaRef, NotionPage, NotionPageDetail, NotionPropertySchema, NotionPropertyValue,
+    RichTextAnnotations, RichTextKind, RichTextSpan, SelectOption,
 };
 
 /// Parses a Notion `rich_text` JSON array into typed `RichTextSpan` entries.
@@ -1758,6 +1758,132 @@ fn normalize_notion_code_lang(lang: &str) -> String {
         "md" => "markdown".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Produces a normalized `(block_type, comparable_content)` key for diff-syncing blocks
+/// between existing Notion API blocks and newly parsed Markdown payloads.
+pub fn block_comparison_key(blk: &NotionBlock) -> (String, String) {
+    let content = match &blk.kind {
+        NotionBlockKind::Paragraph { rich_text, .. }
+        | NotionBlockKind::Heading1 { rich_text, .. }
+        | NotionBlockKind::Heading2 { rich_text, .. }
+        | NotionBlockKind::Heading3 { rich_text, .. }
+        | NotionBlockKind::BulletedListItem { rich_text, .. }
+        | NotionBlockKind::NumberedListItem { rich_text, .. }
+        | NotionBlockKind::Toggle { rich_text, .. }
+        | NotionBlockKind::Quote { rich_text, .. } => rich_text_to_markdown(rich_text),
+        NotionBlockKind::ToDo {
+            rich_text, checked, ..
+        } => format!(
+            "{}|{}",
+            if *checked { "1" } else { "0" },
+            rich_text_to_markdown(rich_text)
+        ),
+        NotionBlockKind::Callout {
+            rich_text, icon, ..
+        } => format!(
+            "{}|{}",
+            icon.as_deref().unwrap_or("💡"),
+            rich_text_to_markdown(rich_text)
+        ),
+        NotionBlockKind::Code {
+            rich_text,
+            language,
+            ..
+        } => format!(
+            "{}|{}",
+            normalize_notion_code_lang(language),
+            spans_plain_text(rich_text)
+        ),
+        NotionBlockKind::Divider => String::new(),
+        NotionBlockKind::Image { url, caption, .. } => {
+            format!("{}|{}", url.trim(), spans_plain_text(caption))
+        }
+        NotionBlockKind::ChildPage { title } | NotionBlockKind::ChildDatabase { title } => {
+            title.clone()
+        }
+        _ => blk.plain_text(),
+    };
+    (blk.block_type.clone(), content)
+}
+
+/// Immediately parses `edited_markdown` into typed `NotionBlock`s (preserving existing
+/// `ChildPage` and `ChildDatabase` blocks as well as real Notion IDs of matched blocks)
+/// and updates `detail.markdown`, `detail.blocks`, `detail.page.plain_text`, and `detail.media`
+/// in < 1 ms without waiting for any Notion API HTTP roundtrip.
+pub fn apply_optimistic_markdown_to_detail(detail: &mut NotionPageDetail, edited_markdown: &str) {
+    let normalized = edited_markdown.replace("\r\n", "\n").replace('\r', "\n");
+    let page_id = detail.page.id.clone();
+
+    let mut old_editable = Vec::new();
+    let mut preserved = Vec::new();
+    for blk in &detail.blocks {
+        if matches!(
+            blk.kind,
+            NotionBlockKind::ChildPage { .. } | NotionBlockKind::ChildDatabase { .. }
+        ) {
+            preserved.push(blk.clone());
+        } else {
+            old_editable.push(blk.clone());
+        }
+    }
+
+    let payloads = markdown_to_notion_blocks(&normalized);
+    let mut new_blocks: Vec<NotionBlock> = payloads
+        .iter()
+        .map(|val| parse_notion_block(val, &page_id, None))
+        .collect();
+
+    let old_keys: Vec<(String, String)> = old_editable.iter().map(block_comparison_key).collect();
+    let new_keys: Vec<(String, String)> = new_blocks.iter().map(block_comparison_key).collect();
+
+    let mut prefix_len = 0usize;
+    while prefix_len < old_keys.len()
+        && prefix_len < new_keys.len()
+        && old_keys[prefix_len] == new_keys[prefix_len]
+    {
+        new_blocks[prefix_len].id = old_editable[prefix_len].id.clone();
+        new_blocks[prefix_len].has_children = old_editable[prefix_len].has_children;
+        new_blocks[prefix_len].children = old_editable[prefix_len].children.clone();
+        prefix_len += 1;
+    }
+
+    let mut suffix_len = 0usize;
+    while suffix_len < (old_keys.len() - prefix_len)
+        && suffix_len < (new_keys.len() - prefix_len)
+        && old_keys[old_keys.len() - 1 - suffix_len] == new_keys[new_keys.len() - 1 - suffix_len]
+    {
+        let old_idx = old_editable.len() - 1 - suffix_len;
+        let new_idx = new_blocks.len() - 1 - suffix_len;
+        new_blocks[new_idx].id = old_editable[old_idx].id.clone();
+        new_blocks[new_idx].has_children = old_editable[old_idx].has_children;
+        new_blocks[new_idx].children = old_editable[old_idx].children.clone();
+        suffix_len += 1;
+    }
+
+    let old_mid_end = old_editable.len() - suffix_len;
+    let new_mid_end = new_blocks.len() - suffix_len;
+    if old_mid_end - prefix_len == new_mid_end - prefix_len {
+        for offset in 0..(old_mid_end - prefix_len) {
+            let old_blk = &old_editable[prefix_len + offset];
+            let new_blk = &mut new_blocks[prefix_len + offset];
+            if old_blk.block_type == new_blk.block_type && !old_blk.id.is_empty() {
+                new_blk.id = old_blk.id.clone();
+            }
+        }
+    }
+
+    for (idx, blk) in new_blocks.iter_mut().enumerate() {
+        if blk.id.trim().is_empty() {
+            blk.id = format!("__optimistic_{}_{}", page_id, idx);
+        }
+    }
+
+    new_blocks.extend(preserved);
+    detail.page.plain_text = blocks_to_plain_text(&new_blocks);
+    detail.media = collect_media_refs(&new_blocks);
+    detail.blocks = new_blocks;
+    detail.markdown = normalized;
 }
 
 #[cfg(test)]

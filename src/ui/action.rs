@@ -78,6 +78,8 @@ pub enum Action {
     ShowToast(String),
     OpenQuickAppend,
     OpenPageEditor,
+    FinishInlineEdit,
+    SaveInlineEdit,
     OpenNewPageModal,
     OpenDbFilter,
     ConfirmArchivePage,
@@ -137,6 +139,7 @@ pub enum Action {
 /// Dispatches an `Action` against `(AppState, UiState)`. Returns `true` if TUI should exit.
 pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     if matches!(action, Action::Quit) {
+        app.close_inline_editor_and_flush(ui);
         app.html_server.shutdown();
         app.sync_ctrl.request(SyncCommand::Shutdown);
         return true;
@@ -207,6 +210,14 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     ui.overlays.push(top);
                 }
             }
+        }
+    }
+
+    // Route typing, cursor navigation, paste, and undo/redo to the active in-place inline editor
+    // when Canvas is focused and no modal overlay is active.
+    if ui.overlays.is_empty() && ui.inline_editor.is_some() && ui.focus == Focus::Canvas {
+        if handle_inline_editor_action(&action, app, ui) {
+            return false;
         }
     }
 
@@ -913,14 +924,26 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 )));
         }
         Action::OpenPageEditor => {
-            if let Some(detail) = app.active_page_detail.as_ref() {
-                ui.overlays.push(Overlay::page_editor(
-                    detail.page.id.clone(),
-                    detail.page.display_title().to_string(),
-                    detail.markdown.clone(),
-                ));
-            } else {
+            if ui.inline_editor.is_some() {
+                app.close_inline_editor_and_flush(ui);
+            } else if !app.open_inline_editor(ui) {
                 ui.warning("Open a page to edit");
+            }
+        }
+        Action::FinishInlineEdit => {
+            app.close_inline_editor_and_flush(ui);
+        }
+        Action::SaveInlineEdit => {
+            if ui.inline_editor.is_some() {
+                let dispatched = app.flush_inline_editor_sync(ui, true);
+                if !dispatched
+                    && !ui
+                        .inline_editor
+                        .as_ref()
+                        .is_some_and(|ed| ed.sync_in_flight)
+                {
+                    ui.info("Already synced");
+                }
             }
         }
         Action::OpenNewPageModal => {
@@ -976,43 +999,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             });
         }
         Action::SubmitPageEdit(edited_markdown) => {
-            let Some(page_id) = app.active_page_id.clone() else {
-                ui.warning("Open a page before saving edits");
-                return false;
-            };
-            let current_md = app
-                .active_page_detail
-                .as_ref()
-                .map(|d| d.markdown.as_str())
-                .unwrap_or("");
-            if edited_markdown.trim() == current_md.trim() {
-                ui.info("No changes to save");
-                return false;
-            }
-            let client = app.client.clone();
-            let storage = app.storage.clone();
-            let ui_tx = app.ui_tx.clone();
-            ui.tasks.begin("edit");
-            tokio::spawn(async move {
-                match crate::cli::op_replace_page_markdown(
-                    &client,
-                    &storage,
-                    &page_id,
-                    &edited_markdown,
-                )
-                .await
-                {
-                    Ok(detail) => {
-                        let _ = ui_tx.send(UiMsg::PageEdited(Box::new(detail)));
-                    }
-                    Err(err) => {
-                        let _ = ui_tx.send(UiMsg::TaskFailed {
-                            label: "edit".into(),
-                            error: err.to_string(),
-                        });
-                    }
-                }
-            });
+            let _ = app.submit_page_edit_markdown(ui, edited_markdown);
         }
         Action::SubmitCreatePage {
             title,
@@ -1091,6 +1078,12 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             });
         }
         Action::RequestExternalEditor => {
+            if let Some(ed) = ui.inline_editor.take() {
+                // Preserve unsaved inline buffer in active_page_detail before launching external $EDITOR
+                app.apply_optimistic_local(&ed.page_id, ed.composer.text(), true);
+                ui.canvas_scroll = ed.scroll_y;
+                ui.cursor_pos = None;
+            }
             if app.active_page_id.is_some() {
                 ui.editor_requested = true;
             } else {
@@ -1580,6 +1573,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     Focus::Comments
                 }
                 Some(HitTarget::CanvasBlock(_))
+                | Some(HitTarget::InlineEditorBody)
                 | Some(HitTarget::TodoToggle(_))
                 | Some(HitTarget::ToggleBlock(_))
                 | Some(HitTarget::ChildCard(_))
@@ -1635,12 +1629,22 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 }
                 Focus::Canvas | Focus::Overlay => match app.active_view {
                     CanvasView::Page => {
-                        ui.canvas_follow_selected = false;
-                        let mag = delta.unsigned_abs();
-                        if delta < 0 {
-                            ui.canvas_scroll = ui.canvas_scroll.saturating_sub(mag);
+                        if let Some(ed) = ui.inline_editor.as_mut() {
+                            ed.follow_cursor = false;
+                            let mag = delta.unsigned_abs();
+                            if delta < 0 {
+                                ed.scroll_y = ed.scroll_y.saturating_sub(mag);
+                            } else {
+                                ed.scroll_y = ed.scroll_y.saturating_add(mag);
+                            }
                         } else {
-                            ui.canvas_scroll = ui.canvas_scroll.saturating_add(mag);
+                            ui.canvas_follow_selected = false;
+                            let mag = delta.unsigned_abs();
+                            if delta < 0 {
+                                ui.canvas_scroll = ui.canvas_scroll.saturating_sub(mag);
+                            } else {
+                                ui.canvas_scroll = ui.canvas_scroll.saturating_add(mag);
+                            }
                         }
                     }
                     CanvasView::Database => match ui.db_view_mode {
@@ -1682,6 +1686,196 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     false
 }
 
+fn handle_inline_editor_action(action: &Action, app: &mut AppState, ui: &mut UiState) -> bool {
+    match action {
+        Action::Input(ch) => {
+            let changed = if let Some(ed) = ui.inline_editor.as_mut() {
+                let before = ed.composer.text().len();
+                ed.composer.insert_char(*ch);
+                ed.follow_cursor = true;
+                ed.composer.text().len() != before
+            } else {
+                false
+            };
+            if changed {
+                app.record_inline_mutation(ui, false);
+            }
+            true
+        }
+        Action::Newline | Action::Activate => {
+            if let Some(ed) = ui.inline_editor.as_mut() {
+                ed.composer.newline();
+                ed.follow_cursor = true;
+            }
+            app.record_inline_mutation(ui, false);
+            true
+        }
+        Action::Tab => {
+            if let Some(ed) = ui.inline_editor.as_mut() {
+                ed.composer.insert_str("  ");
+                ed.follow_cursor = true;
+            }
+            app.record_inline_mutation(ui, false);
+            true
+        }
+        Action::Backspace => {
+            let changed = if let Some(ed) = ui.inline_editor.as_mut() {
+                let before = ed.composer.text().len();
+                ed.composer.backspace();
+                ed.follow_cursor = true;
+                ed.composer.text().len() != before
+            } else {
+                false
+            };
+            if changed {
+                app.record_inline_mutation(ui, false);
+            }
+            true
+        }
+        Action::Delete => {
+            let changed = if let Some(ed) = ui.inline_editor.as_mut() {
+                let before = ed.composer.text().len();
+                ed.composer.delete_forward();
+                ed.follow_cursor = true;
+                ed.composer.text().len() != before
+            } else {
+                false
+            };
+            if changed {
+                app.record_inline_mutation(ui, false);
+            }
+            true
+        }
+        Action::Paste(text) => {
+            let changed = if let Some(ed) = ui.inline_editor.as_mut() {
+                let before = ed.composer.text().to_string();
+                ed.composer.insert_str(text);
+                ed.follow_cursor = true;
+                ed.composer.text() != before
+            } else {
+                false
+            };
+            if changed {
+                app.record_inline_mutation(ui, false);
+            }
+            true
+        }
+        Action::PasteClipboard => {
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                if let Ok(text) = cb.get_text() {
+                    if !text.is_empty() {
+                        let changed = if let Some(ed) = ui.inline_editor.as_mut() {
+                            let before = ed.composer.text().to_string();
+                            ed.composer.insert_str(&text);
+                            ed.follow_cursor = true;
+                            ed.composer.text() != before
+                        } else {
+                            false
+                        };
+                        if changed {
+                            app.record_inline_mutation(ui, false);
+                        }
+                    }
+                }
+            }
+            true
+        }
+        Action::Undo => {
+            let changed = if let Some(ed) = ui.inline_editor.as_mut() {
+                let ok = ed.composer.undo();
+                ed.follow_cursor = true;
+                ok
+            } else {
+                false
+            };
+            if changed {
+                app.record_inline_mutation(ui, false);
+            }
+            true
+        }
+        Action::Redo => {
+            let changed = if let Some(ed) = ui.inline_editor.as_mut() {
+                let ok = ed.composer.redo();
+                ed.follow_cursor = true;
+                ok
+            } else {
+                false
+            };
+            if changed {
+                app.record_inline_mutation(ui, false);
+            }
+            true
+        }
+        Action::CursorLeft => {
+            if let Some(ed) = ui.inline_editor.as_mut() {
+                ed.composer.move_left(false);
+                ed.follow_cursor = true;
+            }
+            true
+        }
+        Action::CursorRight => {
+            if let Some(ed) = ui.inline_editor.as_mut() {
+                ed.composer.move_right(false);
+                ed.follow_cursor = true;
+            }
+            true
+        }
+        Action::CursorUp | Action::MoveUp => {
+            if let Some(ed) = ui.inline_editor.as_mut() {
+                ed.composer.move_up(false);
+                ed.follow_cursor = true;
+            }
+            true
+        }
+        Action::CursorDown | Action::MoveDown => {
+            if let Some(ed) = ui.inline_editor.as_mut() {
+                ed.composer.move_down(false);
+                ed.follow_cursor = true;
+            }
+            true
+        }
+        Action::CursorHome => {
+            if let Some(ed) = ui.inline_editor.as_mut() {
+                ed.composer.move_home(false);
+                ed.follow_cursor = true;
+            }
+            true
+        }
+        Action::CursorEnd => {
+            if let Some(ed) = ui.inline_editor.as_mut() {
+                ed.composer.move_end(false);
+                ed.follow_cursor = true;
+            }
+            true
+        }
+        Action::PageUp => {
+            if let Some(ed) = ui.inline_editor.as_mut() {
+                let steps = ed.last_viewport_height.saturating_sub(2).max(5);
+                for _ in 0..steps {
+                    ed.composer.move_up(false);
+                }
+                ed.follow_cursor = true;
+            }
+            true
+        }
+        Action::PageDown => {
+            if let Some(ed) = ui.inline_editor.as_mut() {
+                let steps = ed.last_viewport_height.saturating_sub(2).max(5);
+                for _ in 0..steps {
+                    ed.composer.move_down(false);
+                }
+                ed.follow_cursor = true;
+            }
+            true
+        }
+        Action::CloseOverlay => {
+            app.close_inline_editor_and_flush(ui);
+            true
+        }
+        _ => false,
+    }
+}
+
 fn handle_mouse_click(
     target: HitTarget,
     col: u16,
@@ -1720,9 +1914,6 @@ fn handle_mouse_click(
                 return dispatch(Action::Activate, app, ui);
             }
             HitTarget::Button(ButtonId::ConfirmOk) => {
-                if matches!(ui.overlays.last(), Some(Overlay::PageEditor(_))) {
-                    return dispatch(Action::OverlaySubmit, app, ui);
-                }
                 return dispatch(Action::Activate, app, ui);
             }
             HitTarget::Button(ButtonId::ConfirmCancel) => {
@@ -1773,6 +1964,12 @@ fn handle_mouse_click(
         HitTarget::CanvasBlock(idx) => {
             ui.focus = Focus::Canvas;
             ui.selected_block = idx;
+        }
+        HitTarget::InlineEditorBody => {
+            ui.focus = Focus::Canvas;
+            if let Some(ed) = ui.inline_editor.as_mut() {
+                ed.place_cursor_at_screen_pos(col, row);
+            }
         }
         HitTarget::TodoToggle(idx) | HitTarget::ToggleBlock(idx) => {
             ui.focus = Focus::Canvas;
@@ -1971,6 +2168,8 @@ fn handle_mouse_click(
             }
             ButtonId::EditPage => return dispatch(Action::OpenPageEditor, app, ui),
             ButtonId::EditExternal => return dispatch(Action::RequestExternalEditor, app, ui),
+            ButtonId::FinishInlineEdit => return dispatch(Action::FinishInlineEdit, app, ui),
+            ButtonId::SaveInlineEdit => return dispatch(Action::SaveInlineEdit, app, ui),
             ButtonId::OpenWeb => return dispatch(Action::OpenActiveInBrowser, app, ui),
             ButtonId::LinkExtractor => return dispatch(Action::OpenLinkExtractor, app, ui),
             ButtonId::ToggleHrefs => return dispatch(Action::ToggleShowLinkUrls, app, ui),
@@ -3100,7 +3299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_page_editor_opens_on_e_and_edit_pill_without_external_editor_and_replaces_blocks_on_save() {
+    async fn test_inline_editor_opens_in_canvas_without_popup_optimistic_update_and_esc_done_scroll_preserved() {
         use std::sync::{Arc, Mutex};
         use axum::{
             extract::Path as AxumPath,
@@ -3111,7 +3310,10 @@ mod tests {
         use tokio::net::TcpListener;
 
         let deleted_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let appended_payloads: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let patched_blocks: Arc<Mutex<Vec<(String, serde_json::Value)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let appended_payloads: Arc<Mutex<Vec<(Option<String>, Vec<serde_json::Value>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let current_blocks: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(vec![
             serde_json::json!({
                 "id": "blk-old-1",
@@ -3128,9 +3330,11 @@ mod tests {
         ]));
 
         let del_log = deleted_ids.clone();
+        let patch_log = patched_blocks.clone();
         let blocks_del = current_blocks.clone();
         let blocks_get = current_blocks.clone();
-        let blocks_patch = current_blocks.clone();
+        let blocks_append = current_blocks.clone();
+        let blocks_update = current_blocks.clone();
         let app_log = appended_payloads.clone();
 
         let router = Router::new()
@@ -3162,19 +3366,23 @@ mod tests {
                     }
                 })
                 .patch(move |Json(body): Json<serde_json::Value>| {
-                    let b = blocks_patch.clone();
+                    let b = blocks_append.clone();
                     let log = app_log.clone();
                     async move {
+                        let after = body
+                            .get("after")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
                         let children = body
                             .get("children")
                             .and_then(|v| v.as_array())
                             .cloned()
                             .unwrap_or_default();
-                        log.lock().unwrap().extend(children.clone());
+                        log.lock().unwrap().push((after, children.clone()));
                         let mut guard = b.lock().unwrap();
                         let mut created = Vec::new();
                         for (i, mut c) in children.into_iter().enumerate() {
-                            c["id"] = serde_json::json!(format!("blk-new-{i}"));
+                            c["id"] = serde_json::json!(format!("blk-new-{}-{}", guard.len(), i));
                             c["has_children"] = serde_json::json!(false);
                             guard.push(c.clone());
                             created.push(c);
@@ -3193,7 +3401,31 @@ mod tests {
                         b.lock().unwrap().retain(|blk| blk["id"] != id);
                         Json(serde_json::json!({ "id": id, "archived": true }))
                     }
-                }),
+                })
+                .patch(
+                    move |AxumPath(id): AxumPath<String>, Json(body): Json<serde_json::Value>| {
+                        let log = patch_log.clone();
+                        let b = blocks_update.clone();
+                        async move {
+                            log.lock().unwrap().push((id.clone(), body.clone()));
+                            let mut guard = b.lock().unwrap();
+                            if let Some(existing) = guard.iter_mut().find(|blk| blk["id"] == id) {
+                                if let Some(btype) = existing["type"].as_str().map(str::to_string) {
+                                    if let Some(updated_inner) = body.get(&btype) {
+                                        existing[&btype] = updated_inner.clone();
+                                    }
+                                }
+                                return Json(existing.clone());
+                            }
+                            Json(serde_json::json!({
+                                "id": id,
+                                "type": "paragraph",
+                                "has_children": false,
+                                "paragraph": body.get("paragraph").cloned().unwrap_or_else(|| serde_json::json!({ "rich_text": [] }))
+                            }))
+                        }
+                    },
+                ),
             )
             .route(
                 "/v1/comments",
@@ -3224,20 +3456,50 @@ mod tests {
         let mut app = AppState::new(cfg, auth, client, storage, sync_ctrl, ui_tx);
         let page = NotionPage {
             id: "11111111-2222-3333-4444-555555555555".into(),
+            workspace_id: app.workspace_id.clone(),
             title: "Editable Page".into(),
             ..Default::default()
         };
+        let other_page = NotionPage {
+            id: "22222222-2222-3333-4444-555555555555".into(),
+            workspace_id: app.workspace_id.clone(),
+            title: "Second Page".into(),
+            ..Default::default()
+        };
+        app.storage.upsert_page(&page).unwrap();
+        app.storage.upsert_page(&other_page).unwrap();
+        app.pages = vec![page.clone(), other_page.clone()];
         app.active_view = CanvasView::Page;
         app.active_page_id = Some(page.id.clone());
         app.active_page_detail = Some(NotionPageDetail {
             page: page.clone(),
-            blocks: Vec::new(),
+            blocks: vec![
+                NotionBlock {
+                    id: "blk-old-1".into(),
+                    page_id: page.id.clone(),
+                    block_type: "paragraph".into(),
+                    kind: NotionBlockKind::Paragraph {
+                        rich_text: vec![RichTextSpan::plain("Old content")],
+                        color: NotionColor::Default,
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "blk-child-page".into(),
+                    page_id: page.id.clone(),
+                    block_type: "child_page".into(),
+                    kind: NotionBlockKind::ChildPage {
+                        title: "Keep Child Page".into(),
+                    },
+                    ..Default::default()
+                },
+            ],
             comments: Vec::new(),
             markdown: "Old content".into(),
             media: Vec::new(),
         });
 
-        // 1. Pressing 'e' opens Overlay::PageEditor WITHOUT setting ui.editor_requested = true!
+        // 1. Pressing 'e' opens INLINE editor directly inside Canvas (ZERO popup overlays!)
         let act_e = crate::ui::event::key_to_action(
             KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
             ui.focus(),
@@ -3250,13 +3512,24 @@ mod tests {
         assert_eq!(act_e, Action::OpenPageEditor);
         dispatch(act_e, &mut app, &mut ui);
         assert!(!ui.editor_requested, "'e' must NEVER launch external editor");
-        assert!(matches!(ui.overlays.last(), Some(Overlay::PageEditor(_))));
+        assert!(ui.inline_editor.is_some(), "'e' must open inline Canvas editor");
+        assert!(ui.overlays.is_empty(), "inline editor must NOT open a popup overlay");
 
-        // Close with Esc
-        dispatch(Action::CloseOverlay, &mut app, &mut ui);
-        assert!(ui.overlays.is_empty());
+        // Pressing Esc exits inline editor cleanly
+        let act_esc = crate::ui::event::key_to_action(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            ui.focus(),
+            &ui.keymap,
+            ui.accepts_text_input(),
+            false,
+            ui.db_view_mode,
+        )
+        .unwrap();
+        assert_eq!(act_esc, Action::FinishInlineEdit);
+        dispatch(act_esc, &mut app, &mut ui);
+        assert!(ui.inline_editor.is_none());
 
-        // 2. Clicking [✎ Edit] pill opens Overlay::PageEditor WITHOUT setting ui.editor_requested = true!
+        // 2. Clicking [✎ Edit] pill opens INLINE editor in Canvas (ZERO popup overlays!)
         let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
         terminal
             .draw(|f| {
@@ -3277,14 +3550,83 @@ mod tests {
             &mut ui,
         );
         assert!(!ui.editor_requested, "[✎ Edit] must NEVER launch external editor");
-        assert!(matches!(ui.overlays.last(), Some(Overlay::PageEditor(_))));
+        assert!(ui.inline_editor.is_some());
+        assert!(ui.overlays.is_empty());
 
-        // 3. Edit inside PageEditorOverlay (Enter newline + Korean UTF-8 + Ctrl+Z undo + Ctrl+S submit)
+        // Render inline editor and verify header bar pills, cursor position, and hitmap targets
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        let edit_screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(edit_screen.contains("EDITING"));
+        assert!(edit_screen.contains("[✓ Done]"));
+        assert!(edit_screen.contains("[Ctrl+S Save]"));
+        assert!(edit_screen.contains("[Ext $EDITOR]"));
+        assert!(edit_screen.contains("Ln 1, Col 1"));
+        assert!(ui.cursor_pos.is_some(), "inline editor must expose live terminal cursor");
+        assert!(ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::FinishInlineEdit))
+            .is_some());
+        assert!(ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::SaveInlineEdit))
+            .is_some());
+        assert!(ui.hitmap.region_of(HitTarget::InlineEditorBody).is_some());
+
+        // 3. Typing keys (including 'q', 'j', 'k', 'e', Korean UTF-8, Enter, Tab, Undo) routes to inline editor
+        //    AND immediately updates optimistic local page detail in 0ms while preserving ChildPage!
+        let editor_body = ui
+            .hitmap
+            .region_of(HitTarget::InlineEditorBody)
+            .expect("inline editor body hit target");
+        // Click at col 4 on line 1 ("Old |content") to verify mouse click-to-place cursor
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::InlineEditorBody,
+                col: editor_body.x + 4,
+                row: editor_body.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.inline_editor.as_ref().unwrap().cursor_line_col(), (1, 5));
+
         dispatch(Action::CursorEnd, &mut app, &mut ui);
-        dispatch(Action::Activate, &mut app, &mut ui); // newline
-        for ch in "새 문단X".chars() {
-            dispatch(Action::Input(ch), &mut app, &mut ui);
+        let act_enter = crate::ui::event::key_to_action(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ui.focus(),
+            &ui.keymap,
+            ui.accepts_text_input(),
+            false,
+            ui.db_view_mode,
+        )
+        .unwrap();
+        assert_eq!(act_enter, Action::Newline);
+        dispatch(act_enter, &mut app, &mut ui);
+
+        for ch in "qje 새 문단X".chars() {
+            let act_ch = crate::ui::event::key_to_action(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                ui.focus(),
+                &ui.keymap,
+                ui.accepts_text_input(),
+                false,
+                ui.db_view_mode,
+            )
+            .unwrap();
+            assert_eq!(act_ch, Action::Input(ch));
+            dispatch(act_ch, &mut app, &mut ui);
         }
+
         // Ctrl+Z undoes 'X'
         let act_undo = crate::ui::event::key_to_action(
             KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
@@ -3298,7 +3640,22 @@ mod tests {
         assert_eq!(act_undo, Action::Undo);
         dispatch(act_undo, &mut app, &mut ui);
 
-        // Ctrl+S submits Action::SubmitPageEdit and closes the overlay
+        // 0ms optimistic reflection: active_page_detail already reflects new Markdown & blocks
+        // BEFORE any HTTP sync completes, and preserves ChildPage!
+        let ed_gen = ui.inline_editor.as_ref().unwrap().edit_generation;
+        assert!(ed_gen > 0);
+        let opt_detail = app.active_page_detail.as_ref().unwrap();
+        assert_eq!(opt_detail.markdown, "Old content\nqje 새 문단");
+        assert!(opt_detail.page.plain_text.contains("qje 새 문단"));
+        assert!(
+            opt_detail
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, NotionBlockKind::ChildPage { ref title } if title == "Keep Child Page")),
+            "optimistic update must preserve ChildPage blocks"
+        );
+
+        // 4. Ctrl+S flushes immediately while STAYING in inline edit mode!
         let act_save = crate::ui::event::key_to_action(
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
             ui.focus(),
@@ -3308,29 +3665,55 @@ mod tests {
             ui.db_view_mode,
         )
         .unwrap();
-        assert_eq!(act_save, Action::OverlaySubmit);
+        assert_eq!(act_save, Action::SaveInlineEdit);
         dispatch(act_save, &mut app, &mut ui);
-        assert!(ui.overlays.is_empty());
+        assert!(
+            ui.inline_editor.is_some(),
+            "Ctrl+S must stay in inline edit mode while flushing sync"
+        );
+        assert!(ui.inline_editor.as_ref().unwrap().sync_in_flight);
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
             .await
             .expect("timed out waiting for PageEdited")
             .expect("ui_rx closed");
         assert!(
-            matches!(msg, UiMsg::PageEdited(_)),
-            "expected UiMsg::PageEdited from SubmitPageEdit"
+            matches!(msg, UiMsg::PageEdited { generation, .. } if generation == ed_gen),
+            "expected UiMsg::PageEdited with matching generation"
         );
         app.handle_ui_msg(&mut ui, msg);
+        assert!(!ui.inline_editor.as_ref().unwrap().sync_in_flight);
+        assert_eq!(
+            ui.inline_editor.as_ref().unwrap().sync_status().0,
+            "✓ Synced"
+        );
+        // Unchanged first paragraph was NOT deleted! Only the new 2nd paragraph was appended with `after: blk-old-1`!
+        assert!(deleted_ids.lock().unwrap().is_empty());
+        assert_eq!(appended_payloads.lock().unwrap().len(), 1);
+        assert_eq!(
+            appended_payloads.lock().unwrap()[0].0.as_deref(),
+            Some("blk-old-1")
+        );
 
-        // Old content block was deleted (not duplicated!) while child_page was preserved!
-        assert_eq!(*deleted_ids.lock().unwrap(), vec!["blk-old-1".to_string()]);
-        assert_eq!(appended_payloads.lock().unwrap().len(), 2);
-        assert!(ui
-            .toasts
-            .latest()
-            .is_some_and(|t| t.message == "Saved changes to Notion"));
+        // 5. Clicking [✓ Done] returns to rendered Canvas preserving scroll position
+        ui.inline_editor.as_mut().unwrap().scroll_y = 7;
+        let done_btn = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::FinishInlineEdit))
+            .expect("[✓ Done] pill should be in hitmap");
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::Button(ButtonId::FinishInlineEdit),
+                col: done_btn.x + 1,
+                row: done_btn.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(ui.inline_editor.is_none());
+        assert_eq!(ui.canvas_scroll, 7);
 
-        // 4. Ctrl+E explicitly requests external $EDITOR
+        // 6. Ctrl+E still requests external $EDITOR
         let act_ext = crate::ui::event::key_to_action(
             KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
             ui.focus(),
@@ -3343,6 +3726,403 @@ mod tests {
         assert_eq!(act_ext, Action::RequestExternalEditor);
         dispatch(act_ext, &mut app, &mut ui);
         assert!(ui.editor_requested);
+        ui.editor_requested = false;
+
+        // 7. Navigating to another page while inline editing flushes and closes cleanly
+        app.open_inline_editor(&mut ui);
+        assert!(ui.inline_editor.is_some());
+        dispatch(Action::Input('!'), &mut app, &mut ui);
+        app.open_page(&other_page.id, &mut ui, true);
+        assert!(ui.inline_editor.is_none());
+        assert_eq!(app.active_page_id.as_deref(), Some(other_page.id.as_str()));
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_inline_autosync_debounce_600ms_and_stale_generation_does_not_overwrite_newer_edits() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        use axum::{
+            extract::Path as AxumPath,
+            routing::get,
+            Json, Router,
+        };
+        use tokio::net::TcpListener;
+
+        let patch_texts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let patch_log = patch_texts.clone();
+
+        let router = Router::new()
+            .route(
+                "/v1/blocks/{id}",
+                axum::routing::patch(
+                    move |AxumPath(id): AxumPath<String>, Json(body): Json<serde_json::Value>| {
+                        let log = patch_log.clone();
+                        async move {
+                            let content = body
+                                .pointer("/paragraph/rich_text/0/text/content")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            log.lock().unwrap().push(content.clone());
+                            Json(serde_json::json!({
+                                "id": id,
+                                "type": "paragraph",
+                                "has_children": false,
+                                "paragraph": { "rich_text": [{ "plain_text": content }] }
+                            }))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v1/blocks/{id}/children",
+                get(|| async {
+                    Json(serde_json::json!({ "object": "list", "results": [], "has_more": false }))
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let cfg = AppConfig::default();
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_debounce_test");
+        let client = NotionClient::new(&cfg, auth.clone())
+            .unwrap()
+            .with_base_url(format!("http://{addr}/v1"));
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = tokio::sync::watch::channel(FocusTarget::default());
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+
+        let mut ui = UiState::from_config(&cfg);
+        ui.focus = Focus::Canvas;
+        let mut app = AppState::new(cfg, auth, client, storage, sync_ctrl, ui_tx);
+        let page = NotionPage {
+            id: "33333333-2222-3333-4444-555555555555".into(),
+            workspace_id: app.workspace_id.clone(),
+            title: "Debounce Page".into(),
+            ..Default::default()
+        };
+        app.storage.upsert_page(&page).unwrap();
+        app.pages = vec![page.clone()];
+        app.active_view = CanvasView::Page;
+        app.active_page_id = Some(page.id.clone());
+        app.active_page_detail = Some(NotionPageDetail {
+            page: page.clone(),
+            blocks: vec![NotionBlock {
+                id: "blk-p-1".into(),
+                page_id: page.id.clone(),
+                block_type: "paragraph".into(),
+                kind: NotionBlockKind::Paragraph {
+                    rich_text: vec![RichTextSpan::plain("Alpha")],
+                    color: NotionColor::Default,
+                },
+                ..Default::default()
+            }],
+            comments: Vec::new(),
+            markdown: "Alpha".into(),
+            media: Vec::new(),
+        });
+
+        assert!(app.open_inline_editor(&mut ui));
+        dispatch(Action::CursorEnd, &mut app, &mut ui);
+        dispatch(Action::Input('1'), &mut app, &mut ui);
+
+        let gen1 = ui.inline_editor.as_ref().unwrap().edit_generation;
+        assert_eq!(gen1, 1);
+        let dirty_at = ui.inline_editor.as_ref().unwrap().dirty_since.unwrap();
+
+        // Before 600ms -> debounce must NOT fire yet
+        assert!(!app.tick_inline_autosync(&mut ui, dirty_at + Duration::from_millis(500)));
+        assert!(!ui.inline_editor.as_ref().unwrap().sync_in_flight);
+
+        // At 600ms -> debounce fires background sync for gen1
+        assert!(app.tick_inline_autosync(&mut ui, dirty_at + Duration::from_millis(600)));
+        assert!(ui.inline_editor.as_ref().unwrap().sync_in_flight);
+
+        // While gen1 HTTP sync is in flight, user types '2' (advancing to gen2)
+        dispatch(Action::Input('2'), &mut app, &mut ui);
+        let gen2 = ui.inline_editor.as_ref().unwrap().edit_generation;
+        assert_eq!(gen2, 2);
+        assert_eq!(ui.inline_editor.as_ref().unwrap().composer.text(), "Alpha12");
+        assert_eq!(
+            app.active_page_detail.as_ref().unwrap().markdown,
+            "Alpha12"
+        );
+
+        // Receive gen1 completion -> must NOT overwrite gen2's local editor/detail buffer,
+        // and must automatically dispatch coalesced follow-up sync for gen2!
+        let msg1 = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+            .await
+            .expect("timed out waiting for gen1 PageEdited")
+            .expect("ui_rx closed");
+        assert!(matches!(msg1, UiMsg::PageEdited { generation: 1, .. }));
+        app.handle_ui_msg(&mut ui, msg1);
+
+        assert_eq!(
+            ui.inline_editor.as_ref().unwrap().composer.text(),
+            "Alpha12",
+            "stale PageEdited(old_gen) must NEVER overwrite newer user keystrokes"
+        );
+        assert_eq!(
+            app.active_page_detail.as_ref().unwrap().markdown,
+            "Alpha12",
+            "stale PageEdited(old_gen) must NEVER overwrite optimistic local page detail"
+        );
+        assert!(
+            ui.inline_editor.as_ref().unwrap().sync_in_flight,
+            "coalesced follow-up sync for gen2 must launch automatically"
+        );
+
+        // Receive gen2 completion -> status flips to ✓ Synced cleanly
+        let msg2 = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+            .await
+            .expect("timed out waiting for gen2 PageEdited")
+            .expect("ui_rx closed");
+        assert!(matches!(msg2, UiMsg::PageEdited { generation: 2, .. }));
+        app.handle_ui_msg(&mut ui, msg2);
+
+        let ed = ui.inline_editor.as_ref().unwrap();
+        assert!(!ed.sync_in_flight);
+        assert_eq!(ed.synced_generation, 2);
+        assert_eq!(ed.sync_status().0, "✓ Synced");
+        assert_eq!(ed.composer.text(), "Alpha12");
+        assert_eq!(
+            *patch_texts.lock().unwrap(),
+            vec!["Alpha1".to_string(), "Alpha12".to_string()]
+        );
+
+        // Idle tick after sync does nothing
+        assert!(!app.tick_inline_autosync(&mut ui, Instant::now() + Duration::from_secs(5)));
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_diff_sync_single_paragraph_edit_calls_one_patch_and_zero_deletes() {
+        use std::sync::{Arc, Mutex};
+        use axum::{
+            extract::Path as AxumPath,
+            routing::{delete, get},
+            Json, Router,
+        };
+        use tokio::net::TcpListener;
+
+        let deleted_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let patched_ids: Arc<Mutex<Vec<(String, serde_json::Value)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let appended_calls: Arc<Mutex<Vec<(Option<String>, usize)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        let initial_blocks = vec![
+            serde_json::json!({
+                "id": "blk-1",
+                "type": "heading_1",
+                "has_children": false,
+                "heading_1": { "rich_text": [{ "plain_text": "Title Section" }] }
+            }),
+            serde_json::json!({
+                "id": "blk-2",
+                "type": "paragraph",
+                "has_children": false,
+                "paragraph": { "rich_text": [{ "plain_text": "First untouched paragraph" }] }
+            }),
+            serde_json::json!({
+                "id": "blk-3",
+                "type": "paragraph",
+                "has_children": false,
+                "paragraph": { "rich_text": [{ "plain_text": "Middle line to edit" }] }
+            }),
+            serde_json::json!({
+                "id": "blk-4",
+                "type": "to_do",
+                "has_children": false,
+                "to_do": { "checked": false, "rich_text": [{ "plain_text": "Untouched todo" }] }
+            }),
+            serde_json::json!({
+                "id": "blk-5",
+                "type": "paragraph",
+                "has_children": false,
+                "paragraph": { "rich_text": [{ "plain_text": "Last untouched paragraph" }] }
+            }),
+            serde_json::json!({
+                "id": "blk-child",
+                "type": "child_page",
+                "has_children": false,
+                "child_page": { "title": "Preserved Child" }
+            }),
+        ];
+
+        let state_blocks = Arc::new(Mutex::new(initial_blocks));
+        let get_blocks = state_blocks.clone();
+        let del_blocks = state_blocks.clone();
+        let patch_blocks = state_blocks.clone();
+        let append_blocks = state_blocks.clone();
+        let del_log = deleted_ids.clone();
+        let patch_log = patched_ids.clone();
+        let app_log = appended_calls.clone();
+
+        let router = Router::new()
+            .route(
+                "/v1/pages/{id}",
+                get(|AxumPath(id): AxumPath<String>| async move {
+                    Json(serde_json::json!({
+                        "object": "page",
+                        "id": id,
+                        "url": "https://www.notion.so/page-diff",
+                        "parent": { "type": "workspace", "workspace": true },
+                        "archived": false,
+                        "properties": {
+                            "title": { "type": "title", "title": [{ "plain_text": "Diff Page" }] }
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/v1/blocks/{id}/children",
+                get(move || {
+                    let b = get_blocks.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "object": "list",
+                            "results": b.lock().unwrap().clone(),
+                            "has_more": false
+                        }))
+                    }
+                })
+                .patch(move |Json(body): Json<serde_json::Value>| {
+                    let b = append_blocks.clone();
+                    let log = app_log.clone();
+                    async move {
+                        let after = body
+                            .get("after")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        let children = body
+                            .get("children")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        log.lock().unwrap().push((after.clone(), children.len()));
+                        let mut guard = b.lock().unwrap();
+                        let mut created = Vec::new();
+                        let insert_pos = after
+                            .as_deref()
+                            .and_then(|aid| guard.iter().position(|x| x["id"] == aid))
+                            .map(|p| p + 1)
+                            .unwrap_or(guard.len());
+                        for (i, mut c) in children.into_iter().enumerate() {
+                            c["id"] = serde_json::json!(format!("blk-ins-{i}"));
+                            c["has_children"] = serde_json::json!(false);
+                            guard.insert(insert_pos + i, c.clone());
+                            created.push(c);
+                        }
+                        Json(serde_json::json!({ "object": "list", "results": created }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/blocks/{id}",
+                delete(move |AxumPath(id): AxumPath<String>| {
+                    let d = del_log.clone();
+                    let b = del_blocks.clone();
+                    async move {
+                        d.lock().unwrap().push(id.clone());
+                        b.lock().unwrap().retain(|blk| blk["id"] != id);
+                        Json(serde_json::json!({ "id": id, "archived": true }))
+                    }
+                })
+                .patch(
+                    move |AxumPath(id): AxumPath<String>, Json(body): Json<serde_json::Value>| {
+                        let p = patch_log.clone();
+                        let b = patch_blocks.clone();
+                        async move {
+                            p.lock().unwrap().push((id.clone(), body.clone()));
+                            let mut guard = b.lock().unwrap();
+                            if let Some(existing) = guard.iter_mut().find(|blk| blk["id"] == id) {
+                                let btype = existing["type"].as_str().unwrap().to_string();
+                                if let Some(inner) = body.get(&btype) {
+                                    existing[&btype] = inner.clone();
+                                }
+                                return Json(existing.clone());
+                            }
+                            Json(serde_json::json!({ "id": id, "type": "paragraph", "paragraph": { "rich_text": [] } }))
+                        }
+                    },
+                ),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let cfg = AppConfig::default();
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_diff_test");
+        let client = NotionClient::new(&cfg, auth)
+            .unwrap()
+            .with_base_url(format!("http://{addr}/v1"));
+        let storage = Storage::open_in_memory().unwrap();
+        let page_id = "44444444-2222-3333-4444-555555555555";
+
+        // 1. Change ONLY paragraph 3 (`blk-3`) on a 5-block + child_page page
+        let edited_md = "# Title Section\n\nFirst untouched paragraph\n\nMiddle line UPDATED!\n\n- [ ] Untouched todo\n\nLast untouched paragraph";
+        let detail = crate::cli::op_replace_page_markdown(&client, &storage, page_id, edited_md)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            deleted_ids.lock().unwrap().len(),
+            0,
+            "editing 1 paragraph in place must make 0 DELETE calls"
+        );
+        assert_eq!(
+            appended_calls.lock().unwrap().len(),
+            0,
+            "editing 1 paragraph in place must make 0 append calls"
+        );
+        {
+            let patches = patched_ids.lock().unwrap();
+            assert_eq!(
+                patches.len(),
+                1,
+                "editing 1 paragraph on a 5-block page must make exactly 1 PATCH call"
+            );
+            assert_eq!(patches[0].0, "blk-3");
+            assert_eq!(
+                patches[0].1.pointer("/paragraph/rich_text/0/text/content"),
+                Some(&serde_json::json!("Middle line UPDATED!"))
+            );
+        }
+        assert!(detail.markdown.contains("Middle line UPDATED!"));
+        assert!(detail
+            .blocks
+            .iter()
+            .any(|b| matches!(b.kind, NotionBlockKind::ChildPage { ref title } if title == "Preserved Child")));
+
+        // 2. Pure middle insertion after `blk-3` -> 0 DELETEs, 1 PATCH /children with `"after": "blk-3"`
+        patched_ids.lock().unwrap().clear();
+        let inserted_md = "# Title Section\n\nFirst untouched paragraph\n\nMiddle line UPDATED!\n\nBrand new inserted line\n\n- [ ] Untouched todo\n\nLast untouched paragraph";
+        let detail2 =
+            crate::cli::op_replace_page_markdown(&client, &storage, page_id, inserted_md)
+                .await
+                .unwrap();
+        assert_eq!(deleted_ids.lock().unwrap().len(), 0);
+        assert_eq!(patched_ids.lock().unwrap().len(), 0);
+        {
+            let appends = appended_calls.lock().unwrap();
+            assert_eq!(appends.len(), 1);
+            assert_eq!(appends[0].0.as_deref(), Some("blk-3"));
+            assert_eq!(appends[0].1, 1);
+        }
+        assert!(detail2.markdown.contains("Brand new inserted line"));
 
         server_handle.abort();
     }

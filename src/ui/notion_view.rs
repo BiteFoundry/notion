@@ -24,7 +24,8 @@ use crate::{
         NotionPageDetail, NotionPropertyValue, RichTextSpan,
     },
     ui::{
-        app::{AppState, CanvasView, Focus, UiState, VisibleBlock},
+        app::{AppState, CanvasView, Focus, InlineSyncStatus, UiState, VisibleBlock},
+        composer::{text_layout, truncate_display},
         hitmap::{ButtonId, HitMap, HitTarget},
         theme::Theme,
         truncate_width,
@@ -254,6 +255,15 @@ fn draw_page_canvas(
         return;
     };
 
+    if ui
+        .inline_editor
+        .as_ref()
+        .is_some_and(|ed| ed.page_id == detail.page.id)
+    {
+        draw_inline_page_editor(frame, area, content_area, &theme, ui, hitmap);
+        return;
+    }
+
     let visible = app.visible_blocks(ui);
     let selected_idx = ui.selected_block.min(visible.len().saturating_sub(1));
     let canvas_focused = ui.focus == Focus::Canvas;
@@ -482,6 +492,481 @@ fn draw_page_canvas(
             .thumb_style(Style::default().fg(theme.fg_muted).bg(theme.bg_canvas));
         frame.render_stateful_widget(scrollbar, area, &mut sb_state);
     }
+}
+
+/// Renders the in-place inline Markdown editor directly inside the Page Canvas content area
+/// (no floating popup modal), keeping breadcrumb bar, sidebar, width mode, and scroll intact.
+fn draw_inline_page_editor(
+    frame: &mut Frame,
+    pane_area: Rect,
+    content_area: Rect,
+    theme: &Theme,
+    ui: &mut UiState,
+    hitmap: &mut HitMap,
+) {
+    let canvas_focused = ui.focus == Focus::Canvas;
+    let Some(ed) = ui.inline_editor.as_mut() else {
+        return;
+    };
+
+    if content_area.width < 8 || content_area.height < 2 {
+        ed.last_editor_area = None;
+        return;
+    }
+
+    // 1. Compact 1-line inline edit bar at top of Canvas content area
+    let bar_rect = Rect::new(content_area.x, content_area.y, content_area.width, 1);
+    let bar_bg = theme.bg_header;
+    frame.render_widget(
+        Paragraph::new("").style(Style::default().bg(bar_bg)),
+        bar_rect,
+    );
+
+    let (status_text, status_kind) = ed.sync_status();
+    let status_fg = match status_kind {
+        InlineSyncStatus::Synced => theme.success,
+        InlineSyncStatus::Syncing => theme.accent_soft,
+        InlineSyncStatus::Edited => theme.warning,
+        InlineSyncStatus::Error => theme.error,
+    };
+
+    let (ln, col) = ed.cursor_line_col();
+    let done_pill = "[✓ Done]";
+    let save_pill = "[Ctrl+S Save]";
+    let ext_pill = "[Ext $EDITOR]";
+    let pos_text = format!("Ln {ln}, Col {col}");
+
+    let mut right_items: Vec<(String, Option<ButtonId>, Style)> = vec![
+        (
+            done_pill.to_string(),
+            Some(ButtonId::FinishInlineEdit),
+            Style::default()
+                .fg(theme.success)
+                .bg(bar_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        (
+            save_pill.to_string(),
+            Some(ButtonId::SaveInlineEdit),
+            Style::default()
+                .fg(theme.accent_soft)
+                .bg(bar_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if content_area.width >= 66 {
+        right_items.push((
+            ext_pill.to_string(),
+            Some(ButtonId::EditExternal),
+            Style::default().fg(theme.fg_muted).bg(bar_bg),
+        ));
+    }
+    if content_area.width >= 54 {
+        right_items.push((
+            pos_text,
+            None,
+            Style::default().fg(theme.fg_muted).bg(bar_bg),
+        ));
+    }
+
+    let right_w: u16 = right_items
+        .iter()
+        .enumerate()
+        .map(|(i, (label, _, _))| label.width() as u16 + u16::from(i > 0))
+        .sum::<u16>()
+        .saturating_add(1);
+
+    let left_budget = content_area.width.saturating_sub(right_w) as usize;
+    let edit_badge = "✎ EDITING";
+    let left_line = if left_budget >= edit_badge.width() + 3 + status_text.width() + 1 {
+        Line::from(vec![
+            Span::styled(
+                format!(" {edit_badge}"),
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(bar_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · ", Style::default().fg(theme.fg_subtle).bg(bar_bg)),
+            Span::styled(
+                status_text,
+                Style::default()
+                    .fg(status_fg)
+                    .bg(bar_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
+            truncate_width(&format!(" {edit_badge} · {status_text}"), left_budget),
+            Style::default()
+                .fg(status_fg)
+                .bg(bar_bg)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    if left_budget > 0 {
+        frame.render_widget(
+            Paragraph::new(left_line).style(Style::default().bg(bar_bg)),
+            Rect::new(bar_rect.x, bar_rect.y, left_budget as u16, 1),
+        );
+    }
+
+    let mut rx = bar_rect.right().saturating_sub(right_w);
+    for (idx, (label, btn, style)) in right_items.into_iter().enumerate() {
+        if idx > 0 {
+            rx = rx.saturating_add(1);
+        }
+        let w = (label.width() as u16).min(bar_rect.right().saturating_sub(rx));
+        if w == 0 {
+            break;
+        }
+        frame.render_widget(
+            Paragraph::new(Span::styled(label, style)),
+            Rect::new(rx, bar_rect.y, w, 1),
+        );
+        if let Some(button_id) = btn {
+            hitmap.add_line(rx, bar_rect.y, w, HitTarget::Button(button_id));
+        }
+        rx = rx.saturating_add(w);
+    }
+
+    // 2. Editable Markdown Body directly below the 1-line edit bar
+    let body_y = content_area.y.saturating_add(1);
+    let body_h = content_area.height.saturating_sub(1).max(1);
+    let editor_area = Rect::new(content_area.x, body_y, content_area.width, body_h);
+    ed.last_viewport_height = body_h;
+    ed.last_editor_area = Some(editor_area);
+    ed.composer.last_inner_width = editor_area.width;
+
+    let text = ed.composer.text();
+    let cursor = ed.composer.cursor();
+    let selection = ed.composer.selection_range();
+    let (visual, cursor_row, cursor_col) =
+        text_layout(text, editor_area.width.max(1) as usize, cursor);
+
+    let total_rows = visual.len();
+    let view_h = body_h as usize;
+    let max_scroll = total_rows.saturating_sub(view_h);
+
+    let mut offset = ed.scroll_y as usize;
+    if ed.follow_cursor {
+        if cursor_row < offset {
+            offset = cursor_row;
+        } else if cursor_row >= offset.saturating_add(view_h) {
+            offset = cursor_row.saturating_add(1).saturating_sub(view_h);
+        }
+    }
+    offset = offset.min(max_scroll);
+    ed.scroll_y = offset.min(u16::MAX as usize) as u16;
+    ed.last_visual_lines = visual.clone();
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(view_h);
+    if text.is_empty() {
+        lines.push(Line::from(Span::styled(
+            truncate_display(
+                "Type Markdown here (# Heading, - [ ] Todo, > Quote, ```code```)...",
+                editor_area.width as usize,
+            ),
+            theme.muted_style().add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        let mut in_code_fence = code_fence_state_before(text, visual.get(offset).map_or(0, |r| r.0));
+        for &(start, end) in visual.iter().skip(offset).take(view_h) {
+            let is_logical_start = start == 0 || text.as_bytes().get(start - 1) == Some(&b'\n');
+            let (logical_start, logical_end) = logical_line_bounds(text, start);
+            let logical_line = text.get(logical_start..logical_end).unwrap_or("");
+            let is_fence_delim = logical_line.trim_start().starts_with("```");
+
+            let line = highlight_markdown_visual_slice(
+                text,
+                start,
+                end,
+                logical_start,
+                logical_line,
+                in_code_fence,
+                is_fence_delim,
+                selection,
+                theme,
+            );
+            lines.push(line);
+
+            if is_logical_start && is_fence_delim {
+                in_code_fence = !in_code_fence;
+            }
+        }
+    }
+
+    let body_surface = Style::default().bg(theme.bg_canvas).fg(theme.fg_primary);
+    frame.render_widget(Paragraph::new(lines).style(body_surface), editor_area);
+    hitmap.add(editor_area, HitTarget::InlineEditorBody);
+
+    if total_rows > view_h && pane_area.width >= 4 {
+        let sb_area = Rect::new(
+            pane_area.right().saturating_sub(1),
+            body_y,
+            1,
+            body_h,
+        );
+        let mut sb_state = ScrollbarState::new(max_scroll.saturating_add(1))
+            .position(offset)
+            .viewport_content_length(view_h);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("┃")
+            .track_style(Style::default().fg(theme.divider).bg(theme.bg_canvas))
+            .thumb_style(Style::default().fg(theme.accent).bg(theme.bg_canvas));
+        frame.render_stateful_widget(scrollbar, sb_area, &mut sb_state);
+    }
+
+    // 3. Live terminal cursor position
+    if canvas_focused && cursor_row >= offset && cursor_row < offset.saturating_add(view_h) {
+        let cy = editor_area
+            .y
+            .saturating_add((cursor_row - offset) as u16)
+            .min(editor_area.bottom().saturating_sub(1));
+        let cx = editor_area
+            .x
+            .saturating_add(cursor_col as u16)
+            .min(editor_area.right().saturating_sub(1));
+        ui.cursor_pos = Some((cx, cy));
+    }
+}
+
+fn code_fence_state_before(text: &str, byte_offset: usize) -> bool {
+    let prefix = text.get(..byte_offset.min(text.len())).unwrap_or("");
+    let mut in_fence = false;
+    for line in prefix.split('\n') {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+    }
+    // If byte_offset is in the middle of a fence delimiter line itself, do not flip twice.
+    if byte_offset < text.len()
+        && byte_offset > 0
+        && text.as_bytes().get(byte_offset - 1) != Some(&b'\n')
+    {
+        if let Some(cur_line) = prefix.rsplit('\n').next() {
+            if cur_line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+            }
+        }
+    }
+    in_fence
+}
+
+fn logical_line_bounds(text: &str, pos: usize) -> (usize, usize) {
+    let clamped = pos.min(text.len());
+    let start = text[..clamped].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[clamped..]
+        .find('\n')
+        .map_or(text.len(), |i| clamped + i);
+    (start, end)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn highlight_markdown_visual_slice(
+    text: &str,
+    start: usize,
+    end: usize,
+    logical_start: usize,
+    logical_line: &str,
+    in_code_fence: bool,
+    is_fence_delim: bool,
+    selection: Option<(usize, usize)>,
+    theme: &Theme,
+) -> Line<'static> {
+    let slice = text.get(start..end).unwrap_or("");
+    if slice.is_empty() {
+        return Line::from("");
+    }
+
+    let base_default = Style::default().fg(theme.fg_primary).bg(theme.bg_canvas);
+    let (prefix_end_byte, prefix_style, body_style, allow_inline_code) = if is_fence_delim {
+        let fence_style = Style::default()
+            .fg(theme.accent_soft)
+            .bg(theme.bg_code)
+            .add_modifier(Modifier::BOLD);
+        (logical_start + logical_line.len(), fence_style, fence_style, false)
+    } else if in_code_fence {
+        let code_style = Style::default().fg(theme.code_fg).bg(theme.bg_code);
+        (logical_start, code_style, code_style, false)
+    } else {
+        classify_markdown_line(logical_start, logical_line, theme, base_default)
+    };
+
+    // Count backticks before `start` on the same logical line so wrapped inline code keeps styling.
+    let mut in_inline_code = false;
+    if allow_inline_code && start > logical_start {
+        if let Some(prev) = text.get(logical_start..start) {
+            for ch in prev.chars() {
+                if ch == '`' {
+                    in_inline_code = !in_inline_code;
+                }
+            }
+        }
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_style: Option<Style> = None;
+
+    for (offset, ch) in slice.char_indices() {
+        let pos = start + offset;
+        let is_tick = allow_inline_code && ch == '`';
+        if is_tick && !in_inline_code {
+            in_inline_code = true;
+        }
+
+        let selected = selection
+            .map(|(from, to)| pos >= from && pos < to)
+            .unwrap_or(false);
+        let style = if selected {
+            theme.selection()
+        } else if pos < prefix_end_byte {
+            prefix_style
+        } else if in_inline_code {
+            theme.code_style()
+        } else {
+            body_style
+        };
+
+        if is_tick && in_inline_code {
+            // Closing backtick ends inline code after styling the backtick itself.
+            let before_count = text
+                .get(logical_start..=pos)
+                .map(|s| s.chars().filter(|&c| c == '`').count())
+                .unwrap_or(0);
+            if before_count % 2 == 0 {
+                in_inline_code = false;
+            }
+        }
+
+        if run_style != Some(style) {
+            if !run.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut run),
+                    run_style.unwrap_or(base_default),
+                ));
+            }
+            run_style = Some(style);
+        }
+        if ch == '\t' {
+            run.push_str("    ");
+        } else {
+            run.push(ch);
+        }
+    }
+
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style.unwrap_or(base_default)));
+    }
+    Line::from(spans)
+}
+
+fn classify_markdown_line(
+    logical_start: usize,
+    logical_line: &str,
+    theme: &Theme,
+    base_default: Style,
+) -> (usize, Style, Style, bool) {
+    let lead_ws = logical_line.len() - logical_line.trim_start_matches([' ', '\t']).len();
+    let trimmed = &logical_line[lead_ws..];
+
+    if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+        let st = Style::default().fg(theme.fg_muted).bg(theme.bg_canvas);
+        return (logical_start + logical_line.len(), st, st, false);
+    }
+    if trimmed.starts_with("### ") {
+        let p_end = logical_start + lead_ws + 4;
+        let p_st = Style::default()
+            .fg(theme.accent)
+            .bg(theme.bg_canvas)
+            .add_modifier(Modifier::BOLD);
+        let b_st = Style::default()
+            .fg(theme.fg_secondary)
+            .bg(theme.bg_canvas)
+            .add_modifier(Modifier::BOLD);
+        return (p_end, p_st, b_st, true);
+    }
+    if trimmed.starts_with("## ") {
+        let p_end = logical_start + lead_ws + 3;
+        let p_st = Style::default()
+            .fg(theme.accent)
+            .bg(theme.bg_canvas)
+            .add_modifier(Modifier::BOLD);
+        let b_st = Style::default()
+            .fg(theme.accent_soft)
+            .bg(theme.bg_canvas)
+            .add_modifier(Modifier::BOLD);
+        return (p_end, p_st, b_st, true);
+    }
+    if trimmed.starts_with("# ") {
+        let p_end = logical_start + lead_ws + 2;
+        let p_st = Style::default()
+            .fg(theme.accent)
+            .bg(theme.bg_canvas)
+            .add_modifier(Modifier::BOLD);
+        let b_st = Style::default()
+            .fg(theme.fg_primary)
+            .bg(theme.bg_canvas)
+            .add_modifier(Modifier::BOLD);
+        return (p_end, p_st, b_st, true);
+    }
+    if trimmed.starts_with("- [x] ")
+        || trimmed.starts_with("- [X] ")
+        || trimmed.starts_with("* [x] ")
+        || trimmed.starts_with("* [X] ")
+    {
+        let p_end = logical_start + lead_ws + 6;
+        let p_st = Style::default()
+            .fg(theme.success)
+            .bg(theme.bg_canvas)
+            .add_modifier(Modifier::BOLD);
+        let b_st = Style::default()
+            .fg(theme.fg_muted)
+            .bg(theme.bg_canvas)
+            .add_modifier(Modifier::CROSSED_OUT);
+        return (p_end, p_st, b_st, true);
+    }
+    if trimmed.starts_with("- [ ] ") || trimmed.starts_with("* [ ] ") {
+        let p_end = logical_start + lead_ws + 6;
+        let p_st = Style::default()
+            .fg(theme.warning)
+            .bg(theme.bg_canvas)
+            .add_modifier(Modifier::BOLD);
+        return (p_end, p_st, base_default, true);
+    }
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        let p_end = logical_start + lead_ws + 2;
+        let p_st = Style::default()
+            .fg(theme.accent)
+            .bg(theme.bg_canvas)
+            .add_modifier(Modifier::BOLD);
+        return (p_end, p_st, base_default, true);
+    }
+    if let Some(dot) = trimmed.find(". ") {
+        if dot > 0 && dot <= 4 && trimmed[..dot].chars().all(|c| c.is_ascii_digit()) {
+            let p_end = logical_start + lead_ws + dot + 2;
+            let p_st = Style::default()
+                .fg(theme.accent)
+                .bg(theme.bg_canvas)
+                .add_modifier(Modifier::BOLD);
+            return (p_end, p_st, base_default, true);
+        }
+    }
+    if trimmed.starts_with("> ") || trimmed == ">" {
+        let p_end = logical_start + lead_ws + trimmed.len().min(2);
+        let p_st = Style::default()
+            .fg(theme.accent)
+            .bg(theme.bg_canvas)
+            .add_modifier(Modifier::BOLD);
+        let b_st = theme.quote_style().bg(theme.bg_canvas);
+        return (p_end, p_st, b_st, true);
+    }
+    (logical_start, base_default, base_default, true)
 }
 
 fn push_properties_strip(

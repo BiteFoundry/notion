@@ -9,7 +9,6 @@ pub mod html_preview;
 pub mod image_preview;
 pub mod links;
 pub mod notion_form;
-pub mod page_editor;
 pub mod path_input;
 pub mod search;
 pub mod settings;
@@ -31,8 +30,7 @@ use crate::ui::{
         attachments::AttachmentsState, command_palette::CommandPalette, confirm::ConfirmDialog,
         context_menu::ContextMenu, file_picker::FilePickerOverlay,
         html_preview::HtmlPreviewOverlay, image_preview::ImagePreviewOverlay,
-        links::LinkExtractorOverlay, notion_form::NotionFormOverlay,
-        page_editor::PageEditorOverlay, path_input::PathInputState,
+        links::LinkExtractorOverlay, notion_form::NotionFormOverlay, path_input::PathInputState,
         search::SearchOverlay, settings::SettingsState,
         workspace_switcher::WorkspaceSwitcherOverlay,
     },
@@ -50,7 +48,6 @@ pub enum OverlayKind {
     FilePicker,
     Links,
     NotionForm,
-    PageEditor,
     ImagePreview,
     HtmlPreview,
     Help,
@@ -78,7 +75,6 @@ pub enum Overlay {
     FilePicker(FilePickerOverlay),
     Links(LinkExtractorOverlay),
     NotionForm(NotionFormOverlay),
-    PageEditor(PageEditorOverlay),
     ImagePreview(ImagePreviewOverlay),
     HtmlPreview(HtmlPreviewOverlay),
     Help(HelpOverlay),
@@ -98,7 +94,6 @@ impl Overlay {
             Overlay::FilePicker(_) => OverlayKind::FilePicker,
             Overlay::Links(_) => OverlayKind::Links,
             Overlay::NotionForm(_) => OverlayKind::NotionForm,
-            Overlay::PageEditor(_) => OverlayKind::PageEditor,
             Overlay::ImagePreview(_) => OverlayKind::ImagePreview,
             Overlay::HtmlPreview(_) => OverlayKind::HtmlPreview,
             Overlay::Help(_) => OverlayKind::Help,
@@ -113,7 +108,6 @@ impl Overlay {
             | Overlay::PathInput(_)
             | Overlay::FilePicker(_) => true,
             Overlay::NotionForm(form) => form.accepts_text(),
-            Overlay::PageEditor(ed) => ed.accepts_text(),
             Overlay::HtmlPreview(html) => html.accepts_text(),
             _ => false,
         }
@@ -157,14 +151,6 @@ impl Overlay {
 
     pub fn notion_form(form: NotionFormOverlay) -> Self {
         Overlay::NotionForm(form)
-    }
-
-    pub fn page_editor(
-        page_id: impl Into<String>,
-        page_title: impl Into<String>,
-        markdown: impl Into<String>,
-    ) -> Self {
-        Overlay::PageEditor(PageEditorOverlay::new(page_id, page_title, markdown))
     }
 
     pub fn html_preview(title: impl Into<String>, html: String) -> Self {
@@ -232,7 +218,6 @@ impl Overlay {
             Overlay::FilePicker(picker) => picker.handle(action),
             Overlay::Links(links) => links.handle(action),
             Overlay::NotionForm(form) => form.handle(action),
-            Overlay::PageEditor(ed) => ed.handle(action),
             Overlay::ImagePreview(preview) => preview.handle(action),
             Overlay::HtmlPreview(html) => html.handle(action),
             Overlay::Help(_) => match action {
@@ -257,8 +242,7 @@ impl Overlay {
             Overlay::FilePicker(picker) => picker.select(index),
             Overlay::Links(links) => links.select(index),
             Overlay::NotionForm(form) => form.select(index),
-            Overlay::PageEditor(_)
-            | Overlay::ImagePreview(_)
+            Overlay::ImagePreview(_)
             | Overlay::HtmlPreview(_)
             | Overlay::PathInput(_)
             | Overlay::Help(_)
@@ -315,7 +299,6 @@ impl Overlay {
                 form.draw(frame, area, ui, hitmap);
                 None
             }
-            Overlay::PageEditor(ed) => ed.draw(frame, area, ui, hitmap),
             Overlay::ImagePreview(preview) => {
                 preview.draw(frame, area, app, ui, hitmap);
                 None

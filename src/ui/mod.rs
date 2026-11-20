@@ -58,6 +58,7 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     ui.term_width = area.width;
     ui.term_height = area.height;
     ui.pending_pixel_graphic = None;
+    ui.cursor_pos = None;
 
     let mut hitmap = HitMap::new();
     hitmap.add(area, HitTarget::Pane(ui.focus));
@@ -122,16 +123,23 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
 
     // Render overlay stack bottom-to-top
     let mut overlays = std::mem::take(&mut ui.overlays);
-    let mut cursor_pos = None;
-    for ov in &mut overlays {
-        if let Some(pos) = ov.draw(frame, area, app, ui, &mut hitmap) {
-            cursor_pos = Some(pos);
+    if !overlays.is_empty() {
+        // Active overlay owns focus & terminal cursor instead of inline canvas editor
+        ui.cursor_pos = None;
+        for ov in &mut overlays {
+            if let Some(pos) = ov.draw(frame, area, app, ui, &mut hitmap) {
+                ui.cursor_pos = Some(pos);
+            }
         }
     }
     ui.overlays = overlays;
 
+    if let Some((cx, cy)) = ui.cursor_pos {
+        frame.set_cursor_position((cx, cy));
+    }
+
     ui.hitmap = hitmap;
-    cursor_pos
+    ui.cursor_pos
 }
 
 fn draw_vertical_divider(frame: &mut Frame, area: Rect, theme: &theme::Theme) {
@@ -209,17 +217,22 @@ fn draw_status_bar(
         };
         let focus_tag = match ui.focus {
             Focus::Sidebar => "Sidebar",
+            Focus::Canvas if ui.inline_editor.is_some() => "Editing",
             Focus::Canvas if app.active_view == CanvasView::Database => "Database",
             Focus::Canvas => "Page",
             Focus::Comments => "Comments",
             Focus::Overlay => "Overlay",
         };
-        let hints = match app.active_view {
-            CanvasView::Page => {
-                "a Append · e Edit · n New · f Fav · C Comments · w Width · Ctrl+K Find · ? Help"
-            }
-            CanvasView::Database => {
-                "1 Table · 2 Board · 3 List · f Filter · s Sort · m Move · n New · Ctrl+K Find"
+        let hints = if ui.inline_editor.is_some() {
+            "Esc Done · Ctrl+S Save Now · Ctrl+Z/Y Undo/Redo · Ctrl+V Paste · Ctrl+E $EDITOR"
+        } else {
+            match app.active_view {
+                CanvasView::Page => {
+                    "a Append · e Edit · n New · f Fav · C Comments · w Width · Ctrl+K Find · ? Help"
+                }
+                CanvasView::Database => {
+                    "1 Table · 2 Board · 3 List · f Filter · s Sort · m Move · n New · Ctrl+K Find"
+                }
             }
         };
         left_spans.push(Span::styled(

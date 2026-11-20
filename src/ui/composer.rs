@@ -28,7 +28,7 @@ struct Snapshot {
     cursor: usize,
 }
 
-/// Alias used by full-screen in-terminal Markdown editors (e.g. `PageEditorOverlay`).
+/// Alias used by in-terminal Markdown editors (e.g. `InlinePageEditor`).
 pub type MultiLineComposer = ComposerState;
 
 #[derive(Debug, Clone)]
@@ -377,6 +377,17 @@ impl ComposerState {
 
     pub fn move_doc_end(&mut self, extend: bool) {
         self.move_to(self.text.len(), extend);
+    }
+
+    /// Places the cursor at a specific UTF-8 byte offset (snapped safely to a char boundary)
+    /// and clears any active selection anchor.
+    pub fn set_cursor(&mut self, pos: usize) {
+        let mut safe = pos.min(self.text.len());
+        while safe > 0 && !self.text.is_char_boundary(safe) {
+            safe -= 1;
+        }
+        self.cursor = safe;
+        self.anchor = None;
     }
 
     fn move_to(&mut self, pos: usize, extend: bool) {

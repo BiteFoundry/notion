@@ -77,6 +77,48 @@ pub fn key_to_action(
         };
     }
 
+    // In-place inline Canvas Markdown editor: route all typing, editing, and navigation keys
+    // directly to the inline editor so `q`, `j`, `k`, `e`, space, etc. insert text normally.
+    if focus == Focus::Canvas && text_input {
+        if ctrl && !alt {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') => return Some(Action::QuitConfirm),
+                KeyCode::Char('s') | KeyCode::Char('S') => return Some(Action::SaveInlineEdit),
+                KeyCode::Char('z') | KeyCode::Char('Z') => return Some(Action::Undo),
+                KeyCode::Char('y') | KeyCode::Char('Y') => return Some(Action::Redo),
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    return Some(Action::RequestExternalEditor);
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => return Some(Action::PasteClipboard),
+                KeyCode::Char('b') | KeyCode::Char('B') => return Some(Action::ToggleSidebar),
+                KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Char('p') | KeyCode::Char('P') => {
+                    return Some(Action::OpenOverlay(OverlayKind::CommandPalette));
+                }
+                _ => return None,
+            }
+        }
+        if alt {
+            return None;
+        }
+        return match key.code {
+            KeyCode::Esc => Some(Action::FinishInlineEdit),
+            KeyCode::Enter => Some(Action::Newline),
+            KeyCode::Tab => Some(Action::Tab),
+            KeyCode::Backspace => Some(Action::Backspace),
+            KeyCode::Delete => Some(Action::Delete),
+            KeyCode::Up => Some(Action::CursorUp),
+            KeyCode::Down => Some(Action::CursorDown),
+            KeyCode::Left => Some(Action::CursorLeft),
+            KeyCode::Right => Some(Action::CursorRight),
+            KeyCode::Home => Some(Action::CursorHome),
+            KeyCode::End => Some(Action::CursorEnd),
+            KeyCode::PageUp => Some(Action::PageUp),
+            KeyCode::PageDown => Some(Action::PageDown),
+            KeyCode::Char(ch) => Some(Action::Input(ch)),
+            _ => None,
+        };
+    }
+
     if let Some(cmd) = keymap.resolve_global(&key, text_input) {
         return Some(match cmd {
             KeyCommand::Quit => Action::QuitConfirm,

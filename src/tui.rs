@@ -1009,7 +1009,7 @@ pub async fn run(
     );
 
     let mut events = EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(200));
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
     let mut last_activity_sent: Option<Instant> = None;
@@ -1074,12 +1074,20 @@ pub async fn run(
         let mut should_quit = false;
         tokio::select! {
             _ = tick.tick() => {
+                let now = Instant::now();
                 let before = ui.toasts.len();
-                ui.toasts.tick(Instant::now());
+                ui.toasts.tick(now);
                 if ui.toasts.len() != before {
                     dirty = true;
                 }
-                if ui.poll_retrying || app.syncing || ui.tasks.first_running().is_some() {
+                if app.tick_inline_autosync(&mut ui, now) {
+                    dirty = true;
+                }
+                if ui.poll_retrying
+                    || app.syncing
+                    || ui.tasks.first_running().is_some()
+                    || ui.inline_editor.as_ref().is_some_and(|ed| ed.sync_in_flight)
+                {
                     ui.spinner_tick = ui.spinner_tick.wrapping_add(1);
                     dirty = true;
                 }

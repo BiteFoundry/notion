@@ -2,11 +2,15 @@
 //! sidebar tree builder, visible block flattener (with live toggle expansion),
 //! and database Table / Board (Kanban) / List query helpers.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use bitefoundry_html::NativeHtmlServer;
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     auth::AuthManager,
@@ -20,9 +24,11 @@ use crate::{
         NotionUser, POLL_RETRY_SUMMARY,
     },
     notion::NotionClient,
+    parser::apply_optimistic_markdown_to_detail,
     storage::Storage,
     sync::{FocusTarget, SyncCommand, SyncController},
     ui::{
+        composer::{normalize, MultiLineComposer},
         hitmap::HitMap,
         keymap::KeyMap,
         overlays::Overlay,
@@ -30,6 +36,131 @@ use crate::{
         toast::{TaskBoard, ToastQueue},
     },
 };
+
+/// Real-time auto-save debounce interval for in-place inline page editing.
+pub const INLINE_AUTOSYNC_DEBOUNCE: Duration = Duration::from_millis(600);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineSyncStatus {
+    Synced,
+    Syncing,
+    Edited,
+    Error,
+}
+
+/// In-place inline Markdown editor rendered directly inside the Page Canvas pane.
+#[derive(Debug, Clone)]
+pub struct InlinePageEditor {
+    pub page_id: String,
+    pub page_title: String,
+    pub composer: MultiLineComposer,
+    pub scroll_y: u16,
+    pub follow_cursor: bool,
+    pub last_viewport_height: u16,
+    pub last_editor_area: Option<Rect>,
+    pub last_visual_lines: Vec<(usize, usize)>,
+    pub edit_generation: u64,
+    pub synced_generation: u64,
+    pub dirty_since: Option<Instant>,
+    pub sync_in_flight: bool,
+    pub last_sync_error: Option<String>,
+    pub last_synced_markdown: String,
+    pub remote_blocks: Vec<NotionBlock>,
+}
+
+impl InlinePageEditor {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        page_id: impl Into<String>,
+        page_title: impl Into<String>,
+        markdown: &str,
+        initial_scroll: u16,
+        edit_generation: u64,
+        synced_generation: u64,
+        sync_in_flight: bool,
+        remote_blocks: Vec<NotionBlock>,
+    ) -> Self {
+        let initial_markdown = normalize(markdown);
+        let mut composer = MultiLineComposer::new();
+        composer.load_text_cursor_start(&initial_markdown);
+        Self {
+            page_id: page_id.into(),
+            page_title: page_title.into(),
+            composer,
+            scroll_y: initial_scroll,
+            follow_cursor: false,
+            last_viewport_height: 20,
+            last_editor_area: None,
+            last_visual_lines: Vec::new(),
+            edit_generation,
+            synced_generation,
+            dirty_since: None,
+            sync_in_flight,
+            last_sync_error: None,
+            last_synced_markdown: initial_markdown,
+            remote_blocks,
+        }
+    }
+
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        self.composer.cursor_line_col()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.edit_generation > self.synced_generation
+            || self.composer.text() != self.last_synced_markdown
+    }
+
+    pub fn sync_status(&self) -> (&'static str, InlineSyncStatus) {
+        if self.last_sync_error.is_some() {
+            ("⚠ Sync error", InlineSyncStatus::Error)
+        } else if self.sync_in_flight {
+            ("● Syncing...", InlineSyncStatus::Syncing)
+        } else if self.edit_generation > self.synced_generation {
+            ("● Edited", InlineSyncStatus::Edited)
+        } else {
+            ("✓ Synced", InlineSyncStatus::Synced)
+        }
+    }
+
+    /// Maps a mouse click `(col, row)` inside the rendered editor body to the closest UTF-8
+    /// character boundary in `self.composer` and moves the cursor there.
+    pub fn place_cursor_at_screen_pos(&mut self, col: u16, row: u16) -> bool {
+        let Some(area) = self.last_editor_area else {
+            return false;
+        };
+        if row < area.y || row >= area.bottom() || col < area.x || col >= area.right() {
+            return false;
+        }
+        let rel_row = (row - area.y) as usize;
+        let rel_col = (col - area.x) as usize;
+        let visual_idx = (self.scroll_y as usize).saturating_add(rel_row);
+        let text = self.composer.text();
+        let byte_pos = if let Some(&(start, end)) = self.last_visual_lines.get(visual_idx) {
+            let slice = text.get(start..end).unwrap_or("");
+            let mut used = 0usize;
+            let mut found = end;
+            for (offset, ch) in slice.char_indices() {
+                let w = if ch == '\t' {
+                    4
+                } else {
+                    UnicodeWidthChar::width(ch).unwrap_or(0)
+                };
+                if rel_col < used + w.max(1) {
+                    found = start + offset;
+                    break;
+                }
+                used += w;
+            }
+            found
+        } else {
+            text.len()
+        };
+        self.composer.set_cursor(byte_pos);
+        self.follow_cursor = true;
+        true
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
@@ -106,7 +237,16 @@ pub enum UiMsg {
     },
     DaemonDetached,
     PageRefreshed(Box<NotionPageDetail>),
-    PageEdited(Box<NotionPageDetail>),
+    PageEdited {
+        page_id: String,
+        generation: u64,
+        detail: Box<NotionPageDetail>,
+    },
+    PageEditFailed {
+        page_id: String,
+        generation: u64,
+        error: String,
+    },
     PageCreated(NotionPage),
     PageArchived(String),
     MediaUrlRefreshed {
@@ -163,6 +303,12 @@ pub struct UiState {
     pub toasts: ToastQueue,
     pub tasks: TaskBoard,
     pub overlays: Vec<Overlay>,
+    pub inline_editor: Option<InlinePageEditor>,
+    pub cursor_pos: Option<(u16, u16)>,
+    pub page_edit_generations: HashMap<String, u64>,
+    pub page_synced_generations: HashMap<String, u64>,
+    pub page_sync_in_flight: HashSet<String>,
+    pub pending_page_sync: HashMap<String, (u64, String, Vec<NotionBlock>)>,
     pub sidebar_selected: usize,
     pub collapsed_nodes: HashSet<String>,
     pub expanded_toggles: HashSet<String>,
@@ -215,6 +361,12 @@ impl UiState {
             toasts: ToastQueue::new(),
             tasks: TaskBoard::default(),
             overlays: Vec::new(),
+            inline_editor: None,
+            cursor_pos: None,
+            page_edit_generations: HashMap::new(),
+            page_synced_generations: HashMap::new(),
+            page_sync_in_flight: HashSet::new(),
+            pending_page_sync: HashMap::new(),
             sidebar_selected: 0,
             collapsed_nodes: HashSet::new(),
             expanded_toggles: HashSet::new(),
@@ -253,6 +405,9 @@ impl UiState {
     pub fn accepts_text_input(&self) -> bool {
         if let Some(top) = self.overlays.last() {
             return top.accepts_text();
+        }
+        if self.inline_editor.is_some() && self.focus == Focus::Canvas {
+            return true;
         }
         self.focus == Focus::Comments
     }
@@ -375,6 +530,15 @@ impl AppState {
     }
 
     pub fn open_page(&mut self, page_id: &str, ui: &mut UiState, push_history: bool) {
+        if ui
+            .inline_editor
+            .as_ref()
+            .is_some_and(|ed| ed.page_id != page_id)
+        {
+            self.close_inline_editor_and_flush(ui);
+        } else if ui.inline_editor.is_some() {
+            self.close_inline_editor_and_flush(ui);
+        }
         if push_history {
             self.push_current_to_nav_stack();
         }
@@ -402,6 +566,9 @@ impl AppState {
     }
 
     pub fn open_database(&mut self, database_id: &str, ui: &mut UiState, push_history: bool) {
+        if ui.inline_editor.is_some() {
+            self.close_inline_editor_and_flush(ui);
+        }
         if push_history {
             self.push_current_to_nav_stack();
         }
@@ -422,6 +589,263 @@ impl AppState {
         });
         self.sync_ctrl.request(SyncCommand::RefreshDatabase {
             database_id: database_id.to_string(),
+        });
+    }
+
+    /// Opens the in-place inline Markdown editor directly inside the Page Canvas pane.
+    pub fn open_inline_editor(&mut self, ui: &mut UiState) -> bool {
+        if self.active_view != CanvasView::Page {
+            return false;
+        }
+        let Some(detail) = self.active_page_detail.as_ref() else {
+            return false;
+        };
+        let page_id = detail.page.id.clone();
+        let page_title = detail.page.display_title().to_string();
+        let current_gen = ui.page_edit_generations.get(&page_id).copied().unwrap_or(0);
+        let synced_gen = ui
+            .page_synced_generations
+            .get(&page_id)
+            .copied()
+            .unwrap_or(current_gen);
+        let in_flight = ui.page_sync_in_flight.contains(&page_id);
+        let remote_blocks = if !detail.blocks.is_empty()
+            && detail
+                .blocks
+                .iter()
+                .all(|b| !b.id.trim().is_empty() && !b.id.starts_with("__optimistic_"))
+        {
+            detail.blocks.clone()
+        } else {
+            Vec::new()
+        };
+
+        ui.inline_editor = Some(InlinePageEditor::new(
+            page_id,
+            page_title,
+            &detail.markdown,
+            ui.canvas_scroll,
+            current_gen,
+            synced_gen,
+            in_flight,
+            remote_blocks,
+        ));
+        ui.focus = Focus::Canvas;
+        ui.narrow_pane = NarrowPane::Canvas;
+        true
+    }
+
+    /// Records a text mutation on the active inline editor: bumps `edit_generation`,
+    /// arms the 600ms auto-sync debounce timer, and reflects edits into `active_page_detail` in 0ms.
+    pub fn record_inline_mutation(&mut self, ui: &mut UiState, persist_sqlite: bool) {
+        let Some(ed) = ui.inline_editor.as_mut() else {
+            return;
+        };
+        ed.edit_generation = ed.edit_generation.saturating_add(1);
+        ed.dirty_since = Some(Instant::now());
+        ed.last_sync_error = None;
+        let page_id = ed.page_id.clone();
+        let gen = ed.edit_generation;
+        let snapshot = ed.composer.text().to_string();
+        ui.page_edit_generations.insert(page_id.clone(), gen);
+
+        self.apply_optimistic_local(&page_id, &snapshot, persist_sqlite);
+    }
+
+    /// Applies `edited_markdown` optimistically to `active_page_detail` (and optionally SQLite cache)
+    /// with 0ms latency so leaving or staying in edit mode never shows stale content.
+    pub fn apply_optimistic_local(
+        &mut self,
+        page_id: &str,
+        edited_markdown: &str,
+        persist_sqlite: bool,
+    ) {
+        if let Some(ref mut detail) = self.active_page_detail {
+            if detail.page.id == page_id {
+                apply_optimistic_markdown_to_detail(detail, edited_markdown);
+                if let Some(p) = self.pages.iter_mut().find(|p| p.id == page_id) {
+                    p.plain_text = detail.page.plain_text.clone();
+                }
+                if persist_sqlite {
+                    let _ = self
+                        .storage
+                        .replace_page_blocks(&self.workspace_id, page_id, &detail.blocks);
+                }
+            }
+        }
+    }
+
+    /// TUI tick hook: when `dirty_since` has elapsed `>= 600ms` and no sync is in flight,
+    /// automatically dispatches a coalesced diff-sync for the current inline editor buffer.
+    pub fn tick_inline_autosync(&mut self, ui: &mut UiState, now: Instant) -> bool {
+        let should_flush = ui.inline_editor.as_ref().is_some_and(|ed| {
+            !ed.sync_in_flight
+                && ed.edit_generation > ed.synced_generation
+                && ed
+                    .dirty_since
+                    .is_some_and(|since| now.saturating_duration_since(since) >= INLINE_AUTOSYNC_DEBOUNCE)
+        });
+        if should_flush {
+            return self.flush_inline_editor_sync(ui, false);
+        }
+        false
+    }
+
+    /// Immediately reflects the inline editor buffer locally + in SQLite and dispatches a
+    /// background diff-sync (or queues a coalesced follow-up if a sync is already in flight).
+    pub fn flush_inline_editor_sync(&mut self, ui: &mut UiState, queue_if_in_flight: bool) -> bool {
+        let Some(ed) = ui.inline_editor.as_mut() else {
+            return false;
+        };
+        let page_id = ed.page_id.clone();
+        let snapshot = ed.composer.text().to_string();
+        let dirty = ed.edit_generation > ed.synced_generation
+            || snapshot.trim() != ed.last_synced_markdown.trim();
+
+        if dirty && ed.edit_generation <= ed.synced_generation {
+            ed.edit_generation = ed.synced_generation.saturating_add(1);
+            ui.page_edit_generations
+                .insert(page_id.clone(), ed.edit_generation);
+        }
+        let gen = ed.edit_generation;
+        let in_flight = ed.sync_in_flight || ui.page_sync_in_flight.contains(&page_id);
+        let remote_blocks = ed.remote_blocks.clone();
+
+        // Always update local detail & SQLite cache right away (0ms).
+        if dirty {
+            self.apply_optimistic_local(&page_id, &snapshot, true);
+        }
+
+        if !dirty {
+            if let Some(ed) = ui.inline_editor.as_mut() {
+                ed.dirty_since = None;
+            }
+            return false;
+        }
+
+        if in_flight {
+            if queue_if_in_flight {
+                ui.pending_page_sync
+                    .insert(page_id, (gen, snapshot, remote_blocks));
+                if let Some(ed) = ui.inline_editor.as_mut() {
+                    ed.dirty_since = None;
+                }
+            }
+            return false;
+        }
+
+        if let Some(ed) = ui.inline_editor.as_mut() {
+            ed.sync_in_flight = true;
+            ed.dirty_since = None;
+            ed.last_sync_error = None;
+        }
+        ui.page_sync_in_flight.insert(page_id.clone());
+        ui.pending_page_sync.remove(&page_id);
+
+        let known = (!remote_blocks.is_empty()).then_some(remote_blocks);
+        self.spawn_page_diff_sync(ui, page_id, gen, snapshot, known);
+        true
+    }
+
+    /// Exits inline edit mode cleanly, flushing any unsynced edits immediately while
+    /// preserving the user's current Canvas scroll position.
+    pub fn close_inline_editor_and_flush(&mut self, ui: &mut UiState) {
+        if ui.inline_editor.is_none() {
+            return;
+        }
+        let _ = self.flush_inline_editor_sync(ui, true);
+        if let Some(ed) = ui.inline_editor.take() {
+            ui.canvas_scroll = ed.scroll_y;
+            ui.canvas_follow_selected = false;
+        }
+        ui.cursor_pos = None;
+    }
+
+    /// Submits an edited Markdown document (e.g. from external `$EDITOR`) with 0ms optimistic
+    /// update + SQLite cache + fast diff-based background sync.
+    pub fn submit_page_edit_markdown(&mut self, ui: &mut UiState, edited_markdown: String) -> bool {
+        let Some(page_id) = self.active_page_id.clone() else {
+            ui.warning("Open a page before saving edits");
+            return false;
+        };
+        let current_md = self
+            .active_page_detail
+            .as_ref()
+            .map(|d| d.markdown.as_str())
+            .unwrap_or("");
+        if edited_markdown.trim() == current_md.trim() {
+            ui.info("No changes to save");
+            return false;
+        }
+        let known_blocks = self.active_page_detail.as_ref().and_then(|d| {
+            let valid = !d.blocks.is_empty()
+                && d.blocks
+                    .iter()
+                    .all(|b| !b.id.trim().is_empty() && !b.id.starts_with("__optimistic_"));
+            valid.then(|| d.blocks.clone())
+        });
+
+        let next_gen = ui
+            .page_edit_generations
+            .get(&page_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        ui.page_edit_generations.insert(page_id.clone(), next_gen);
+
+        self.apply_optimistic_local(&page_id, &edited_markdown, true);
+
+        if ui.page_sync_in_flight.contains(&page_id) {
+            ui.pending_page_sync.insert(
+                page_id,
+                (next_gen, edited_markdown, known_blocks.unwrap_or_default()),
+            );
+            return true;
+        }
+
+        ui.page_sync_in_flight.insert(page_id.clone());
+        ui.pending_page_sync.remove(&page_id);
+        self.spawn_page_diff_sync(ui, page_id, next_gen, edited_markdown, known_blocks);
+        true
+    }
+
+    fn spawn_page_diff_sync(
+        &self,
+        ui: &mut UiState,
+        page_id: String,
+        generation: u64,
+        edited_markdown: String,
+        known_existing: Option<Vec<NotionBlock>>,
+    ) {
+        let client = self.client.clone();
+        let storage = self.storage.clone();
+        let ui_tx = self.ui_tx.clone();
+        ui.tasks.begin("edit");
+        tokio::spawn(async move {
+            match crate::cli::op_diff_sync_page_markdown(
+                &client,
+                &storage,
+                &page_id,
+                &edited_markdown,
+                known_existing,
+            )
+            .await
+            {
+                Ok(detail) => {
+                    let _ = ui_tx.send(UiMsg::PageEdited {
+                        page_id,
+                        generation,
+                        detail: Box::new(detail),
+                    });
+                }
+                Err(err) => {
+                    let _ = ui_tx.send(UiMsg::PageEditFailed {
+                        page_id,
+                        generation,
+                        error: err.to_string(),
+                    });
+                }
+            }
         });
     }
 
@@ -500,7 +924,15 @@ impl AppState {
                 }
             }
             CoreEvent::PageDetailUpdated(detail) => {
-                if self.active_page_id.as_deref() == Some(detail.page.id.as_str()) {
+                let editing_or_syncing = ui
+                    .inline_editor
+                    .as_ref()
+                    .is_some_and(|ed| ed.page_id == detail.page.id)
+                    || ui.page_sync_in_flight.contains(&detail.page.id)
+                    || ui.pending_page_sync.contains_key(&detail.page.id);
+                if !editing_or_syncing
+                    && self.active_page_id.as_deref() == Some(detail.page.id.as_str())
+                {
                     self.active_page_detail = Some(*detail);
                 }
             }
@@ -558,13 +990,98 @@ impl AppState {
                 self.active_page_detail = Some(*detail);
                 ui.success("Synced page");
             }
-            UiMsg::PageEdited(detail) => {
+            UiMsg::PageEdited {
+                page_id,
+                generation,
+                detail,
+            } => {
                 ui.tasks.finish("edit", None);
+                ui.page_sync_in_flight.remove(&page_id);
+                let prev_synced = ui
+                    .page_synced_generations
+                    .get(&page_id)
+                    .copied()
+                    .unwrap_or(0);
+                ui.page_synced_generations
+                    .insert(page_id.clone(), prev_synced.max(generation));
+
+                let current_gen = ui
+                    .page_edit_generations
+                    .get(&page_id)
+                    .copied()
+                    .unwrap_or(0);
+
                 if let Some(existing) = self.pages.iter_mut().find(|p| p.id == detail.page.id) {
-                    *existing = detail.page.clone();
+                    if generation >= current_gen {
+                        *existing = detail.page.clone();
+                    }
                 }
-                self.active_page_detail = Some(*detail);
-                ui.success("Saved changes to Notion");
+
+                let active_inline_matches = ui
+                    .inline_editor
+                    .as_ref()
+                    .is_some_and(|ed| ed.page_id == page_id);
+
+                if active_inline_matches {
+                    let mut needs_followup = false;
+                    let mut latest_md = String::new();
+                    if let Some(ed) = ui.inline_editor.as_mut() {
+                        ed.remote_blocks = detail.blocks.clone();
+                        ed.synced_generation = ed.synced_generation.max(generation);
+                        ed.sync_in_flight = false;
+                        ed.last_sync_error = None;
+                        if generation < ed.edit_generation || generation < current_gen {
+                            // User typed newer content while HTTP was in flight:
+                            // DO NOT overwrite local editor or optimistic detail buffer!
+                            needs_followup = true;
+                        } else {
+                            latest_md = ed.composer.text().to_string();
+                            ed.last_synced_markdown = latest_md.clone();
+                        }
+                    }
+
+                    if needs_followup {
+                        let _ = self.flush_inline_editor_sync(ui, false);
+                    } else if self.active_page_id.as_deref() == Some(page_id.as_str()) {
+                        // Silently update stored block IDs & metadata without disrupting
+                        // the user's inline editor text, cursor, or scroll position.
+                        let mut updated = *detail;
+                        updated.markdown = latest_md;
+                        self.active_page_detail = Some(updated);
+                    }
+                } else if generation < current_gen {
+                    // Editor was closed or switched while older sync was in flight;
+                    // DO NOT overwrite newer optimistic buffer. Run coalesced follow-up if queued.
+                    if let Some((pending_gen, pending_md, _)) = ui.pending_page_sync.remove(&page_id)
+                    {
+                        if pending_gen > generation {
+                            let known = (!detail.blocks.is_empty()).then_some(detail.blocks);
+                            ui.page_sync_in_flight.insert(page_id.clone());
+                            self.spawn_page_diff_sync(ui, page_id, pending_gen, pending_md, known);
+                        }
+                    }
+                } else {
+                    ui.pending_page_sync.remove(&page_id);
+                    if self.active_page_id.as_deref() == Some(page_id.as_str()) {
+                        self.active_page_detail = Some(*detail);
+                    }
+                    ui.success("Saved changes to Notion");
+                }
+            }
+            UiMsg::PageEditFailed {
+                page_id,
+                generation: _,
+                error,
+            } => {
+                ui.tasks.finish("edit", Some(error.clone()));
+                ui.page_sync_in_flight.remove(&page_id);
+                if let Some(ed) = ui.inline_editor.as_mut() {
+                    if ed.page_id == page_id {
+                        ed.sync_in_flight = false;
+                        ed.last_sync_error = Some(error.clone());
+                    }
+                }
+                ui.error(format!("Sync failed: {error}"));
             }
             UiMsg::MediaUrlRefreshed {
                 page_id,
@@ -655,6 +1172,8 @@ impl AppState {
                 }
                 self.active_page_id = None;
                 self.active_page_detail = None;
+                ui.inline_editor = None;
+                ui.cursor_pos = None;
                 self.active_database_id = None;
                 self.active_database_rows.clear();
                 self.nav_stack.clear();

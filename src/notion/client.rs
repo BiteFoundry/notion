@@ -560,20 +560,49 @@ impl NotionClient {
         block_id: &str,
         children: Vec<Value>,
     ) -> Result<Vec<NotionBlock>> {
+        self.append_block_children_after(block_id, None, children)
+            .await
+    }
+
+    /// `PATCH /v1/blocks/{block_id}/children` with an optional `"after"` anchor block ID
+    /// (automatically chunks by 100 blocks per Notion API limits, chaining `"after"` across chunks).
+    pub async fn append_block_children_after(
+        &self,
+        block_id: &str,
+        after: Option<&str>,
+        children: Vec<Value>,
+    ) -> Result<Vec<NotionBlock>> {
         let id = normalize_notion_id(block_id);
         let mut created = Vec::new();
+        let mut cursor_after = after
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(normalize_notion_id);
         for chunk in children.chunks(MAX_APPEND_BATCH_SIZE) {
+            let mut body = serde_json::Map::new();
+            body.insert("children".into(), json!(chunk));
+            if let Some(ref after_id) = cursor_after {
+                body.insert("after".into(), json!(after_id));
+            }
             let val = self
                 .request_json(
                     Method::PATCH,
                     &format!("/blocks/{id}/children"),
-                    Some(json!({ "children": chunk })),
+                    Some(Value::Object(body)),
                 )
                 .await?;
+            let mut batch_last_id: Option<String> = None;
             if let Some(results) = val.get("results").and_then(Value::as_array) {
                 for item in results {
-                    created.push(parse_notion_block(item, &id, None));
+                    let parsed = parse_notion_block(item, &id, None);
+                    if !parsed.id.is_empty() {
+                        batch_last_id = Some(parsed.id.clone());
+                    }
+                    created.push(parsed);
                 }
+            }
+            if batch_last_id.is_some() {
+                cursor_after = batch_last_id;
             }
         }
         Ok(created)
