@@ -33,6 +33,8 @@ pub struct ImagePreviewOverlay {
     pub items: Vec<PreviewTarget>,
     pub index: usize,
     pub zoom_pct: u16,
+    pub scroll_y: u16,
+    pub scroll_x: u16,
     pub error: Option<String>,
 }
 
@@ -65,6 +67,8 @@ impl ImagePreviewOverlay {
             items,
             index: start,
             zoom_pct: 100,
+            scroll_y: 0,
+            scroll_x: 0,
             error: None,
         })
     }
@@ -87,10 +91,13 @@ impl ImagePreviewOverlay {
         let inner_h = rect.height.saturating_sub(3).max(6);
         let base_cols = rect.width.saturating_sub(4).max(12);
         let base_rows = rect.height.saturating_sub(4).max(6);
+        // Allow tall/zoomed images to exceed viewport height so vertical scrolling works cleanly
+        let max_cols = inner_w.saturating_mul(2).max(base_cols);
+        let max_rows = inner_h.saturating_mul(4).max(base_rows);
         let scaled_cols = ((base_cols as u32 * self.zoom_pct as u32) / 100)
-            .clamp(8, inner_w.max(base_cols) as u32) as u16;
+            .clamp(8, max_cols as u32) as u16;
         let scaled_rows = ((base_rows as u32 * self.zoom_pct as u32) / 100)
-            .clamp(4, inner_h.max(base_rows) as u32) as u16;
+            .clamp(4, max_rows as u32) as u16;
         (scaled_cols, scaled_rows)
     }
 
@@ -98,32 +105,69 @@ impl ImagePreviewOverlay {
         match action {
             Action::CloseOverlay | Action::Input('q') | Action::Input('v') => OverlayOutcome::Close,
             Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
-            Action::CursorLeft | Action::Input('[') | Action::MoveUp => {
+            Action::MoveUp | Action::Input('k') => {
+                self.scroll_y = self.scroll_y.saturating_sub(2);
+                OverlayOutcome::Handled
+            }
+            Action::MoveDown | Action::Input('j') => {
+                self.scroll_y = self.scroll_y.saturating_add(2);
+                OverlayOutcome::Handled
+            }
+            Action::PageUp => {
+                self.scroll_y = self.scroll_y.saturating_sub(10);
+                OverlayOutcome::Handled
+            }
+            Action::PageDown => {
+                self.scroll_y = self.scroll_y.saturating_add(10);
+                OverlayOutcome::Handled
+            }
+            Action::CursorHome | Action::Input('g') => {
+                self.scroll_y = 0;
+                self.scroll_x = 0;
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } => {
+                if *delta < 0 {
+                    self.scroll_y = self.scroll_y.saturating_sub((-*delta) as u16);
+                } else {
+                    self.scroll_y = self.scroll_y.saturating_add(*delta as u16);
+                }
+                OverlayOutcome::Handled
+            }
+            Action::CursorLeft | Action::Input('[') => {
                 if self.items.len() > 1 {
                     self.index = (self.index + self.items.len() - 1) % self.items.len();
+                    self.scroll_y = 0;
+                    self.scroll_x = 0;
                     self.error = None;
                     return OverlayOutcome::Dispatch(Action::LoadPreviewImage);
                 }
                 OverlayOutcome::Handled
             }
-            Action::CursorRight | Action::Input(']') | Action::MoveDown => {
+            Action::CursorRight | Action::Input(']') => {
                 if self.items.len() > 1 {
                     self.index = (self.index + 1) % self.items.len();
+                    self.scroll_y = 0;
+                    self.scroll_x = 0;
                     self.error = None;
                     return OverlayOutcome::Dispatch(Action::LoadPreviewImage);
                 }
                 OverlayOutcome::Handled
             }
             Action::Input('+') | Action::Input('=') => {
-                self.zoom_pct = (self.zoom_pct + 20).min(200);
+                self.zoom_pct = (self.zoom_pct + 25).min(300);
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
             Action::Input('-') => {
-                self.zoom_pct = self.zoom_pct.saturating_sub(20).max(25);
+                self.zoom_pct = self.zoom_pct.saturating_sub(25).max(25);
+                self.scroll_y = 0;
+                self.scroll_x = 0;
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
             Action::Input('0') => {
                 self.zoom_pct = 100;
+                self.scroll_y = 0;
+                self.scroll_x = 0;
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
             Action::Input('p') => OverlayOutcome::Dispatch(Action::CycleImageProtocol),
@@ -161,10 +205,10 @@ impl ImagePreviewOverlay {
         let proto = ui.graphics_caps.protocol;
         let title = match self.current() {
             Some(t) => format!(
-                " Image {}/{}: {} · {}% · {} · [/] Prev/Next · +/- Zoom · p Proto · d Save · Esc Close ",
+                " Image {}/{}: {} · {}% · {} · ↑↓/Wheel Scroll · [/] Prev/Next · +/- Zoom · p Proto · o Open · d Save · Esc ",
                 self.index + 1,
                 self.items.len(),
-                crate::ui::truncate_width(&t.display_name, 26),
+                crate::ui::truncate_width(&t.display_name, 22),
                 self.zoom_pct,
                 proto.label()
             ),
@@ -218,7 +262,14 @@ impl ImagePreviewOverlay {
                     protocol: proto,
                 });
             } else {
-                frame.render_widget(Paragraph::new(rendered.lines.clone()), inner);
+                let total_rows = rendered.lines.len() as u16;
+                let max_scroll_y = total_rows.saturating_sub(inner.height);
+                let sy = self.scroll_y.min(max_scroll_y);
+                let sx = self.scroll_x.min(rendered.cols.saturating_sub(inner.width));
+                frame.render_widget(
+                    Paragraph::new(rendered.lines.clone()).scroll((sy, sx)),
+                    inner,
+                );
             }
         } else {
             frame.render_widget(
