@@ -386,6 +386,9 @@ pub enum Command {
     },
     /// Synchronize workspace pages & databases into local SQLite WAL + FTS5 cache
     Sync {
+        /// Force a full rescan instead of incremental `last_edited_time` sync
+        #[arg(long)]
+        full: bool,
         #[arg(long)]
         json: bool,
     },
@@ -625,15 +628,31 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Sync { json: as_json } => {
+        Command::Sync { full, json: as_json } => {
             let (_auth, client, storage) = open_runtime(&config, workspace_override).await?;
-            let (ws_id, pages, databases) = sync::sync_workspace_tree(&client, &storage).await?;
+            let show_progress = !as_json && io::stderr().is_terminal();
+            let started = std::time::Instant::now();
+            let (ws_id, pages, databases) =
+                sync::sync_workspace_tree_with_options(&client, &storage, full, |batch, p, d| {
+                    if show_progress {
+                        eprint!("\rSyncing workspace... batch {batch} ({p} pages, {d} databases)");
+                        let _ = io::stderr().flush();
+                    }
+                })
+                .await?;
+            if show_progress {
+                eprintln!(
+                    "\rSynced in {:.1}s                                          ",
+                    started.elapsed().as_secs_f64()
+                );
+            }
             if as_json {
                 print_json(&json!({
                     "ok": true,
                     "workspace_id": ws_id,
                     "pages_count": pages.len(),
                     "databases_count": databases.len(),
+                    "incremental": !full,
                 }))?;
             } else {
                 println!(

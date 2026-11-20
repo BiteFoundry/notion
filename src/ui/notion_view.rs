@@ -711,6 +711,60 @@ fn render_block_lines(
                 Some(HitTarget::MediaChip(idx)),
             ));
         }
+        NotionBlockKind::Video { url, caption, .. } => {
+            let cap = spans_plain_text(caption);
+            let label = if cap.is_empty() {
+                url.as_str()
+            } else {
+                cap.as_str()
+            };
+            out.push((
+                Line::from(vec![
+                    cursor_gutter,
+                    Span::raw(indent),
+                    Span::styled(
+                        format!(" 🎬 [VIDEO: {label}] (Enter: open) "),
+                        Style::default()
+                            .fg(theme.accent_soft)
+                            .bg(theme.bg_card)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if ui.show_inline_hrefs && !cap.is_empty() {
+                            format!("  {url}")
+                        } else {
+                            String::new()
+                        },
+                        theme.muted_style(),
+                    ),
+                ])
+                .style(sel_bg),
+                Some(HitTarget::MediaChip(idx)),
+            ));
+        }
+        NotionBlockKind::Audio { url, caption, .. } => {
+            let cap = spans_plain_text(caption);
+            let label = if cap.is_empty() {
+                url.as_str()
+            } else {
+                cap.as_str()
+            };
+            out.push((
+                Line::from(vec![
+                    cursor_gutter,
+                    Span::raw(indent),
+                    Span::styled(
+                        format!(" 🎵 [AUDIO: {label}] (Enter: open) "),
+                        Style::default()
+                            .fg(theme.accent_soft)
+                            .bg(theme.bg_card)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+                .style(sel_bg),
+                Some(HitTarget::MediaChip(idx)),
+            ));
+        }
         NotionBlockKind::ChildPage { title } => {
             let card_bg = if selected {
                 theme.bg_selected

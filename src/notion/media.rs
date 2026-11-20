@@ -86,6 +86,8 @@ pub async fn download_media_target(
         let blk = client.get_block(trimmed, "").await?;
         match blk.kind {
             NotionBlockKind::Image { url, .. } if !url.is_empty() => (url, None),
+            NotionBlockKind::Video { url, .. } if !url.is_empty() => (url, Some("video.mp4".into())),
+            NotionBlockKind::Audio { url, .. } if !url.is_empty() => (url, Some("audio.mp3".into())),
             NotionBlockKind::File { url, name, .. } if !url.is_empty() => (url, name),
             NotionBlockKind::Pdf { url, .. } if !url.is_empty() => (url, Some("document.pdf".into())),
             other => bail!("Block `{trimmed}` is not a downloadable image/file/pdf block ({other:?})"),

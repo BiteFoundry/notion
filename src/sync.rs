@@ -62,24 +62,73 @@ impl SyncController {
     }
 }
 
-/// Performs a full workspace tree sync (`POST /v1/search`) and stores pages & databases into SQLite.
+/// Performs an incremental workspace tree sync (`POST /v1/search`) into SQLite.
+/// Uses the stored `last_edited_time` watermark to stop early on unchanged batches.
 pub async fn sync_workspace_tree(
     client: &NotionClient,
     storage: &Storage,
 ) -> Result<(String, Vec<NotionPage>, Vec<NotionDatabase>)> {
+    sync_workspace_tree_with_options(client, storage, false, |_, _, _| {}).await
+}
+
+/// Performs a workspace tree sync with optional full-rescan override and batch progress callback.
+pub async fn sync_workspace_tree_with_options<F>(
+    client: &NotionClient,
+    storage: &Storage,
+    full_rescan: bool,
+    on_batch: F,
+) -> Result<(String, Vec<NotionPage>, Vec<NotionDatabase>)>
+where
+    F: FnMut(usize, usize, usize),
+{
     let workspace_id = client.auth().active_workspace_id().await;
+    let scope_key = format!("workspace:{workspace_id}");
+
+    let watermark = if full_rescan {
+        None
+    } else {
+        let st_wm = storage.clone();
+        let sk = scope_key.clone();
+        tokio::task::spawn_blocking(move || st_wm.get_sync_cursor(&sk))
+            .await
+            .ok()
+            .flatten()
+    };
+
     let res = client
-        .search_all(None, SearchFilterObject::All, 500)
+        .search_incremental(
+            None,
+            SearchFilterObject::All,
+            500,
+            watermark.as_deref(),
+            on_batch,
+        )
         .await?;
+
+    // Compute newest `last_edited_time` across synced items for the next incremental watermark
+    let mut newest_edited: Option<String> = watermark;
+    for p in &res.pages {
+        if let Some(ts) = p.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
+            if newest_edited.as_deref().map_or(true, |cur| ts > cur) {
+                newest_edited = Some(ts.to_string());
+            }
+        }
+    }
+    for d in &res.databases {
+        if let Some(ts) = d.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
+            if newest_edited.as_deref().map_or(true, |cur| ts > cur) {
+                newest_edited = Some(ts.to_string());
+            }
+        }
+    }
 
     let st = storage.clone();
     let pages_clone = res.pages.clone();
     let dbs_clone = res.databases.clone();
-    let ws_clone = workspace_id.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         st.upsert_pages(&pages_clone)?;
         st.upsert_databases(&dbs_clone)?;
-        st.set_sync_cursor(&format!("workspace:{ws_clone}"), None)?;
+        st.set_sync_cursor(&scope_key, newest_edited.as_deref())?;
         Ok(())
     })
     .await??;
@@ -98,26 +147,61 @@ pub async fn sync_workspace_tree(
 }
 
 /// Syncs a single page's metadata, recursive block tree, and comments into SQLite.
+/// Skips re-fetching blocks when the cached page's `last_edited_time` already matches Notion.
 pub async fn sync_page_detail(
     client: &NotionClient,
     storage: &Storage,
     page_id: &str,
 ) -> Result<crate::models::NotionPageDetail> {
-    let detail = client.fetch_page_detail(page_id).await?;
+    let ws_id = client.auth().active_workspace_id().await;
+    let norm_id = crate::models::normalize_notion_id(page_id);
+
+    let st_check = storage.clone();
+    let ws_check = ws_id.clone();
+    let id_check = norm_id.clone();
+    let cached = tokio::task::spawn_blocking(move || st_check.load_page_detail(&ws_check, &id_check))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten();
+
+    let detail = if let Some(cached_detail) = cached {
+        let cached_ts = cached_detail
+            .page
+            .last_edited_time
+            .as_deref()
+            .filter(|s| !s.is_empty());
+        if !cached_detail.blocks.is_empty() && cached_ts.is_some() {
+            let fresh_page = client.get_page(&norm_id).await?;
+            if fresh_page.last_edited_time.as_deref() == cached_ts {
+                return Ok(cached_detail);
+            }
+            client.fetch_page_detail_with_page(fresh_page).await?
+        } else {
+            client.fetch_page_detail(&norm_id).await?
+        }
+    } else {
+        client.fetch_page_detail(&norm_id).await?
+    };
+
     let st = storage.clone();
     let detail_clone = detail.clone();
     tokio::task::spawn_blocking(move || st.save_page_detail(&detail_clone)).await??;
     Ok(detail)
 }
 
-/// Syncs a database schema and all its rows into SQLite.
+/// Syncs a database schema and all its rows into SQLite (in parallel).
 pub async fn sync_database_rows(
     client: &NotionClient,
     storage: &Storage,
     database_id: &str,
 ) -> Result<(Option<NotionDatabase>, Vec<NotionPage>)> {
-    let db = client.get_database(database_id).await.ok();
-    let rows = client.query_database_all(database_id, None, None, 250).await?;
+    let (db_res, rows_res) = tokio::join!(
+        client.get_database(database_id),
+        client.query_database_all(database_id, None, None, 250),
+    );
+    let db = db_res.ok();
+    let rows = rows_res?;
     let st = storage.clone();
     let db_clone = db.clone();
     let rows_clone = rows.clone();

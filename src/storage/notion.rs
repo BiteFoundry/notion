@@ -472,6 +472,18 @@ impl Storage {
         Ok(())
     }
 
+    pub fn get_sync_cursor(&self, scope_key: &str) -> Option<String> {
+        let conn = self.reader();
+        conn.query_row(
+            "SELECT cursor FROM sync_cursors WHERE scope_key = ?1",
+            params![scope_key],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+    }
+
     pub fn last_synced_at(&self, scope_key: &str) -> Option<String> {
         let conn = self.reader();
         conn.query_row(

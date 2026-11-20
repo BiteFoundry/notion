@@ -383,7 +383,9 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     NotionBlockKind::Image { .. } => {
                         return dispatch(Action::OpenImagePreview, app, ui);
                     }
-                    NotionBlockKind::Bookmark { url, .. }
+                    NotionBlockKind::Video { url, .. }
+                    | NotionBlockKind::Audio { url, .. }
+                    | NotionBlockKind::Bookmark { url, .. }
                     | NotionBlockKind::Embed { url, .. }
                     | NotionBlockKind::LinkPreview { url } => {
                         let u = url.clone();
@@ -918,11 +920,41 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         target.page_id, target.media_index, cols, rows, caps.protocol
                     );
                     if !app.image_cache.contains_key(&cache_key) {
-                        let http = app.client.http_client().clone();
+                        let client = app.client.clone();
+                        let http = client.http_client().clone();
                         let ui_tx = app.ui_tx.clone();
                         let url = target.url.clone();
+                        let block_id = app
+                            .active_page_detail
+                            .as_ref()
+                            .and_then(|d| d.media.get(target.media_index))
+                            .map(|m| m.block_id.clone())
+                            .unwrap_or_default();
+                        let page_id = target.page_id.clone();
                         tokio::spawn(async move {
-                            match media::fetch_media_bytes_cached(&http, &url).await {
+                            // First attempt cached/direct URL; if expired (Notion S3 URLs expire after 1h),
+                            // refresh the block from Notion API to get a fresh signed URL and retry once.
+                            let fetched = match media::fetch_media_bytes_cached(&http, &url).await {
+                                Ok(ok) => Ok(ok),
+                                Err(first_err) if !block_id.trim().is_empty() => {
+                                    if let Ok(blk) = client.get_block(&block_id, &page_id).await {
+                                        if let NotionBlockKind::Image { url: fresh_url, .. } = blk.kind {
+                                            if !fresh_url.trim().is_empty() && fresh_url != url {
+                                                media::fetch_media_bytes_cached(&http, &fresh_url).await
+                                            } else {
+                                                Err(first_err)
+                                            }
+                                        } else {
+                                            Err(first_err)
+                                        }
+                                    } else {
+                                        Err(first_err)
+                                    }
+                                }
+                                Err(err) => Err(err),
+                            };
+
+                            match fetched {
                                 Ok((bytes, _)) => {
                                     let rendered = tokio::task::spawn_blocking(move || {
                                         crate::img_preview::decode_and_render_for_protocol(
@@ -934,15 +966,29 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                                         )
                                     })
                                     .await;
-                                    if let Ok(Ok(img)) = rendered {
-                                        let _ = ui_tx.send(UiMsg::ImageRendered {
-                                            cache_key,
-                                            rendered: Box::new(img),
-                                        });
+                                    match rendered {
+                                        Ok(Ok(img)) => {
+                                            let _ = ui_tx.send(UiMsg::ImageRendered {
+                                                cache_key,
+                                                rendered: Box::new(img),
+                                            });
+                                        }
+                                        Ok(Err(err)) => {
+                                            let _ = ui_tx.send(UiMsg::ImagePreviewFailed(format!(
+                                                "{err} (press 'o' to open in browser)"
+                                            )));
+                                        }
+                                        Err(join_err) => {
+                                            let _ = ui_tx.send(UiMsg::ImagePreviewFailed(format!(
+                                                "Image decode task failed: {join_err}"
+                                            )));
+                                        }
                                     }
                                 }
                                 Err(err) => {
-                                    let _ = ui_tx.send(UiMsg::ImagePreviewFailed(err.to_string()));
+                                    let _ = ui_tx.send(UiMsg::ImagePreviewFailed(format!(
+                                        "{err} (press 'o' to open in browser)"
+                                    )));
                                 }
                             }
                         });

@@ -594,6 +594,10 @@ pub async fn run(
     let sync_ctrl = SyncController::from_channels(proxy_focus_tx, proxy_nudge_tx);
 
     let mut ui = UiState::from_config(&config);
+    if let Ok(sz) = terminal.size() {
+        ui.term_width = sz.width;
+        ui.term_height = sz.height;
+    }
     ui.graphics_caps = crate::img_preview::probe_terminal_graphics_caps(config.image_protocol);
     ui.kitty_keyboard_supported = guard.keyboard_enhanced;
     let mut app = AppState::new(

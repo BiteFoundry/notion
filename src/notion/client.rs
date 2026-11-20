@@ -288,26 +288,72 @@ impl NotionClient {
         filter: SearchFilterObject,
         max_items: usize,
     ) -> Result<SearchResponse> {
+        self.search_incremental(query, filter, max_items, None, |_, _, _| {})
+            .await
+    }
+
+    /// Incremental paginated `POST /v1/search` (sorted by `last_edited_time` descending).
+    /// When `stop_before_edited` is provided, stops paginating as soon as a batch reaches items
+    /// already older than or equal to the watermark — turning repeat syncs into a single API call.
+    pub async fn search_incremental<F>(
+        &self,
+        query: Option<&str>,
+        filter: SearchFilterObject,
+        max_items: usize,
+        stop_before_edited: Option<&str>,
+        mut on_batch: F,
+    ) -> Result<SearchResponse>
+    where
+        F: FnMut(usize, usize, usize),
+    {
         let mut all_pages = Vec::new();
         let mut all_dbs = Vec::new();
         let mut cursor: Option<String> = None;
         let limit = max_items.max(1);
+        let mut batch_num = 0usize;
 
         loop {
+            batch_num += 1;
             let batch = self
                 .search(query, filter, 100.min(limit), cursor.as_deref())
                 .await?;
+
+            // Check if this batch crossed our previous sync watermark (results are sorted newest-first)
+            let hit_watermark = if let Some(wm) = stop_before_edited.filter(|s| !s.is_empty()) {
+                let mut oldest_in_batch: Option<&str> = None;
+                for p in &batch.pages {
+                    if let Some(ts) = p.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
+                        if oldest_in_batch.map_or(true, |cur| ts < cur) {
+                            oldest_in_batch = Some(ts);
+                        }
+                    }
+                }
+                for d in &batch.databases {
+                    if let Some(ts) = d.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
+                        if oldest_in_batch.map_or(true, |cur| ts < cur) {
+                            oldest_in_batch = Some(ts);
+                        }
+                    }
+                }
+                oldest_in_batch.is_some_and(|oldest| oldest <= wm)
+            } else {
+                false
+            };
+
             all_pages.extend(batch.pages);
             all_dbs.extend(batch.databases);
-            if !batch.has_more
+            on_batch(batch_num, all_pages.len(), all_dbs.len());
+
+            if hit_watermark
+                || !batch.has_more
                 || batch.next_cursor.is_none()
                 || all_pages.len() + all_dbs.len() >= limit
             {
                 return Ok(SearchResponse {
                     pages: all_pages,
                     databases: all_dbs,
-                    has_more: batch.has_more,
-                    next_cursor: batch.next_cursor,
+                    has_more: !hit_watermark && batch.has_more,
+                    next_cursor: if hit_watermark { None } else { batch.next_cursor },
                 });
             }
             cursor = batch.next_cursor;
@@ -424,19 +470,38 @@ impl NotionClient {
             if remaining_depth == 0 {
                 return Ok(blocks);
             }
-            for blk in &mut blocks {
-                // Skip recursing into child_page and child_database (those are opened separately)
-                let should_recurse = blk.has_children
-                    && !matches!(
-                        blk.block_type.as_str(),
-                        "child_page" | "child_database" | "unsupported"
-                    );
-                if should_recurse && blk.children.is_empty() {
-                    if let Ok(children) = self
-                        .fetch_block_tree_rec(&blk.id, page_id, Some(&blk.id), remaining_depth - 1)
-                        .await
-                    {
-                        blk.children = children;
+            // Collect indices of child blocks to recurse into and fetch in bounded parallel chunks of 3
+            // (respects Notion's 3 req/s rate limit while cutting nested page latency ~3x).
+            let recurse_indices: Vec<usize> = blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, blk)| {
+                    let should_recurse = blk.has_children
+                        && blk.children.is_empty()
+                        && !matches!(
+                            blk.block_type.as_str(),
+                            "child_page" | "child_database" | "unsupported"
+                        );
+                    should_recurse.then_some(i)
+                })
+                .collect();
+
+            for chunk in recurse_indices.chunks(3) {
+                let futs: Vec<_> = chunk
+                    .iter()
+                    .map(|&idx| {
+                        let bid = blocks[idx].id.clone();
+                        async move {
+                            let res = self
+                                .fetch_block_tree_rec(&bid, page_id, Some(&bid), remaining_depth - 1)
+                                .await;
+                            (idx, res)
+                        }
+                    })
+                    .collect();
+                for (idx, res) in futures::future::join_all(futs).await {
+                    if let Ok(children) = res {
+                        blocks[idx].children = children;
                     }
                 }
             }
@@ -444,16 +509,42 @@ impl NotionClient {
         })
     }
 
-    /// Fetches a complete `NotionPageDetail` (page metadata + recursive blocks + comments + markdown + media refs).
+    /// Fetches a complete `NotionPageDetail` (page metadata + recursive blocks + comments) in parallel.
     pub async fn fetch_page_detail(&self, page_id: &str) -> Result<NotionPageDetail> {
         let id = normalize_notion_id(page_id);
-        let mut page = self.get_page(&id).await?;
-        let blocks = self.fetch_block_tree(&id, None).await?;
-        let comments = self.list_comments(&id).await.unwrap_or_default();
+        let (page_res, blocks_res, comments_res) = tokio::join!(
+            self.get_page(&id),
+            self.fetch_block_tree(&id, None),
+            self.list_comments(&id),
+        );
+        let mut page = page_res?;
+        let blocks = blocks_res?;
+        let comments = comments_res.unwrap_or_default();
         let plain_text = blocks_to_plain_text(&blocks);
         let markdown = blocks_to_markdown(&blocks);
         let media = collect_media_refs(&blocks);
         page.plain_text = plain_text;
+        Ok(NotionPageDetail {
+            page,
+            blocks,
+            comments,
+            markdown,
+            media,
+        })
+    }
+
+    /// Fetches blocks & comments in parallel for an already-fetched `NotionPage`.
+    pub async fn fetch_page_detail_with_page(&self, mut page: NotionPage) -> Result<NotionPageDetail> {
+        let id = normalize_notion_id(&page.id);
+        let (blocks_res, comments_res) = tokio::join!(
+            self.fetch_block_tree(&id, None),
+            self.list_comments(&id),
+        );
+        let blocks = blocks_res?;
+        let comments = comments_res.unwrap_or_default();
+        page.plain_text = blocks_to_plain_text(&blocks);
+        let markdown = blocks_to_markdown(&blocks);
+        let media = collect_media_refs(&blocks);
         Ok(NotionPageDetail {
             page,
             blocks,

@@ -652,6 +652,22 @@ pub fn parse_notion_block(
                 is_hosted,
             }
         }
+        "video" => {
+            let (url, is_hosted) = extract_media_url(inner);
+            NotionBlockKind::Video {
+                url,
+                caption: cap(),
+                is_hosted,
+            }
+        }
+        "audio" => {
+            let (url, is_hosted) = extract_media_url(inner);
+            NotionBlockKind::Audio {
+                url,
+                caption: cap(),
+                is_hosted,
+            }
+        }
         "file" => {
             let (url, _) = extract_media_url(inner);
             let name = inner
@@ -830,6 +846,36 @@ fn collect_media_refs_rec(blocks: &[NotionBlock], out: &mut Vec<NotionMediaRef>)
                     display_name,
                     mime_type,
                     is_image: is_img,
+                });
+            }
+            NotionBlockKind::Video { url, caption, .. } if !url.trim().is_empty() => {
+                let cap = spans_plain_text(caption);
+                let display_name = if !cap.trim().is_empty() {
+                    cap
+                } else {
+                    file_name_from_url(url).unwrap_or_else(|| format!("video-{}.mp4", out.len() + 1))
+                };
+                out.push(NotionMediaRef {
+                    block_id: blk.id.clone(),
+                    display_name,
+                    url: url.clone(),
+                    mime_type: "video/mp4".to_string(),
+                    is_image: false,
+                });
+            }
+            NotionBlockKind::Audio { url, caption, .. } if !url.trim().is_empty() => {
+                let cap = spans_plain_text(caption);
+                let display_name = if !cap.trim().is_empty() {
+                    cap
+                } else {
+                    file_name_from_url(url).unwrap_or_else(|| format!("audio-{}.mp3", out.len() + 1))
+                };
+                out.push(NotionMediaRef {
+                    block_id: blk.id.clone(),
+                    display_name,
+                    url: url.clone(),
+                    mime_type: "audio/mpeg".to_string(),
+                    is_image: false,
                 });
             }
             NotionBlockKind::Pdf { url, caption } if !url.trim().is_empty() => {
@@ -1062,6 +1108,18 @@ fn render_blocks_md(blocks: &[NotionBlock], depth: usize, out: &mut Vec<String>)
             NotionBlockKind::File { url, name, .. } => {
                 let label = name.as_deref().unwrap_or("File");
                 out.push(format!("{indent}[📎 {label}]({url})"));
+                out.push(String::new());
+            }
+            NotionBlockKind::Video { url, caption, .. } => {
+                let label = spans_plain_text(caption);
+                let label = if label.is_empty() { "Video" } else { &label };
+                out.push(format!("{indent}[🎬 {label}]({url})"));
+                out.push(String::new());
+            }
+            NotionBlockKind::Audio { url, caption, .. } => {
+                let label = spans_plain_text(caption);
+                let label = if label.is_empty() { "Audio" } else { &label };
+                out.push(format!("{indent}[🎵 {label}]({url})"));
                 out.push(String::new());
             }
             NotionBlockKind::Pdf { url, caption } => {

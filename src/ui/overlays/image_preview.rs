@@ -127,6 +127,13 @@ impl ImagePreviewOverlay {
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
             Action::Input('p') => OverlayOutcome::Dispatch(Action::CycleImageProtocol),
+            Action::Input('o') | Action::Input('O') => {
+                if let Some(target) = self.current() {
+                    OverlayOutcome::Dispatch(Action::OpenUrl(target.url.clone()))
+                } else {
+                    OverlayOutcome::Handled
+                }
+            }
             Action::Input('d') => {
                 if let Some(target) = self.current() {
                     OverlayOutcome::Dispatch(Action::DownloadMedia(target.media_index))

@@ -387,6 +387,16 @@ pub enum NotionBlockKind {
         caption: Vec<RichTextSpan>,
         is_hosted: bool,
     },
+    Video {
+        url: String,
+        caption: Vec<RichTextSpan>,
+        is_hosted: bool,
+    },
+    Audio {
+        url: String,
+        caption: Vec<RichTextSpan>,
+        is_hosted: bool,
+    },
     File {
         url: String,
         name: Option<String>,
@@ -471,7 +481,9 @@ impl NotionBlock {
                 .map(|c| spans_plain_text(c))
                 .collect::<Vec<_>>()
                 .join(" | "),
-            NotionBlockKind::Image { url, caption, .. } => {
+            NotionBlockKind::Image { url, caption, .. }
+            | NotionBlockKind::Video { url, caption, .. }
+            | NotionBlockKind::Audio { url, caption, .. } => {
                 let cap = spans_plain_text(caption);
                 if cap.is_empty() {
                     url.clone()
