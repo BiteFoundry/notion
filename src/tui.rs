@@ -43,6 +43,22 @@ use crate::{
 
 static KITTY_USED_GLOBAL: AtomicBool = AtomicBool::new(false);
 
+/// VT DECSET sequences for X10 + button-motion + SGR mouse reporting.
+/// `crossterm 0.28` skips ANSI mouse codes on Windows, so writing these explicitly
+/// ensures ConPTY / Windows Terminal / xterm.js report mouse wheel events cleanly.
+pub(crate) const VT_ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+pub(crate) const VT_DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+pub(crate) fn write_vt_mouse_enable(w: &mut impl io::Write) -> io::Result<()> {
+    w.write_all(VT_ENABLE_MOUSE.as_bytes())?;
+    w.flush()
+}
+
+pub(crate) fn write_vt_mouse_disable(w: &mut impl io::Write) -> io::Result<()> {
+    w.write_all(VT_DISABLE_MOUSE.as_bytes())?;
+    w.flush()
+}
+
 #[cfg(windows)]
 mod win_console {
     use std::ptr::null_mut;
@@ -183,13 +199,16 @@ impl PixelLayerTracker {
         }
 
         // Avoid full `terminal.clear()` flicker when only the `#crop:...` viewport changed
-        // on the exact same rect and base image for Sixel without a terminal resize.
+        // on the exact same rect, cell dimensions, and base image for Sixel without a terminal resize.
+        // If `rect` shrinks or actual `cols`/`rows` (`draw_h`/`draw_w`) change, fall through to erase old pixels.
         let sixel_crop_only = !term_resized
             && self.active.len() == 1
             && desired.len() == 1
             && self.active[0].protocol == TerminalImageProtocol::Sixel
             && desired[0].protocol == TerminalImageProtocol::Sixel
             && self.active[0].rect == desired[0].rect
+            && self.active[0].cols == desired[0].cols
+            && self.active[0].rows == desired[0].rows
             && parse_pixel_key(&self.active[0].cache_key).0
                 == parse_pixel_key(&desired[0].cache_key).0;
 
@@ -275,7 +294,10 @@ impl TerminalGuard {
             EnableBracketedPaste
         )?;
         #[cfg(windows)]
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        {
+            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+            write_vt_mouse_enable(&mut stdout)?;
+        }
 
         let keyboard_enhanced = if supports_keyboard_enhancement().unwrap_or(false) {
             execute!(
@@ -291,7 +313,10 @@ impl TerminalGuard {
         };
 
         #[cfg(windows)]
-        win_console::enforce_windows_mouse_capture();
+        {
+            win_console::enforce_windows_mouse_capture();
+            let _ = write_vt_mouse_enable(&mut stdout);
+        }
 
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
@@ -333,7 +358,10 @@ impl TerminalGuard {
             LeaveAlternateScreen
         );
         #[cfg(windows)]
-        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        {
+            let _ = write_vt_mouse_disable(&mut stdout);
+            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        }
         let _ = disable_raw_mode();
         #[cfg(windows)]
         win_console::restore_console_mode(self.orig_conin_mode);
@@ -369,7 +397,10 @@ fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
             LeaveAlternateScreen
         );
         #[cfg(windows)]
-        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        {
+            let _ = write_vt_mouse_disable(&mut stdout);
+            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        }
         let _ = disable_raw_mode();
         #[cfg(windows)]
         win_console::restore_console_mode(orig_conin_mode);
@@ -593,21 +624,34 @@ fn draw_frame(
                 let fit_w = pg.rect.width.min(safe_max_w);
                 let fit_h = pg.rect.height.min(safe_max_h);
                 if fit_w > 0 && fit_h > 0 {
-                    let (base_key, _) = parse_pixel_key(&pg.cache_key);
-                    if let Some(payload_len) = app
-                        .image_cache
-                        .get(base_key)
-                        .and_then(|r| r.pixel_payload.as_deref().map(str::len))
-                    {
-                        let clamped_rect = Rect::new(pg.rect.x, pg.rect.y, fit_w, fit_h);
-                        desired.push(ActivePixelGraphic {
-                            cache_key: pg.cache_key,
-                            rect: clamped_rect,
-                            protocol: pg.protocol,
-                            cols: clamped_rect.width,
-                            rows: clamped_rect.height,
-                            payload_len,
-                        });
+                    let (base_key, crop) = parse_pixel_key(&pg.cache_key);
+                    if let Some(rendered) = app.image_cache.get(base_key) {
+                        if let Some(payload_len) = rendered.pixel_payload.as_deref().map(str::len) {
+                            let (draw_cols, draw_rows) = match crop {
+                                Some((sx, sy, vw, vh)) => rendered
+                                    .viewport_cell_dims(sx, sy, vw.min(fit_w), vh.min(fit_h))
+                                    .unwrap_or((fit_w, fit_h)),
+                                None if rendered.cols <= fit_w && rendered.rows <= fit_h => {
+                                    (rendered.cols, rendered.rows)
+                                }
+                                None => rendered
+                                    .viewport_cell_dims(0, 0, fit_w, fit_h)
+                                    .unwrap_or((fit_w, fit_h)),
+                            };
+                            let actual_w = draw_cols.min(fit_w);
+                            let actual_h = draw_rows.min(fit_h);
+                            if actual_w > 0 && actual_h > 0 {
+                                let clamped_rect = Rect::new(pg.rect.x, pg.rect.y, actual_w, actual_h);
+                                desired.push(ActivePixelGraphic {
+                                    cache_key: pg.cache_key,
+                                    rect: clamped_rect,
+                                    protocol: pg.protocol,
+                                    cols: actual_w,
+                                    rows: actual_h,
+                                    payload_len,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -990,7 +1034,10 @@ pub async fn run(
                 EnableBracketedPaste
             )?;
             #[cfg(windows)]
-            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+            {
+                execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+                write_vt_mouse_enable(&mut stdout)?;
+            }
             if guard.keyboard_enhanced {
                 let _ = execute!(
                     stdout,
@@ -1001,14 +1048,17 @@ pub async fn run(
                 );
             }
             #[cfg(windows)]
-            win_console::enforce_windows_mouse_capture();
+            {
+                win_console::enforce_windows_mouse_capture();
+                let _ = write_vt_mouse_enable(&mut stdout);
+            }
             terminal.clear()?;
             dirty = true;
 
             match result {
                 Ok(edited) => {
                     if edited.trim() != initial_md.trim() && !edited.trim().is_empty() {
-                        let _ = action::dispatch(Action::SubmitSlashAppend(edited), &mut app, &mut ui);
+                        let _ = action::dispatch(Action::SubmitPageEdit(edited), &mut app, &mut ui);
                         ui.info("Syncing edited Markdown to Notion...");
                     }
                 }
@@ -1156,7 +1206,7 @@ mod tests {
         assert!(!noop.erase_and_redraw);
         assert!(!noop.emit_desired);
 
-        // Sixel crop-only scroll on exact same rect -> emit without full-screen clear flicker
+        // Sixel crop-only scroll on exact same rect & dims -> emit without full-screen clear flicker
         let img_a_scrolled = ActivePixelGraphic {
             cache_key: "hd:p1:0:80:120:Sixel#crop:0,6,80,24".to_string(),
             ..img_a.clone()
@@ -1164,6 +1214,18 @@ mod tests {
         let scroll_plan = tracker.plan_transition(&[img_a_scrolled], (120, 36), false);
         assert!(!scroll_plan.erase_and_redraw);
         assert!(scroll_plan.emit_desired);
+
+        // When Sixel draw_h/rect shrinks at bottom of image, must erase old pixels!
+        let img_a_shrunk = ActivePixelGraphic {
+            cache_key: "hd:p1:0:80:120:Sixel#crop:0,20,80,24".to_string(),
+            rect: Rect::new(4, 2, 80, 18),
+            rows: 18,
+            ..img_a.clone()
+        };
+        let shrink_plan = tracker.plan_transition(&[img_a_shrunk], (120, 36), false);
+        assert!(shrink_plan.erase_and_redraw);
+        assert_eq!(shrink_plan.erase_rects, vec![img_a.rect]);
+        assert!(shrink_plan.emit_desired);
 
         // Closing modal / switching to HtmlPreview -> erase previous rect and redraw
         let close_plan = tracker.plan_transition(&[], (120, 36), false);
@@ -1206,5 +1268,22 @@ mod tests {
         assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE, 0x0098);
         assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE & 0x0040, 0); // QuickEdit cleared
         assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE & 0x0200, 0); // VTInput cleared
+    }
+
+    #[test]
+    fn test_vt_mouse_enable_and_disable_ansi_sequences() {
+        let mut enable_buf = Vec::new();
+        write_vt_mouse_enable(&mut enable_buf).unwrap();
+        assert_eq!(
+            String::from_utf8(enable_buf).unwrap(),
+            "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+        );
+
+        let mut disable_buf = Vec::new();
+        write_vt_mouse_disable(&mut disable_buf).unwrap();
+        assert_eq!(
+            String::from_utf8(disable_buf).unwrap(),
+            "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
+        );
     }
 }

@@ -106,8 +106,14 @@ pub enum UiMsg {
     },
     DaemonDetached,
     PageRefreshed(Box<NotionPageDetail>),
+    PageEdited(Box<NotionPageDetail>),
     PageCreated(NotionPage),
     PageArchived(String),
+    MediaUrlRefreshed {
+        page_id: String,
+        block_id: String,
+        url: String,
+    },
     CommentAdded {
         page_id: String,
         comment: NotionComment,
@@ -162,6 +168,7 @@ pub struct UiState {
     pub expanded_toggles: HashSet<String>,
     pub selected_block: usize,
     pub canvas_scroll: u16,
+    pub canvas_follow_selected: bool,
     pub comments_drawer_open: bool,
     pub comments_scroll: u16,
     pub comment_reply_input: String,
@@ -213,6 +220,7 @@ impl UiState {
             expanded_toggles: HashSet::new(),
             selected_block: 0,
             canvas_scroll: 0,
+            canvas_follow_selected: false,
             comments_drawer_open: false,
             comments_scroll: 0,
             comment_reply_input: String::new(),
@@ -374,6 +382,7 @@ impl AppState {
         self.active_page_id = Some(page_id.to_string());
         ui.selected_block = 0;
         ui.canvas_scroll = 0;
+        ui.canvas_follow_selected = false;
 
         if let Ok(Some(cached)) = self.storage.load_page_detail(&self.workspace_id, page_id) {
             self.active_page_detail = Some(cached);
@@ -548,6 +557,43 @@ impl AppState {
                 ui.tasks.finish("todo", None);
                 self.active_page_detail = Some(*detail);
                 ui.success("Synced page");
+            }
+            UiMsg::PageEdited(detail) => {
+                ui.tasks.finish("edit", None);
+                if let Some(existing) = self.pages.iter_mut().find(|p| p.id == detail.page.id) {
+                    *existing = detail.page.clone();
+                }
+                self.active_page_detail = Some(*detail);
+                ui.success("Saved changes to Notion");
+            }
+            UiMsg::MediaUrlRefreshed {
+                page_id,
+                block_id,
+                url,
+            } => {
+                if !block_id.trim().is_empty() && !url.trim().is_empty() {
+                    if let Some(ref mut detail) = self.active_page_detail {
+                        if page_id.is_empty() || detail.page.id == page_id {
+                            for m in &mut detail.media {
+                                if m.block_id == block_id {
+                                    m.url = url.clone();
+                                }
+                            }
+                            update_block_media_url_in_tree(&mut detail.blocks, &block_id, &url);
+                        }
+                    }
+                    for ov in &mut ui.overlays {
+                        if let Overlay::ImagePreview(ref mut preview) = ov {
+                            for item in &mut preview.items {
+                                if item.block_id == block_id
+                                    && (page_id.is_empty() || item.page_id == page_id)
+                                {
+                                    item.url = url.clone();
+                                }
+                            }
+                        }
+                    }
+                }
             }
             UiMsg::PageCreated(page) => {
                 ui.tasks.finish("create", None);
@@ -1044,6 +1090,28 @@ fn set_todo_in_tree(blocks: &mut [NotionBlock], target_id: &str, checked: bool) 
             }
         }
         if set_todo_in_tree(&mut blk.children, target_id, checked) {
+            return true;
+        }
+    }
+    false
+}
+
+fn update_block_media_url_in_tree(blocks: &mut [NotionBlock], target_id: &str, url: &str) -> bool {
+    for blk in blocks {
+        if blk.id == target_id {
+            match &mut blk.kind {
+                NotionBlockKind::Image { url: ref mut u, .. }
+                | NotionBlockKind::Video { url: ref mut u, .. }
+                | NotionBlockKind::Audio { url: ref mut u, .. }
+                | NotionBlockKind::File { url: ref mut u, .. }
+                | NotionBlockKind::Pdf { url: ref mut u, .. } => {
+                    *u = url.to_string();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if update_block_media_url_in_tree(&mut blk.children, target_id, url) {
             return true;
         }
     }

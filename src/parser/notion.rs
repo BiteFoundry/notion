@@ -959,6 +959,12 @@ fn guess_mime_from_url(url: &str, default_image: bool) -> String {
         .next()
         .unwrap_or(url)
         .to_ascii_lowercase();
+    if lower.ends_with(".svg") {
+        return "image/svg+xml".to_string();
+    }
+    if lower.ends_with(".xml") {
+        return "application/xml".to_string();
+    }
     match sniff_content_kind(None, Some(&lower), None) {
         ContentKind::Html => "text/html".to_string(),
         ContentKind::Svg => "image/svg+xml".to_string(),

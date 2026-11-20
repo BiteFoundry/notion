@@ -351,7 +351,7 @@ fn draw_page_canvas(
         (fav_pill, ButtonId::ToggleFavorite, detail.page.is_favorite),
         ("[+ Append]", ButtonId::QuickAppend, false),
         ("[+ Child]", ButtonId::NewChildPage, false),
-        ("[✎ Edit]", ButtonId::EditExternal, false),
+        ("[✎ Edit]", ButtonId::EditPage, false),
         ("[↗ Web]", ButtonId::OpenWeb, false),
         ("[🔗 Links]", ButtonId::LinkExtractor, false),
         (href_pill, ButtonId::ToggleHrefs, ui.show_inline_hrefs),
@@ -394,10 +394,11 @@ fn draw_page_canvas(
     rendered_lines.push((Line::from(""), None));
 
     // Interactive Blocks
+    let mut selected_line_range: Option<(usize, usize)> = None;
     if visible.is_empty() {
         rendered_lines.push((
             Line::from(Span::styled(
-                "Empty page. Press `a` to append blocks (/h1, /todo, /callout, /code) or `e` to edit in $EDITOR.",
+                "Empty page. Press `a` to append blocks (/h1, /todo, /callout, /code) or `e` to edit.",
                 theme.muted_style().add_modifier(Modifier::ITALIC),
             )),
             None,
@@ -405,6 +406,7 @@ fn draw_page_canvas(
     } else {
         for (idx, vblk) in visible.iter().enumerate() {
             let is_sel = canvas_focused && idx == selected_idx;
+            let start_line = rendered_lines.len();
             render_block_lines(
                 vblk,
                 idx,
@@ -415,7 +417,26 @@ fn draw_page_canvas(
                 &mut rendered_lines,
                 &mut inline_hits,
             );
+            let end_line = rendered_lines.len().saturating_sub(1);
+            if idx == selected_idx && rendered_lines.len() > start_line {
+                selected_line_range = Some((start_line, end_line));
+            }
         }
+    }
+
+    // Keep the selected block visible when navigating with Up/Down/j/k, while allowing MouseScroll to roam freely
+    if ui.canvas_follow_selected {
+        if let Some((sel_start, sel_end)) = selected_line_range {
+            let view_h = content_area.height as usize;
+            let mut desired_scroll = ui.canvas_scroll as usize;
+            if sel_start < desired_scroll {
+                desired_scroll = sel_start;
+            } else if sel_end >= desired_scroll.saturating_add(view_h) {
+                desired_scroll = sel_end.saturating_add(1).saturating_sub(view_h);
+            }
+            ui.canvas_scroll = desired_scroll.min(u16::MAX as usize) as u16;
+        }
+        ui.canvas_follow_selected = false;
     }
 
     // Compute and clamp viewport scroll in-place so ScrollBottom / wheel down never outruns content

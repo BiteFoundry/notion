@@ -122,13 +122,16 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
 
     // Render overlay stack bottom-to-top
     let mut overlays = std::mem::take(&mut ui.overlays);
+    let mut cursor_pos = None;
     for ov in &mut overlays {
-        ov.draw(frame, area, app, ui, &mut hitmap);
+        if let Some(pos) = ov.draw(frame, area, app, ui, &mut hitmap) {
+            cursor_pos = Some(pos);
+        }
     }
     ui.overlays = overlays;
 
     ui.hitmap = hitmap;
-    None
+    cursor_pos
 }
 
 fn draw_vertical_divider(frame: &mut Frame, area: Rect, theme: &theme::Theme) {

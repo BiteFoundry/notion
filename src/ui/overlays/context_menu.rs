@@ -56,7 +56,8 @@ impl ContextMenu {
         let items = match target {
             ContextTarget::PageCanvas => vec![
                 MenuItem::new("Quick Append (/h1, /todo, ...)", Some("a"), Action::OpenQuickAppend),
-                MenuItem::new("Edit in $EDITOR", Some("e"), Action::RequestExternalEditor),
+                MenuItem::new("Edit Page", Some("e"), Action::OpenPageEditor),
+                MenuItem::new("Open in External $EDITOR", Some("Ctrl+E"), Action::RequestExternalEditor),
                 MenuItem::new("New Child Page", Some("n"), Action::OpenNewPageModal),
                 MenuItem::new("Toggle Favorite ★", Some("f"), Action::ToggleFavorite),
                 MenuItem::new("Comments Drawer", Some("C"), Action::ToggleCommentsDrawer),

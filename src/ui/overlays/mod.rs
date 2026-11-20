@@ -9,6 +9,7 @@ pub mod html_preview;
 pub mod image_preview;
 pub mod links;
 pub mod notion_form;
+pub mod page_editor;
 pub mod path_input;
 pub mod search;
 pub mod settings;
@@ -30,7 +31,8 @@ use crate::ui::{
         attachments::AttachmentsState, command_palette::CommandPalette, confirm::ConfirmDialog,
         context_menu::ContextMenu, file_picker::FilePickerOverlay,
         html_preview::HtmlPreviewOverlay, image_preview::ImagePreviewOverlay,
-        links::LinkExtractorOverlay, notion_form::NotionFormOverlay, path_input::PathInputState,
+        links::LinkExtractorOverlay, notion_form::NotionFormOverlay,
+        page_editor::PageEditorOverlay, path_input::PathInputState,
         search::SearchOverlay, settings::SettingsState,
         workspace_switcher::WorkspaceSwitcherOverlay,
     },
@@ -48,6 +50,7 @@ pub enum OverlayKind {
     FilePicker,
     Links,
     NotionForm,
+    PageEditor,
     ImagePreview,
     HtmlPreview,
     Help,
@@ -75,6 +78,7 @@ pub enum Overlay {
     FilePicker(FilePickerOverlay),
     Links(LinkExtractorOverlay),
     NotionForm(NotionFormOverlay),
+    PageEditor(PageEditorOverlay),
     ImagePreview(ImagePreviewOverlay),
     HtmlPreview(HtmlPreviewOverlay),
     Help(HelpOverlay),
@@ -94,6 +98,7 @@ impl Overlay {
             Overlay::FilePicker(_) => OverlayKind::FilePicker,
             Overlay::Links(_) => OverlayKind::Links,
             Overlay::NotionForm(_) => OverlayKind::NotionForm,
+            Overlay::PageEditor(_) => OverlayKind::PageEditor,
             Overlay::ImagePreview(_) => OverlayKind::ImagePreview,
             Overlay::HtmlPreview(_) => OverlayKind::HtmlPreview,
             Overlay::Help(_) => OverlayKind::Help,
@@ -108,6 +113,7 @@ impl Overlay {
             | Overlay::PathInput(_)
             | Overlay::FilePicker(_) => true,
             Overlay::NotionForm(form) => form.accepts_text(),
+            Overlay::PageEditor(ed) => ed.accepts_text(),
             Overlay::HtmlPreview(html) => html.accepts_text(),
             _ => false,
         }
@@ -151,6 +157,14 @@ impl Overlay {
 
     pub fn notion_form(form: NotionFormOverlay) -> Self {
         Overlay::NotionForm(form)
+    }
+
+    pub fn page_editor(
+        page_id: impl Into<String>,
+        page_title: impl Into<String>,
+        markdown: impl Into<String>,
+    ) -> Self {
+        Overlay::PageEditor(PageEditorOverlay::new(page_id, page_title, markdown))
     }
 
     pub fn html_preview(title: impl Into<String>, html: String) -> Self {
@@ -218,6 +232,7 @@ impl Overlay {
             Overlay::FilePicker(picker) => picker.handle(action),
             Overlay::Links(links) => links.handle(action),
             Overlay::NotionForm(form) => form.handle(action),
+            Overlay::PageEditor(ed) => ed.handle(action),
             Overlay::ImagePreview(preview) => preview.handle(action),
             Overlay::HtmlPreview(html) => html.handle(action),
             Overlay::Help(_) => match action {
@@ -242,7 +257,8 @@ impl Overlay {
             Overlay::FilePicker(picker) => picker.select(index),
             Overlay::Links(links) => links.select(index),
             Overlay::NotionForm(form) => form.select(index),
-            Overlay::ImagePreview(_)
+            Overlay::PageEditor(_)
+            | Overlay::ImagePreview(_)
             | Overlay::HtmlPreview(_)
             | Overlay::PathInput(_)
             | Overlay::Help(_)
@@ -257,22 +273,65 @@ impl Overlay {
         app: &AppState,
         ui: &mut UiState,
         hitmap: &mut HitMap,
-    ) {
+    ) -> Option<(u16, u16)> {
         match self {
-            Overlay::ContextMenu(menu) => menu.draw(frame, area, ui, hitmap),
-            Overlay::CommandPalette(palette) => palette.draw(frame, area, app, ui, hitmap),
-            Overlay::WorkspaceSwitcher(ws) => ws.draw(frame, area, app, ui, hitmap),
-            Overlay::Settings(settings) => settings.draw(frame, area, app, ui, hitmap),
-            Overlay::Search(search) => search.draw(frame, area, app, ui, hitmap),
-            Overlay::Attachments(tray) => tray.draw(frame, area, app, ui, hitmap),
-            Overlay::PathInput(input) => input.draw(frame, area, ui, hitmap),
-            Overlay::FilePicker(picker) => picker.draw(frame, area, ui, hitmap),
-            Overlay::Links(links) => links.draw(frame, area, ui, hitmap),
-            Overlay::NotionForm(form) => form.draw(frame, area, ui, hitmap),
-            Overlay::ImagePreview(preview) => preview.draw(frame, area, app, ui, hitmap),
-            Overlay::HtmlPreview(html) => html.draw(frame, area, app, ui, hitmap),
-            Overlay::Help(help) => help.draw(frame, area, ui, hitmap),
-            Overlay::Confirm(dialog) => dialog.draw(frame, area, ui, hitmap),
+            Overlay::ContextMenu(menu) => {
+                menu.draw(frame, area, ui, hitmap);
+                None
+            }
+            Overlay::CommandPalette(palette) => {
+                palette.draw(frame, area, app, ui, hitmap);
+                None
+            }
+            Overlay::WorkspaceSwitcher(ws) => {
+                ws.draw(frame, area, app, ui, hitmap);
+                None
+            }
+            Overlay::Settings(settings) => {
+                settings.draw(frame, area, app, ui, hitmap);
+                None
+            }
+            Overlay::Search(search) => {
+                search.draw(frame, area, app, ui, hitmap);
+                None
+            }
+            Overlay::Attachments(tray) => {
+                tray.draw(frame, area, app, ui, hitmap);
+                None
+            }
+            Overlay::PathInput(input) => {
+                input.draw(frame, area, ui, hitmap);
+                None
+            }
+            Overlay::FilePicker(picker) => {
+                picker.draw(frame, area, ui, hitmap);
+                None
+            }
+            Overlay::Links(links) => {
+                links.draw(frame, area, ui, hitmap);
+                None
+            }
+            Overlay::NotionForm(form) => {
+                form.draw(frame, area, ui, hitmap);
+                None
+            }
+            Overlay::PageEditor(ed) => ed.draw(frame, area, ui, hitmap),
+            Overlay::ImagePreview(preview) => {
+                preview.draw(frame, area, app, ui, hitmap);
+                None
+            }
+            Overlay::HtmlPreview(html) => {
+                html.draw(frame, area, app, ui, hitmap);
+                None
+            }
+            Overlay::Help(help) => {
+                help.draw(frame, area, ui, hitmap);
+                None
+            }
+            Overlay::Confirm(dialog) => {
+                dialog.draw(frame, area, ui, hitmap);
+                None
+            }
         }
     }
 }
@@ -314,7 +373,7 @@ impl HelpOverlay {
             Line::from("  Space / x             Toggle to-do checkbox or expand/collapse toggle"),
             Line::from("  Enter                 Expand toggle, open child page/DB, or open DB card"),
             Line::from("  a                     Slash Quick Append (/h1, /h2, /todo, /callout, /code)"),
-            Line::from("  e / n / f             Edit in $EDITOR · New Child Page · Toggle Favorite ★"),
+            Line::from("  e / Ctrl+E / n / f    Edit Page · External $EDITOR · New Child Page · Favorite ★"),
             Line::from("  C / u / h             Comments Drawer · Link Extractor · Toggle [href]"),
             Line::from("  v / Alt+V / A         HD Image Preview · Media & Files tray"),
             Line::from(""),
@@ -481,18 +540,18 @@ mod tests {
         assert_eq!(ctx.handle(&wheel(-3), &app, &ui), OverlayOutcome::Handled);
         assert!(matches!(&ctx, Overlay::ContextMenu(m) if m.selected == 0));
 
-        // 2. CommandPalette (6 pages + 14 workspace commands = 20 items)
+        // 2. CommandPalette (6 pages + 15 workspace commands = 21 items)
         let mut palette = CommandPalette::new();
         assert_eq!(palette.handle(&wheel(3), &app, &ui), OverlayOutcome::Handled);
         assert_eq!(palette.selected, 3);
         assert_eq!(palette.handle(&Action::PageDown, &app, &ui), OverlayOutcome::Handled);
         assert_eq!(palette.selected, 8);
         assert_eq!(palette.handle(&wheel(100), &app, &ui), OverlayOutcome::Handled);
-        assert_eq!(palette.selected, 19);
+        assert_eq!(palette.selected, 20);
         assert_eq!(palette.handle(&wheel(3), &app, &ui), OverlayOutcome::Handled);
-        assert_eq!(palette.selected, 19);
+        assert_eq!(palette.selected, 20);
         assert_eq!(palette.handle(&wheel(-3), &app, &ui), OverlayOutcome::Handled);
-        assert_eq!(palette.selected, 16);
+        assert_eq!(palette.selected, 17);
         assert_eq!(palette.handle(&wheel(-100), &app, &ui), OverlayOutcome::Handled);
         assert_eq!(palette.selected, 0);
         assert_eq!(palette.handle(&wheel(-3), &app, &ui), OverlayOutcome::Handled);

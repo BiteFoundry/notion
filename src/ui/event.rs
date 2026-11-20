@@ -46,6 +46,16 @@ pub fn key_to_action(
         {
             return Some(Action::OverlaySubmit);
         }
+        if ctrl && !alt {
+            match key.code {
+                KeyCode::Char('z') | KeyCode::Char('Z') => return Some(Action::Undo),
+                KeyCode::Char('y') | KeyCode::Char('Y') => return Some(Action::Redo),
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    return Some(Action::RequestExternalEditor);
+                }
+                _ => {}
+            }
+        }
         return match key.code {
             KeyCode::Esc => Some(Action::CloseOverlay),
             KeyCode::Enter if shift => Some(Action::Newline),
@@ -81,6 +91,7 @@ pub fn key_to_action(
             KeyCommand::ToggleFavorite => Action::ToggleFavorite,
             KeyCommand::ToggleComments => Action::ToggleCommentsDrawer,
             KeyCommand::QuickAppend => Action::OpenQuickAppend,
+            KeyCommand::EditPage => Action::OpenPageEditor,
             KeyCommand::EditExternal => Action::RequestExternalEditor,
             KeyCommand::NewPage => Action::OpenNewPageModal,
             KeyCommand::ArchivePage => Action::ConfirmArchivePage,

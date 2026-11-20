@@ -20,6 +20,7 @@ pub enum ButtonId {
     ToggleComments,
     QuickAppend,
     NewChildPage,
+    EditPage,
     EditExternal,
     OpenWeb,
     LinkExtractor,

@@ -51,9 +51,14 @@ impl fmt::Debug for HtmlPreviewOverlay {
 impl HtmlPreviewOverlay {
     pub fn new(title: impl Into<String>, raw_html: String) -> Self {
         let title_str = title.into();
+        let normalized_html = if crate::notion::media::looks_like_svg_document(raw_html.as_bytes()) {
+            format!("<div style=\"padding:16px\">{raw_html}</div>")
+        } else {
+            raw_html
+        };
         let mut session = HtmlViewSession::new(
             (!title_str.trim().is_empty()).then_some(title_str.clone()),
-            raw_html,
+            normalized_html,
         );
         let resolved_title = session
             .title()

@@ -156,6 +156,77 @@ impl RenderedTerminalImage {
         total
     }
 
+    /// Computes the exact `(draw_cols, draw_rows)` cell dimensions that `viewport_pixel_payload`
+    /// will emit for `(scroll_x, scroll_y, view_cols, view_rows)` without encoding pixel bytes.
+    pub fn viewport_cell_dims(
+        &self,
+        scroll_x: u16,
+        scroll_y: u16,
+        view_cols: u16,
+        view_rows: u16,
+    ) -> Option<(u16, u16)> {
+        if !self.protocol.is_pixel() || view_cols == 0 || view_rows == 0 {
+            return None;
+        }
+        if scroll_x == 0 && scroll_y == 0 && self.cols <= view_cols && self.rows <= view_rows {
+            return Some((self.cols, self.rows));
+        }
+        let backing = self.scroll_backing.as_ref()?;
+        match backing {
+            PixelScrollBacking::SixelIndexed {
+                width,
+                height,
+                cell_px,
+                ..
+            } => {
+                let cell_w = cell_px.0.max(1) as u32;
+                let cell_h = cell_px.1.max(1) as u32;
+                let x0 = (scroll_x as u32).saturating_mul(cell_w);
+                let y0 = (scroll_y as u32).saturating_mul(cell_h);
+                if x0 >= *width || y0 >= *height {
+                    return None;
+                }
+                let max_w = (view_cols as u32).saturating_mul(cell_w);
+                let max_h = (view_rows as u32).saturating_mul(cell_h);
+                let crop_w = (*width - x0).min(max_w);
+                let mut crop_h = (*height - y0).min(max_h);
+                if crop_h.div_ceil(6) * 6 > max_h && max_h >= 6 {
+                    crop_h = max_h - (max_h % 6);
+                }
+                if crop_w == 0 || crop_h == 0 {
+                    return None;
+                }
+                let draw_cols = crop_w.div_ceil(cell_w).clamp(1, view_cols as u32) as u16;
+                let draw_rows = crop_h.div_ceil(cell_h).clamp(1, view_rows as u32) as u16;
+                Some((draw_cols, draw_rows))
+            }
+            PixelScrollBacking::Rgba {
+                width,
+                height,
+                cell_px,
+                ..
+            } => {
+                let cell_w = cell_px.0.max(1) as u32;
+                let cell_h = cell_px.1.max(1) as u32;
+                let x0 = (scroll_x as u32).saturating_mul(cell_w);
+                let y0 = (scroll_y as u32).saturating_mul(cell_h);
+                if x0 >= *width || y0 >= *height {
+                    return None;
+                }
+                let max_w = (view_cols as u32).saturating_mul(cell_w);
+                let max_h = (view_rows as u32).saturating_mul(cell_h);
+                let crop_w = (*width - x0).min(max_w);
+                let crop_h = (*height - y0).min(max_h);
+                if crop_w == 0 || crop_h == 0 {
+                    return None;
+                }
+                let draw_cols = crop_w.div_ceil(cell_w).clamp(1, view_cols as u32) as u16;
+                let draw_rows = crop_h.div_ceil(cell_h).clamp(1, view_rows as u32) as u16;
+                Some((draw_cols, draw_rows))
+            }
+        }
+    }
+
     /// Returns a viewport-cropped pixel protocol payload `(payload, draw_cols, draw_rows)` guaranteed
     /// to fit within `(view_cols, view_rows)` cells starting at cell offset `(scroll_x, scroll_y)`.
     pub fn viewport_pixel_payload(

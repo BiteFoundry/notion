@@ -52,6 +52,8 @@ pub enum Action {
     Newline,
     Backspace,
     Delete,
+    Undo,
+    Redo,
     Paste(String),
     PasteClipboard,
     OverlaySubmit,
@@ -75,6 +77,7 @@ pub enum Action {
     ServeActiveHtml,
     ShowToast(String),
     OpenQuickAppend,
+    OpenPageEditor,
     OpenNewPageModal,
     OpenDbFilter,
     ConfirmArchivePage,
@@ -91,6 +94,7 @@ pub enum Action {
     ActivateChildBlockAt(usize),
     SubmitCommentReply,
     SubmitSlashAppend(String),
+    SubmitPageEdit(String),
     SubmitCreatePage {
         title: String,
         icon: Option<String>,
@@ -111,6 +115,11 @@ pub enum Action {
     RefreshAll,
     OpenActiveInBrowser,
     OpenUrl(String),
+    OpenMediaUrl {
+        url: String,
+        block_id: Option<String>,
+        page_id: Option<String>,
+    },
     CopyUrlToClipboard(String),
     CopySelectionOrMarkdown,
     AttachFormFile(PathBuf),
@@ -160,6 +169,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             | Action::ServeActiveHtml
             | Action::ShowToast(_)
             | Action::OpenUrl(_)
+            | Action::OpenMediaUrl { .. }
             | Action::CopyUrlToClipboard(_)
             | Action::SetTheme(_)
             | Action::ToggleInlineImages
@@ -168,6 +178,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             | Action::SwitchWorkspace(_)
             | Action::AttachFormFile(_)
             | Action::SubmitSlashAppend(_)
+            | Action::SubmitPageEdit(_)
             | Action::SubmitCreatePage { .. }
             | Action::ArchiveActivePage
     );
@@ -293,6 +304,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     if ui.selected_block > 0 {
                         ui.selected_block -= 1;
                     }
+                    ui.canvas_follow_selected = true;
                     ui.canvas_scroll = ui.canvas_scroll.saturating_sub(1);
                 }
                 CanvasView::Database => match ui.db_view_mode {
@@ -322,6 +334,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     if ui.selected_block + 1 < count {
                         ui.selected_block += 1;
                     }
+                    ui.canvas_scroll = ui.canvas_scroll.saturating_add(1);
+                    ui.canvas_follow_selected = true;
                 }
                 CanvasView::Database => match ui.db_view_mode {
                     DatabaseViewMode::Board => {
@@ -346,20 +360,24 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             Focus::Overlay => {}
         },
         Action::PageUp => {
+            ui.canvas_follow_selected = false;
             ui.canvas_scroll = ui.canvas_scroll.saturating_sub(12);
             ui.selected_block = ui.selected_block.saturating_sub(6);
         }
         Action::PageDown => {
+            ui.canvas_follow_selected = false;
             ui.canvas_scroll = ui.canvas_scroll.saturating_add(12);
             let max_b = app.visible_blocks(ui).len().saturating_sub(1);
             ui.selected_block = (ui.selected_block + 6).min(max_b);
         }
         Action::ScrollTop => {
+            ui.canvas_follow_selected = false;
             ui.canvas_scroll = 0;
             ui.selected_block = 0;
             ui.db_selected_row = 0;
         }
         Action::ScrollBottom => {
+            ui.canvas_follow_selected = false;
             let max_b = app.visible_blocks(ui).len().saturating_sub(1);
             ui.selected_block = max_b;
             ui.canvas_scroll = u16::MAX / 2;
@@ -420,7 +438,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         app.open_database(&id, ui, true);
                     }
                     NotionBlockKind::Image { url, .. } => {
-                        if sniff_content_kind(None, Some(url), None) == ContentKind::Html {
+                        if is_html_svg_or_xml_ref(url, None) {
                             let title = url
                                 .rsplit('/')
                                 .next()
@@ -442,9 +460,21 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         }
                         return dispatch(Action::OpenImagePreview, app, ui);
                     }
-                    NotionBlockKind::Video { url, .. }
-                    | NotionBlockKind::Audio { url, .. }
-                    | NotionBlockKind::Bookmark { url, .. }
+                    NotionBlockKind::Video { url, .. } | NotionBlockKind::Audio { url, .. } => {
+                        let bid = vblk.block.id.clone();
+                        let u = url.clone();
+                        let pid = app.active_page_id.clone();
+                        return dispatch(
+                            Action::OpenMediaUrl {
+                                url: u,
+                                block_id: (!bid.is_empty()).then_some(bid),
+                                page_id: pid,
+                            },
+                            app,
+                            ui,
+                        );
+                    }
+                    NotionBlockKind::Bookmark { url, .. }
                     | NotionBlockKind::Embed { url, .. }
                     | NotionBlockKind::LinkPreview { url } => {
                         let u = url.clone();
@@ -453,7 +483,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     NotionBlockKind::File { url, name, .. } => {
                         let bid = vblk.block.id.clone();
                         let u = url.clone();
-                        if is_html_file_ref(&u, name.as_deref()) {
+                        if is_html_svg_or_xml_ref(&u, name.as_deref()) {
                             let title = name
                                 .clone()
                                 .filter(|s| !s.trim().is_empty())
@@ -477,7 +507,15 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         if let Some(midx) = media_idx {
                             return dispatch(Action::DownloadMedia(midx), app, ui);
                         } else if !u.trim().is_empty() {
-                            return dispatch(Action::OpenUrl(u), app, ui);
+                            return dispatch(
+                                Action::OpenMediaUrl {
+                                    url: u,
+                                    block_id: (!bid.is_empty()).then_some(bid),
+                                    page_id: app.active_page_id.clone(),
+                                },
+                                app,
+                                ui,
+                            );
                         }
                     }
                     NotionBlockKind::Pdf { url, .. } => {
@@ -490,7 +528,15 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         if let Some(midx) = media_idx {
                             return dispatch(Action::DownloadMedia(midx), app, ui);
                         } else if !u.trim().is_empty() {
-                            return dispatch(Action::OpenUrl(u), app, ui);
+                            return dispatch(
+                                Action::OpenMediaUrl {
+                                    url: u,
+                                    block_id: (!bid.is_empty()).then_some(bid),
+                                    page_id: app.active_page_id.clone(),
+                                },
+                                app,
+                                ui,
+                            );
                         }
                     }
                     NotionBlockKind::Button { rich_text } => {
@@ -692,7 +738,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                             return dispatch(Action::OpenHtmlPreview { title, html }, app, ui);
                         }
                         NotionBlockKind::File { url, name, .. }
-                            if is_html_file_ref(url, name.as_deref()) =>
+                            if is_html_svg_or_xml_ref(url, name.as_deref()) =>
                         {
                             let title = name
                                 .clone()
@@ -713,7 +759,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                             );
                         }
                         NotionBlockKind::Image { url, caption, .. }
-                            if sniff_content_kind(None, Some(url), None) == ContentKind::Html =>
+                            if is_html_svg_or_xml_ref(url, None) =>
                         {
                             let cap = spans_plain_text(caption);
                             let title = if cap.trim().is_empty() {
@@ -788,13 +834,17 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     Err(first_err) => {
                         if let Some(bid) = block_id.filter(|s| !s.trim().is_empty()) {
                             if let Ok(blk) = client.get_block(&bid, &pid).await {
-                                let fresh = match blk.kind {
-                                    NotionBlockKind::File { url: u, .. }
-                                    | NotionBlockKind::Image { url: u, .. } => u,
-                                    _ => String::new(),
-                                };
-                                if !fresh.trim().is_empty() && fresh != url {
-                                    media::fetch_media_bytes_cached(&http, &fresh).await
+                                if let Some(fresh) = media::extract_block_media_url(&blk.kind) {
+                                    if fresh != url {
+                                        let _ = ui_tx.send(UiMsg::MediaUrlRefreshed {
+                                            page_id: pid.clone(),
+                                            block_id: bid.clone(),
+                                            url: fresh.clone(),
+                                        });
+                                        media::fetch_media_bytes_cached(&http, &fresh).await
+                                    } else {
+                                        Err(first_err)
+                                    }
                                 } else {
                                     Err(first_err)
                                 }
@@ -807,8 +857,15 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     }
                 };
                 match fetched {
-                    Ok((bytes, _)) => {
-                        let html = String::from_utf8_lossy(&bytes).into_owned();
+                    Ok((bytes, mime)) => {
+                        let raw = String::from_utf8_lossy(&bytes).into_owned();
+                        let html = if mime == "image/svg+xml"
+                            || media::looks_like_svg_document(&bytes)
+                        {
+                            format!("<div style=\"padding:16px\">{raw}</div>")
+                        } else {
+                            raw
+                        };
                         let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded { title, html });
                     }
                     Err(err) => {
@@ -854,6 +911,17 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 .push(Overlay::notion_form(NotionFormOverlay::new(
                     NotionFormMode::QuickAppend,
                 )));
+        }
+        Action::OpenPageEditor => {
+            if let Some(detail) = app.active_page_detail.as_ref() {
+                ui.overlays.push(Overlay::page_editor(
+                    detail.page.id.clone(),
+                    detail.page.display_title().to_string(),
+                    detail.markdown.clone(),
+                ));
+            } else {
+                ui.warning("Open a page to edit");
+            }
         }
         Action::OpenNewPageModal => {
             let mode = if app.active_view == CanvasView::Database && app.active_database_id.is_some()
@@ -901,6 +969,45 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     Err(err) => {
                         let _ = ui_tx.send(UiMsg::TaskFailed {
                             label: "append".into(),
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            });
+        }
+        Action::SubmitPageEdit(edited_markdown) => {
+            let Some(page_id) = app.active_page_id.clone() else {
+                ui.warning("Open a page before saving edits");
+                return false;
+            };
+            let current_md = app
+                .active_page_detail
+                .as_ref()
+                .map(|d| d.markdown.as_str())
+                .unwrap_or("");
+            if edited_markdown.trim() == current_md.trim() {
+                ui.info("No changes to save");
+                return false;
+            }
+            let client = app.client.clone();
+            let storage = app.storage.clone();
+            let ui_tx = app.ui_tx.clone();
+            ui.tasks.begin("edit");
+            tokio::spawn(async move {
+                match crate::cli::op_replace_page_markdown(
+                    &client,
+                    &storage,
+                    &page_id,
+                    &edited_markdown,
+                )
+                .await
+                {
+                    Ok(detail) => {
+                        let _ = ui_tx.send(UiMsg::PageEdited(Box::new(detail)));
+                    }
+                    Err(err) => {
+                        let _ = ui_tx.send(UiMsg::TaskFailed {
+                            label: "edit".into(),
                             error: err.to_string(),
                         });
                     }
@@ -1138,10 +1245,56 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 ui.warning("No Notion URL available for the current item");
             }
         }
-        Action::OpenUrl(url) => match open::that(&url) {
+        Action::OpenUrl(url) => match open_url_in_browser(&url) {
             Ok(()) => ui.info(format!("Opened {url}")),
             Err(err) => ui.error(format!("Failed to open browser: {err}")),
         },
+        Action::OpenMediaUrl {
+            url,
+            block_id,
+            page_id,
+        } => {
+            let bid = block_id.filter(|s| !s.trim().is_empty());
+            if media::is_expiring_notion_s3_url(&url) {
+                if let Some(bid) = bid {
+                    let client = app.client.clone();
+                    let ui_tx = app.ui_tx.clone();
+                    let pid = page_id
+                        .or_else(|| app.active_page_id.clone())
+                        .unwrap_or_default();
+                    ui.tasks.begin("open-media");
+                    tokio::spawn(async move {
+                        let mut target_url = url.clone();
+                        if let Ok(blk) = client.get_block(&bid, &pid).await {
+                            if let Some(fresh_url) = media::extract_block_media_url(&blk.kind) {
+                                let _ = ui_tx.send(UiMsg::MediaUrlRefreshed {
+                                    page_id: pid.clone(),
+                                    block_id: bid.clone(),
+                                    url: fresh_url.clone(),
+                                });
+                                target_url = fresh_url;
+                            }
+                        }
+                        match open_url_in_browser(&target_url) {
+                            Ok(()) => {
+                                let _ = ui_tx.send(UiMsg::TaskDone {
+                                    label: "open-media".into(),
+                                    toast: format!("Opened {target_url}"),
+                                });
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiMsg::TaskFailed {
+                                    label: "open-media".into(),
+                                    error: format!("Failed to open browser: {err}"),
+                                });
+                            }
+                        }
+                    });
+                    return false;
+                }
+            }
+            return dispatch(Action::OpenUrl(url), app, ui);
+        }
         Action::CopyUrlToClipboard(url) => copy_to_clipboard(&url, "Copied URL to clipboard", ui),
         Action::CopySelectionOrMarkdown => {
             if let Some(detail) = app.active_page_detail.as_ref() {
@@ -1210,12 +1363,15 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         let http = client.http_client().clone();
                         let ui_tx = app.ui_tx.clone();
                         let url = target.url.clone();
-                        let block_id = app
-                            .active_page_detail
-                            .as_ref()
-                            .and_then(|d| d.media.get(target.media_index))
-                            .map(|m| m.block_id.clone())
-                            .unwrap_or_default();
+                        let block_id = if !target.block_id.trim().is_empty() {
+                            target.block_id.clone()
+                        } else {
+                            app.active_page_detail
+                                .as_ref()
+                                .and_then(|d| d.media.get(target.media_index))
+                                .map(|m| m.block_id.clone())
+                                .unwrap_or_default()
+                        };
                         let page_id = target.page_id.clone();
                         tokio::spawn(async move {
                             // First attempt cached/direct URL; if expired (Notion S3 URLs expire after 1h),
@@ -1224,9 +1380,17 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                                 Ok(ok) => Ok(ok),
                                 Err(first_err) if !block_id.trim().is_empty() => {
                                     if let Ok(blk) = client.get_block(&block_id, &page_id).await {
-                                        if let NotionBlockKind::Image { url: fresh_url, .. } = blk.kind {
-                                            if !fresh_url.trim().is_empty() && fresh_url != url {
-                                                media::fetch_media_bytes_cached(&http, &fresh_url).await
+                                        if let Some(fresh_url) =
+                                            media::extract_block_media_url(&blk.kind)
+                                        {
+                                            if fresh_url != url {
+                                                let _ = ui_tx.send(UiMsg::MediaUrlRefreshed {
+                                                    page_id: page_id.clone(),
+                                                    block_id: block_id.clone(),
+                                                    url: fresh_url.clone(),
+                                                });
+                                                media::fetch_media_bytes_cached(&http, &fresh_url)
+                                                    .await
                                             } else {
                                                 Err(first_err)
                                             }
@@ -1243,55 +1407,80 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                             let display_name = target.display_name.clone();
                             match fetched {
                                 Ok((bytes, mime)) => {
-                                    match sniff_content_kind(
-                                        Some(&mime),
-                                        Some(&display_name),
-                                        Some(&bytes),
-                                    ) {
-                                        ContentKind::Html => {
-                                            let html = String::from_utf8_lossy(&bytes).into_owned();
-                                            let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded {
-                                                title: display_name,
-                                                html,
-                                            });
-                                        }
-                                        ContentKind::Svg => {
-                                            let _ = ui_tx.send(UiMsg::ImagePreviewFailed(
-                                                "SVG vector graphic (press 'o' to open in browser)"
-                                                    .into(),
-                                            ));
-                                        }
-                                        _ => {
-                                            let rendered = tokio::task::spawn_blocking(move || {
-                                                crate::img_preview::decode_and_render_for_protocol(
-                                                    &bytes,
-                                                    cols,
-                                                    rows,
-                                                    (25, 25, 25),
-                                                    caps,
-                                                )
-                                            })
-                                            .await;
-                                            match rendered {
-                                                Ok(Ok(img)) => {
-                                                    let _ = ui_tx.send(UiMsg::ImageRendered {
-                                                        cache_key,
-                                                        rendered: Box::new(img),
-                                                    });
-                                                }
-                                                Ok(Err(err)) => {
-                                                    let _ = ui_tx.send(UiMsg::ImagePreviewFailed(
-                                                        format!(
-                                                            "{err} (press 'o' to open in browser)"
-                                                        ),
-                                                    ));
-                                                }
-                                                Err(join_err) => {
-                                                    let _ = ui_tx.send(UiMsg::ImagePreviewFailed(
-                                                        format!(
-                                                            "Image decode task failed: {join_err}"
-                                                        ),
-                                                    ));
+                                    let is_svg = mime == "image/svg+xml"
+                                        || media::looks_like_svg_document(&bytes);
+                                    let is_xml = mime == "application/xml"
+                                        || mime == "text/xml"
+                                        || media::looks_like_xml_bytes(&bytes);
+                                    if is_svg {
+                                        let svg_src = String::from_utf8_lossy(&bytes);
+                                        let html = format!("<div style=\"padding:16px\">{svg_src}</div>");
+                                        let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded {
+                                            title: display_name,
+                                            html,
+                                        });
+                                    } else if is_xml {
+                                        let xml_src = String::from_utf8_lossy(&bytes).into_owned();
+                                        let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded {
+                                            title: display_name,
+                                            html: xml_src,
+                                        });
+                                    } else {
+                                        match sniff_content_kind(
+                                            Some(&mime),
+                                            Some(&display_name),
+                                            Some(&bytes),
+                                        ) {
+                                            ContentKind::Html => {
+                                                let html =
+                                                    String::from_utf8_lossy(&bytes).into_owned();
+                                                let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded {
+                                                    title: display_name,
+                                                    html,
+                                                });
+                                            }
+                                            ContentKind::Svg => {
+                                                let svg_src = String::from_utf8_lossy(&bytes);
+                                                let html = format!(
+                                                    "<div style=\"padding:16px\">{svg_src}</div>"
+                                                );
+                                                let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded {
+                                                    title: display_name,
+                                                    html,
+                                                });
+                                            }
+                                            _ => {
+                                                let rendered = tokio::task::spawn_blocking(move || {
+                                                    crate::img_preview::decode_and_render_for_protocol(
+                                                        &bytes,
+                                                        cols,
+                                                        rows,
+                                                        (25, 25, 25),
+                                                        caps,
+                                                    )
+                                                })
+                                                .await;
+                                                match rendered {
+                                                    Ok(Ok(img)) => {
+                                                        let _ = ui_tx.send(UiMsg::ImageRendered {
+                                                            cache_key,
+                                                            rendered: Box::new(img),
+                                                        });
+                                                    }
+                                                    Ok(Err(err)) => {
+                                                        let _ = ui_tx.send(
+                                                            UiMsg::ImagePreviewFailed(format!(
+                                                                "{err} (press 'o' to open in browser)"
+                                                            )),
+                                                        );
+                                                    }
+                                                    Err(join_err) => {
+                                                        let _ = ui_tx.send(
+                                                            UiMsg::ImagePreviewFailed(format!(
+                                                                "Image decode task failed: {join_err}"
+                                                            )),
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -1446,6 +1635,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 }
                 Focus::Canvas | Focus::Overlay => match app.active_view {
                     CanvasView::Page => {
+                        ui.canvas_follow_selected = false;
                         let mag = delta.unsigned_abs();
                         if delta < 0 {
                             ui.canvas_scroll = ui.canvas_scroll.saturating_sub(mag);
@@ -1529,9 +1719,17 @@ fn handle_mouse_click(
                 }
                 return dispatch(Action::Activate, app, ui);
             }
-            HitTarget::Button(ButtonId::ConfirmOk) => return dispatch(Action::Activate, app, ui),
+            HitTarget::Button(ButtonId::ConfirmOk) => {
+                if matches!(ui.overlays.last(), Some(Overlay::PageEditor(_))) {
+                    return dispatch(Action::OverlaySubmit, app, ui);
+                }
+                return dispatch(Action::Activate, app, ui);
+            }
             HitTarget::Button(ButtonId::ConfirmCancel) => {
                 return dispatch(Action::CloseOverlay, app, ui);
+            }
+            HitTarget::Button(ButtonId::EditExternal) => {
+                return dispatch(Action::RequestExternalEditor, app, ui);
             }
             HitTarget::Button(ButtonId::HtmlToggleMode) => {
                 return dispatch(Action::Input('m'), app, ui);
@@ -1593,7 +1791,7 @@ fn handle_mouse_click(
                     NotionBlockKind::Image { url, caption, .. } => {
                         let block_id = vblk.block.id.clone();
                         let url = url.clone();
-                        if sniff_content_kind(None, Some(&url), None) == ContentKind::Html {
+                        if is_html_svg_or_xml_ref(&url, None) {
                             let cap = spans_plain_text(caption);
                             let title = if cap.trim().is_empty() {
                                 "HTML Preview".to_string()
@@ -1624,9 +1822,20 @@ fn handle_mouse_click(
                         ui.info("No images on the current page");
                         return false;
                     }
-                    NotionBlockKind::Video { url, .. }
-                    | NotionBlockKind::Audio { url, .. }
-                    | NotionBlockKind::Bookmark { url, .. }
+                    NotionBlockKind::Video { url, .. } | NotionBlockKind::Audio { url, .. } => {
+                        let block_id = vblk.block.id.clone();
+                        let u = url.clone();
+                        return dispatch(
+                            Action::OpenMediaUrl {
+                                url: u,
+                                block_id: (!block_id.is_empty()).then_some(block_id),
+                                page_id: app.active_page_id.clone(),
+                            },
+                            app,
+                            ui,
+                        );
+                    }
+                    NotionBlockKind::Bookmark { url, .. }
                     | NotionBlockKind::Embed { url, .. }
                     | NotionBlockKind::LinkPreview { url } => {
                         let u = url.clone();
@@ -1635,7 +1844,7 @@ fn handle_mouse_click(
                     NotionBlockKind::File { url, name, .. } => {
                         let block_id = vblk.block.id.clone();
                         let u = url.clone();
-                        if is_html_file_ref(&u, name.as_deref()) {
+                        if is_html_svg_or_xml_ref(&u, name.as_deref()) {
                             let title = name
                                 .clone()
                                 .filter(|s| !s.trim().is_empty())
@@ -1659,7 +1868,15 @@ fn handle_mouse_click(
                         if let Some(midx) = media_idx {
                             return dispatch(Action::DownloadMedia(midx), app, ui);
                         } else if !u.trim().is_empty() {
-                            return dispatch(Action::OpenUrl(u), app, ui);
+                            return dispatch(
+                                Action::OpenMediaUrl {
+                                    url: u,
+                                    block_id: (!block_id.is_empty()).then_some(block_id),
+                                    page_id: app.active_page_id.clone(),
+                                },
+                                app,
+                                ui,
+                            );
                         }
                         return false;
                     }
@@ -1673,7 +1890,15 @@ fn handle_mouse_click(
                         if let Some(midx) = media_idx {
                             return dispatch(Action::DownloadMedia(midx), app, ui);
                         } else if !u.trim().is_empty() {
-                            return dispatch(Action::OpenUrl(u), app, ui);
+                            return dispatch(
+                                Action::OpenMediaUrl {
+                                    url: u,
+                                    block_id: (!block_id.is_empty()).then_some(block_id),
+                                    page_id: app.active_page_id.clone(),
+                                },
+                                app,
+                                ui,
+                            );
                         }
                         return false;
                     }
@@ -1744,6 +1969,7 @@ fn handle_mouse_click(
             ButtonId::NewChildPage | ButtonId::DbNewItem => {
                 return dispatch(Action::OpenNewPageModal, app, ui);
             }
+            ButtonId::EditPage => return dispatch(Action::OpenPageEditor, app, ui),
             ButtonId::EditExternal => return dispatch(Action::RequestExternalEditor, app, ui),
             ButtonId::OpenWeb => return dispatch(Action::OpenActiveInBrowser, app, ui),
             ButtonId::LinkExtractor => return dispatch(Action::OpenLinkExtractor, app, ui),
@@ -1775,6 +2001,35 @@ pub(crate) fn is_html_code_language(language: &str) -> bool {
 pub(crate) fn is_html_file_ref(url: &str, name: Option<&str>) -> bool {
     name.is_some_and(|n| sniff_content_kind(None, Some(n), None) == ContentKind::Html)
         || sniff_content_kind(None, Some(url), None) == ContentKind::Html
+}
+
+fn is_html_svg_or_xml_ref(url: &str, name: Option<&str>) -> bool {
+    if is_html_file_ref(url, name) {
+        return true;
+    }
+    let check_ref = |s: &str| {
+        let lower = s
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(s)
+            .to_ascii_lowercase();
+        lower.ends_with(".svg")
+            || lower.ends_with(".xml")
+            || sniff_content_kind(None, Some(s), None) == ContentKind::Svg
+    };
+    name.is_some_and(check_ref) || check_ref(url)
+}
+
+fn open_url_in_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        let _ = url;
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        open::that(url)
+    }
 }
 
 fn selected_db_row_page(app: &AppState, ui: &UiState) -> Option<NotionPage> {
@@ -2546,7 +2801,7 @@ mod tests {
             ButtonId::ToggleFavorite,
             ButtonId::QuickAppend,
             ButtonId::NewChildPage,
-            ButtonId::EditExternal,
+            ButtonId::EditPage,
             ButtonId::OpenWeb,
             ButtonId::LinkExtractor,
             ButtonId::ToggleHrefs,
@@ -2615,5 +2870,480 @@ mod tests {
             }
             other => panic!("expected ShowToast (not ImagePreview) for SVG attachment, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_open_media_url_refreshes_signed_s3_url_and_svg_preview_wraps_html() {
+        use axum::{
+            extract::Path as AxumPath,
+            http::header,
+            routing::get,
+            Json, Router,
+        };
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let fresh_s3_url = format!(
+            "https://prod-files-secure.s3.us-west-2.amazonaws.com/ws/blk-s3/fresh.png?X-Amz-Expires=3600&X-Amz-Signature=fresh_sig_999"
+        );
+        let fresh_for_route = fresh_s3_url.clone();
+        let svg_body = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\"><rect width=\"24\" height=\"24\" fill=\"teal\"/></svg>";
+
+        let router = Router::new()
+            .route(
+                "/v1/blocks/{id}",
+                get(move |AxumPath(id): AxumPath<String>| {
+                    let fresh = fresh_for_route.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "id": id,
+                            "type": "image",
+                            "has_children": false,
+                            "image": {
+                                "type": "file",
+                                "file": { "url": fresh },
+                                "caption": [{ "plain_text": "Signed Shot" }]
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/diagram.svg",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::OK,
+                        [(header::CONTENT_TYPE, "image/svg+xml")],
+                        svg_body,
+                    )
+                }),
+            );
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let cfg = AppConfig::default();
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_s3_refresh_test");
+        let client = NotionClient::new(&cfg, auth.clone())
+            .unwrap()
+            .with_base_url(format!("{base_url}/v1"));
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = tokio::sync::watch::channel(FocusTarget::default());
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+
+        let mut ui = UiState::from_config(&cfg);
+        let mut app = AppState::new(cfg, auth, client, storage, sync_ctrl, ui_tx);
+
+        let stale_s3_url = "https://prod-files-secure.s3.us-west-2.amazonaws.com/ws/blk-s3/old.png?X-Amz-Expires=3600&X-Amz-Signature=expired_sig_000".to_string();
+        let svg_url = format!("{base_url}/diagram.svg");
+        let page = NotionPage {
+            id: "page-s3".into(),
+            title: "S3 Refresh Test".into(),
+            ..Default::default()
+        };
+        app.active_view = CanvasView::Page;
+        app.active_page_id = Some(page.id.clone());
+        app.active_page_detail = Some(NotionPageDetail {
+            page: page.clone(),
+            blocks: vec![NotionBlock {
+                id: "blk-s3".into(),
+                page_id: page.id.clone(),
+                kind: NotionBlockKind::Image {
+                    url: stale_s3_url.clone(),
+                    caption: vec![RichTextSpan::plain("Signed Shot")],
+                    is_hosted: true,
+                },
+                ..Default::default()
+            }],
+            comments: Vec::new(),
+            markdown: String::new(),
+            media: vec![
+                NotionMediaRef {
+                    block_id: "blk-s3".into(),
+                    url: stale_s3_url.clone(),
+                    display_name: "Signed Shot".into(),
+                    mime_type: "image/png".into(),
+                    is_image: true,
+                },
+                NotionMediaRef {
+                    block_id: "blk-svg".into(),
+                    url: svg_url.clone(),
+                    display_name: "diagram.svg".into(),
+                    mime_type: "image/png".into(),
+                    is_image: true,
+                },
+            ],
+        });
+
+        // Open ImagePreviewOverlay and press 'o' -> dispatches OpenMediaUrl and refreshes signed S3 URL!
+        let ov = ImagePreviewOverlay::from_notion_page(app.active_page_detail.as_ref().unwrap(), Some(0)).unwrap();
+        assert_eq!(ov.current().unwrap().block_id, "blk-s3");
+        ui.overlays.push(Overlay::ImagePreview(ov));
+
+        dispatch(Action::Input('o'), &mut app, &mut ui);
+
+        let mut got_refreshed = false;
+        for _ in 0..3 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timed out waiting for MediaUrlRefreshed")
+                .expect("ui_rx closed");
+            if let UiMsg::MediaUrlRefreshed {
+                ref page_id,
+                ref block_id,
+                ref url,
+            } = msg
+            {
+                assert_eq!(page_id, "page-s3");
+                assert_eq!(block_id, "blk-s3");
+                assert_eq!(url, &fresh_s3_url);
+                got_refreshed = true;
+            }
+            app.handle_ui_msg(&mut ui, msg);
+            if got_refreshed {
+                break;
+            }
+        }
+        assert!(got_refreshed, "expected UiMsg::MediaUrlRefreshed");
+        assert_eq!(
+            app.active_page_detail.as_ref().unwrap().media[0].url,
+            fresh_s3_url
+        );
+        match ui.overlays.last() {
+            Some(Overlay::ImagePreview(ov)) => {
+                assert_eq!(ov.items[0].url, fresh_s3_url);
+            }
+            other => panic!("expected ImagePreviewOverlay with refreshed URL, got {other:?}"),
+        }
+
+        // Now verify LoadPreviewImage on genuine SVG wraps it cleanly in <div style="padding:16px">...</div>
+        if let Some(Overlay::ImagePreview(ref mut ov)) = ui.overlays.last_mut() {
+            ov.index = 1; // diagram.svg
+        }
+        dispatch(Action::LoadPreviewImage, &mut app, &mut ui);
+        let mut got_svg_html = false;
+        for _ in 0..4 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timed out waiting for SVG HtmlPreviewLoaded")
+                .expect("ui_rx closed");
+            if let UiMsg::HtmlPreviewLoaded { ref title, ref html } = msg {
+                assert_eq!(title, "diagram.svg");
+                assert!(html.starts_with("<div style=\"padding:16px\">"));
+                assert!(html.contains("<svg "));
+                got_svg_html = true;
+                app.handle_ui_msg(&mut ui, msg);
+                break;
+            }
+            app.handle_ui_msg(&mut ui, msg);
+        }
+        assert!(got_svg_html, "expected SVG to open cleanly in HtmlPreviewOverlay");
+        assert!(matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))));
+
+        server_handle.abort();
+    }
+
+    #[test]
+    fn test_canvas_move_down_advances_scroll_and_keeps_selected_block_visible() {
+        let (mut app, mut ui) = make_test_app_and_ui();
+        ui.focus = Focus::Canvas;
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        assert_eq!(ui.selected_block, 0);
+        assert_eq!(ui.canvas_scroll, 0);
+
+        // MoveDown increments selected_block AND advances canvas_scroll
+        dispatch(Action::MoveDown, &mut app, &mut ui);
+        assert_eq!(ui.selected_block, 1);
+        assert_eq!(ui.canvas_scroll, 1);
+        assert!(ui.canvas_follow_selected);
+
+        // Navigating 35 blocks down auto-scrolls canvas_scroll so selected block stays in viewport
+        for _ in 0..35 {
+            dispatch(Action::MoveDown, &mut app, &mut ui);
+        }
+        assert_eq!(ui.selected_block, 36);
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        assert!(ui.canvas_scroll >= 15, "expected canvas_scroll to follow selected block, got {}", ui.canvas_scroll);
+        assert!(!ui.canvas_follow_selected);
+
+        // MouseScroll freely scrolls without snapping back to selected_block
+        let before_wheel = ui.canvas_scroll;
+        dispatch(
+            Action::MouseScroll {
+                delta: -6,
+                column: 60,
+                row: 10,
+            },
+            &mut app,
+            &mut ui,
+        );
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        assert_eq!(ui.canvas_scroll, before_wheel.saturating_sub(6));
+    }
+
+    #[tokio::test]
+    async fn test_page_editor_opens_on_e_and_edit_pill_without_external_editor_and_replaces_blocks_on_save() {
+        use std::sync::{Arc, Mutex};
+        use axum::{
+            extract::Path as AxumPath,
+            routing::{delete, get},
+            Json, Router,
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use tokio::net::TcpListener;
+
+        let deleted_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let appended_payloads: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let current_blocks: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(vec![
+            serde_json::json!({
+                "id": "blk-old-1",
+                "type": "paragraph",
+                "has_children": false,
+                "paragraph": { "rich_text": [{ "plain_text": "Old content" }] }
+            }),
+            serde_json::json!({
+                "id": "blk-child-page",
+                "type": "child_page",
+                "has_children": false,
+                "child_page": { "title": "Keep Child Page" }
+            }),
+        ]));
+
+        let del_log = deleted_ids.clone();
+        let blocks_del = current_blocks.clone();
+        let blocks_get = current_blocks.clone();
+        let blocks_patch = current_blocks.clone();
+        let app_log = appended_payloads.clone();
+
+        let router = Router::new()
+            .route(
+                "/v1/pages/{id}",
+                get(|AxumPath(id): AxumPath<String>| async move {
+                    Json(serde_json::json!({
+                        "object": "page",
+                        "id": id,
+                        "url": "https://www.notion.so/page-edit-1",
+                        "parent": { "type": "workspace", "workspace": true },
+                        "archived": false,
+                        "properties": {
+                            "title": { "type": "title", "title": [{ "plain_text": "Editable Page" }] }
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/v1/blocks/{id}/children",
+                get(move || {
+                    let b = blocks_get.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "object": "list",
+                            "results": b.lock().unwrap().clone(),
+                            "has_more": false
+                        }))
+                    }
+                })
+                .patch(move |Json(body): Json<serde_json::Value>| {
+                    let b = blocks_patch.clone();
+                    let log = app_log.clone();
+                    async move {
+                        let children = body
+                            .get("children")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        log.lock().unwrap().extend(children.clone());
+                        let mut guard = b.lock().unwrap();
+                        let mut created = Vec::new();
+                        for (i, mut c) in children.into_iter().enumerate() {
+                            c["id"] = serde_json::json!(format!("blk-new-{i}"));
+                            c["has_children"] = serde_json::json!(false);
+                            guard.push(c.clone());
+                            created.push(c);
+                        }
+                        Json(serde_json::json!({ "object": "list", "results": created }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/blocks/{id}",
+                delete(move |AxumPath(id): AxumPath<String>| {
+                    let d = del_log.clone();
+                    let b = blocks_del.clone();
+                    async move {
+                        d.lock().unwrap().push(id.clone());
+                        b.lock().unwrap().retain(|blk| blk["id"] != id);
+                        Json(serde_json::json!({ "id": id, "archived": true }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/comments",
+                get(|| async {
+                    Json(serde_json::json!({ "object": "list", "results": [], "has_more": false }))
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let cfg = AppConfig::default();
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_edit_test");
+        let client = NotionClient::new(&cfg, auth.clone())
+            .unwrap()
+            .with_base_url(format!("http://{addr}/v1"));
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = tokio::sync::watch::channel(FocusTarget::default());
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+
+        let mut ui = UiState::from_config(&cfg);
+        ui.focus = Focus::Canvas;
+        let mut app = AppState::new(cfg, auth, client, storage, sync_ctrl, ui_tx);
+        let page = NotionPage {
+            id: "11111111-2222-3333-4444-555555555555".into(),
+            title: "Editable Page".into(),
+            ..Default::default()
+        };
+        app.active_view = CanvasView::Page;
+        app.active_page_id = Some(page.id.clone());
+        app.active_page_detail = Some(NotionPageDetail {
+            page: page.clone(),
+            blocks: Vec::new(),
+            comments: Vec::new(),
+            markdown: "Old content".into(),
+            media: Vec::new(),
+        });
+
+        // 1. Pressing 'e' opens Overlay::PageEditor WITHOUT setting ui.editor_requested = true!
+        let act_e = crate::ui::event::key_to_action(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            ui.focus(),
+            &ui.keymap,
+            ui.accepts_text_input(),
+            false,
+            ui.db_view_mode,
+        )
+        .unwrap();
+        assert_eq!(act_e, Action::OpenPageEditor);
+        dispatch(act_e, &mut app, &mut ui);
+        assert!(!ui.editor_requested, "'e' must NEVER launch external editor");
+        assert!(matches!(ui.overlays.last(), Some(Overlay::PageEditor(_))));
+
+        // Close with Esc
+        dispatch(Action::CloseOverlay, &mut app, &mut ui);
+        assert!(ui.overlays.is_empty());
+
+        // 2. Clicking [✎ Edit] pill opens Overlay::PageEditor WITHOUT setting ui.editor_requested = true!
+        let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        let edit_btn = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::EditPage))
+            .expect("[✎ Edit] button should map to ButtonId::EditPage");
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::Button(ButtonId::EditPage),
+                col: edit_btn.x + 1,
+                row: edit_btn.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(!ui.editor_requested, "[✎ Edit] must NEVER launch external editor");
+        assert!(matches!(ui.overlays.last(), Some(Overlay::PageEditor(_))));
+
+        // 3. Edit inside PageEditorOverlay (Enter newline + Korean UTF-8 + Ctrl+Z undo + Ctrl+S submit)
+        dispatch(Action::CursorEnd, &mut app, &mut ui);
+        dispatch(Action::Activate, &mut app, &mut ui); // newline
+        for ch in "새 문단X".chars() {
+            dispatch(Action::Input(ch), &mut app, &mut ui);
+        }
+        // Ctrl+Z undoes 'X'
+        let act_undo = crate::ui::event::key_to_action(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+            ui.focus(),
+            &ui.keymap,
+            ui.accepts_text_input(),
+            false,
+            ui.db_view_mode,
+        )
+        .unwrap();
+        assert_eq!(act_undo, Action::Undo);
+        dispatch(act_undo, &mut app, &mut ui);
+
+        // Ctrl+S submits Action::SubmitPageEdit and closes the overlay
+        let act_save = crate::ui::event::key_to_action(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            ui.focus(),
+            &ui.keymap,
+            ui.accepts_text_input(),
+            false,
+            ui.db_view_mode,
+        )
+        .unwrap();
+        assert_eq!(act_save, Action::OverlaySubmit);
+        dispatch(act_save, &mut app, &mut ui);
+        assert!(ui.overlays.is_empty());
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+            .await
+            .expect("timed out waiting for PageEdited")
+            .expect("ui_rx closed");
+        assert!(
+            matches!(msg, UiMsg::PageEdited(_)),
+            "expected UiMsg::PageEdited from SubmitPageEdit"
+        );
+        app.handle_ui_msg(&mut ui, msg);
+
+        // Old content block was deleted (not duplicated!) while child_page was preserved!
+        assert_eq!(*deleted_ids.lock().unwrap(), vec!["blk-old-1".to_string()]);
+        assert_eq!(appended_payloads.lock().unwrap().len(), 2);
+        assert!(ui
+            .toasts
+            .latest()
+            .is_some_and(|t| t.message == "Saved changes to Notion"));
+
+        // 4. Ctrl+E explicitly requests external $EDITOR
+        let act_ext = crate::ui::event::key_to_action(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            ui.focus(),
+            &ui.keymap,
+            ui.accepts_text_input(),
+            false,
+            ui.db_view_mode,
+        )
+        .unwrap();
+        assert_eq!(act_ext, Action::RequestExternalEditor);
+        dispatch(act_ext, &mut app, &mut ui);
+        assert!(ui.editor_requested);
+
+        server_handle.abort();
     }
 }

@@ -948,10 +948,7 @@ async fn handle_pages_cmd(
                 let edited = crate::ui::composer::external_edit(&detail.markdown)
                     .context("Failed to edit page in external $EDITOR")?;
                 if edited.trim() != detail.markdown.trim() {
-                    let new_blocks = markdown_to_notion_blocks(&edited);
-                    if !new_blocks.is_empty() {
-                        client.append_block_children(&page_id, new_blocks).await?;
-                    }
+                    let _ = op_replace_page_markdown(client, storage, &page_id, &edited).await?;
                 }
             }
             let updated = if title.is_some() || icon.is_some() {
@@ -1653,6 +1650,42 @@ pub async fn op_append_blocks(
         let _ = storage.replace_page_blocks(&ws_id, &id, &full_tree);
     }
     Ok(appended)
+}
+
+/// Replaces the editable content blocks of a Notion page with blocks parsed from `edited_markdown`
+/// (preserving child pages and child databases), then refreshes and caches the updated page detail.
+pub async fn op_replace_page_markdown(
+    client: &NotionClient,
+    storage: &Storage,
+    page: &str,
+    edited_markdown: &str,
+) -> Result<NotionPageDetail> {
+    let ws_id = client.auth().active_workspace_id().await;
+    let id = resolver::resolve_page_id(storage, Some(client), &ws_id, page).await?;
+    let existing = client.list_block_children(&id, &id, None).await?;
+    let new_blocks = markdown_to_notion_blocks(edited_markdown);
+
+    for blk in &existing {
+        if blk.id.trim().is_empty()
+            || matches!(
+                blk.kind,
+                NotionBlockKind::ChildPage { .. } | NotionBlockKind::ChildDatabase { .. }
+            )
+        {
+            continue;
+        }
+        if blk.block_type == "unsupported" {
+            let _ = client.delete_block(&blk.id).await;
+        } else {
+            client.delete_block(&blk.id).await?;
+        }
+    }
+
+    if !new_blocks.is_empty() {
+        client.append_block_children(&id, new_blocks).await?;
+    }
+
+    sync::sync_page_detail(client, storage, &id).await
 }
 
 pub async fn op_update_block_text(

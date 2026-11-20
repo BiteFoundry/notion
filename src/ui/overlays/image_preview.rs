@@ -26,6 +26,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewTarget {
     pub page_id: String,
+    pub block_id: String,
     pub media_index: usize,
     pub url: String,
     pub display_name: String,
@@ -58,6 +59,7 @@ impl ImagePreviewOverlay {
             }
             items.push(PreviewTarget {
                 page_id: detail.page.id.clone(),
+                block_id: m.block_id.clone(),
                 media_index: idx,
                 url: m.url.clone(),
                 display_name: m.display_name.clone(),
@@ -192,7 +194,13 @@ impl ImagePreviewOverlay {
             Action::Input('p') => OverlayOutcome::Dispatch(Action::CycleImageProtocol),
             Action::OpenActiveInBrowser | Action::Input('o') | Action::Input('O') => {
                 if let Some(target) = self.current() {
-                    OverlayOutcome::Dispatch(Action::OpenUrl(target.url.clone()))
+                    OverlayOutcome::Dispatch(Action::OpenMediaUrl {
+                        url: target.url.clone(),
+                        block_id: (!target.block_id.trim().is_empty())
+                            .then(|| target.block_id.clone()),
+                        page_id: (!target.page_id.trim().is_empty())
+                            .then(|| target.page_id.clone()),
+                    })
                 } else {
                     OverlayOutcome::Handled
                 }
@@ -591,7 +599,11 @@ mod tests {
         assert_eq!(ov.index, 1);
         assert_eq!(
             ov.handle(&Action::OpenActiveInBrowser),
-            OverlayOutcome::Dispatch(Action::OpenUrl("https://example.com/second.png".to_string()))
+            OverlayOutcome::Dispatch(Action::OpenMediaUrl {
+                url: "https://example.com/second.png".to_string(),
+                block_id: Some("blk-2".to_string()),
+                page_id: Some("page-1".to_string()),
+            })
         );
     }
 }

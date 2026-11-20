@@ -87,7 +87,8 @@ impl CommandPalette {
         let commands = [
             ("Quick Append Block (/h1, /todo, /callout)", "a", Action::OpenQuickAppend),
             ("New Child Page / Database Item", "n", Action::OpenNewPageModal),
-            ("Edit Active Page in $EDITOR", "e", Action::RequestExternalEditor),
+            ("Edit Active Page (In-Terminal Markdown)", "e", Action::OpenPageEditor),
+            ("Open in External $EDITOR", "Ctrl+E", Action::RequestExternalEditor),
             ("Toggle Page Width (Centered / Full)", "w", Action::TogglePageWidth),
             ("Toggle Favorite Star", "f", Action::ToggleFavorite),
             ("Toggle Comments Peek Drawer", "C", Action::ToggleCommentsDrawer),
