@@ -134,28 +134,49 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         return handle_mouse_click(target, col, row, app, ui);
     }
 
-    // Route through top overlay first when present
-    if let Some(mut top) = ui.overlays.pop() {
-        let outcome = top.handle(&action, app, ui);
-        match outcome {
-            OverlayOutcome::Handled => {
-                ui.overlays.push(top);
-                return false;
-            }
-            OverlayOutcome::Close => {
-                ui.active_pixel_graphic = None;
-                return false;
-            }
-            OverlayOutcome::Dispatch(next) => {
-                ui.overlays.push(top);
-                return dispatch(next, app, ui);
-            }
-            OverlayOutcome::CloseAndDispatch(next) => {
-                ui.active_pixel_graphic = None;
-                return dispatch(next, app, ui);
-            }
-            OverlayOutcome::NotHandled => {
-                ui.overlays.push(top);
+    // Route through top overlay first when present — except internal effect actions
+    // (e.g., `LoadPreviewImage`, `CycleImageProtocol`, `DownloadMedia`, `OpenUrl`) which must reach the core dispatcher.
+    let bypass_overlay = matches!(
+        action,
+        Action::LoadPreviewImage
+            | Action::CycleImageProtocol
+            | Action::DownloadMedia(_)
+            | Action::OpenUrl(_)
+            | Action::CopyUrlToClipboard(_)
+            | Action::SetTheme(_)
+            | Action::ToggleInlineImages
+            | Action::ToggleNotify
+            | Action::CycleSyncInterval
+            | Action::SwitchWorkspace(_)
+            | Action::AttachFormFile(_)
+            | Action::SubmitSlashAppend(_)
+            | Action::SubmitCreatePage { .. }
+            | Action::ArchiveActivePage
+    );
+
+    if !bypass_overlay {
+        if let Some(mut top) = ui.overlays.pop() {
+            let outcome = top.handle(&action, app, ui);
+            match outcome {
+                OverlayOutcome::Handled => {
+                    ui.overlays.push(top);
+                    return false;
+                }
+                OverlayOutcome::Close => {
+                    ui.active_pixel_graphic = None;
+                    return false;
+                }
+                OverlayOutcome::Dispatch(next) => {
+                    ui.overlays.push(top);
+                    return dispatch(next, app, ui);
+                }
+                OverlayOutcome::CloseAndDispatch(next) => {
+                    ui.active_pixel_graphic = None;
+                    return dispatch(next, app, ui);
+                }
+                OverlayOutcome::NotHandled => {
+                    ui.overlays.push(top);
+                }
             }
         }
     }
