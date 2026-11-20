@@ -12,7 +12,7 @@ use crate::ui::{
     action::Action,
     app::{AppState, UiState},
     hitmap::{HitMap, HitTarget},
-    overlays::{centered_rect, OverlayOutcome},
+    overlays::{centered_rect, scroll_selection_clamped, OverlayOutcome},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -42,6 +42,26 @@ impl WorkspaceSwitcherOverlay {
                     let cur = self.selected.min(count - 1);
                     self.selected = (cur + 1) % count;
                 }
+                OverlayOutcome::Handled
+            }
+            Action::PageUp => {
+                self.selected = scroll_selection_clamped(self.selected, count, -5);
+                OverlayOutcome::Handled
+            }
+            Action::PageDown => {
+                self.selected = scroll_selection_clamped(self.selected, count, 5);
+                OverlayOutcome::Handled
+            }
+            Action::CursorHome | Action::ScrollTop | Action::Input('g') => {
+                self.selected = 0;
+                OverlayOutcome::Handled
+            }
+            Action::CursorEnd | Action::ScrollBottom | Action::Input('G') => {
+                self.selected = count.saturating_sub(1);
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } => {
+                self.selected = scroll_selection_clamped(self.selected, count, *delta as isize);
                 OverlayOutcome::Handled
             }
             Action::Activate | Action::OverlaySubmit => {
@@ -95,18 +115,23 @@ impl WorkspaceSwitcherOverlay {
         }
 
         let active = app.config.effective_workspace_name(None);
+        let visible_rows = inner.height as usize;
         let sel = self
             .selected
             .min(app.config.workspaces.len().saturating_sub(1));
+        let offset =
+            crate::ui::nav_pane::selection_offset(sel, visible_rows, app.config.workspaces.len());
 
-        for (idx, ws) in app
+        for (row, ws) in app
             .config
             .workspaces
             .iter()
-            .take(inner.height as usize)
+            .skip(offset)
+            .take(visible_rows)
             .enumerate()
         {
-            let y = inner.y + idx as u16;
+            let idx = offset + row;
+            let y = inner.y + row as u16;
             let is_sel = idx == sel;
             let is_active = ws.name.eq_ignore_ascii_case(&active);
             let style = if is_sel {

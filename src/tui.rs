@@ -1,14 +1,16 @@
 //! TUI entry shell: terminal raw mode, mouse capture, keyboard enhancement, event loop, external `$EDITOR`.
 
+use std::borrow::Cow;
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+#[cfg(not(windows))]
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyCode,
+    KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -22,7 +24,8 @@ use tokio::sync::{mpsc, watch};
 
 use crate::{
     auth::AuthManager,
-    config::AppConfig,
+    config::{AppConfig, ImageProtocolPreference},
+    img_preview::TerminalGraphicsCaps,
     models::CoreEvent,
     notion::NotionClient,
     storage::Storage,
@@ -35,21 +38,144 @@ use crate::{
     },
 };
 
+#[cfg(windows)]
+mod win_console {
+    use std::ptr::null_mut;
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
+
+    const ENABLE_WINDOW_INPUT: u32 = 0x0008;
+    const ENABLE_MOUSE_INPUT: u32 = 0x0010;
+    pub const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+
+    /// Raw-mode + ConPTY mouse capture console input mode (`0x0098`):
+    /// enables `ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS`,
+    /// explicitly clearing `ENABLE_QUICK_EDIT_MODE`, `ENABLE_VIRTUAL_TERMINAL_INPUT`,
+    /// `ENABLE_LINE_INPUT`, `ENABLE_ECHO_INPUT`, and `ENABLE_PROCESSED_INPUT`.
+    pub const TUI_MOUSE_CAPTURE_MODE: u32 =
+        ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut std::ffi::c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: isize,
+        ) -> isize;
+        fn CloseHandle(h_object: isize) -> i32;
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn GetConsoleMode(h_console_handle: isize, lp_mode: *mut u32) -> i32;
+        fn SetConsoleMode(h_console_handle: isize, dw_mode: u32) -> i32;
+    }
+
+    fn with_conin_handle<T>(f: impl FnOnce(isize) -> Option<T>) -> Option<T> {
+        const CONIN_WIDE: [u16; 7] = [
+            b'C' as u16,
+            b'O' as u16,
+            b'N' as u16,
+            b'I' as u16,
+            b'N' as u16,
+            b'$' as u16,
+            0,
+        ];
+        let conin = unsafe {
+            CreateFileW(
+                CONIN_WIDE.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null_mut(),
+                OPEN_EXISTING,
+                0,
+                0,
+            )
+        };
+        if conin != 0 && conin != INVALID_HANDLE_VALUE {
+            let res = f(conin);
+            unsafe {
+                CloseHandle(conin);
+            }
+            return res;
+        }
+        let std_in = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if std_in != 0 && std_in != INVALID_HANDLE_VALUE {
+            f(std_in)
+        } else {
+            None
+        }
+    }
+
+    pub fn snapshot_console_mode() -> Option<u32> {
+        with_conin_handle(|h| {
+            let mut mode = 0u32;
+            if unsafe { GetConsoleMode(h, &mut mode) } != 0 {
+                Some(mode)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn enforce_windows_mouse_capture() {
+        let _ = with_conin_handle(|h| {
+            unsafe {
+                SetConsoleMode(h, TUI_MOUSE_CAPTURE_MODE);
+            }
+            Some(())
+        });
+    }
+
+    pub fn restore_console_mode(orig_mode: Option<u32>) {
+        if let Some(mode) = orig_mode {
+            let _ = with_conin_handle(|h| {
+                unsafe {
+                    SetConsoleMode(h, mode | ENABLE_EXTENDED_FLAGS);
+                }
+                Some(())
+            });
+        }
+    }
+}
+
 struct TerminalGuard {
     keyboard_enhanced: bool,
     kitty_used: bool,
+    #[cfg(windows)]
+    orig_conin_mode: Option<u32>,
 }
 
 impl TerminalGuard {
-    fn enter() -> Result<(Self, Terminal<CrosstermBackend<Stdout>>)> {
+    fn enter(
+        image_protocol: ImageProtocolPreference,
+    ) -> Result<(Self, Terminal<CrosstermBackend<Stdout>>, TerminalGraphicsCaps)> {
+        #[cfg(windows)]
+        let orig_conin_mode = win_console::snapshot_console_mode();
+
         enable_raw_mode()?;
+        // Probe graphics & cell pixel dimensions while raw mode is active, BEFORE entering
+        // alternate screen / mouse capture so Windows VT probe never clobbers ConPTY mouse mode.
+        let graphics_caps = crate::img_preview::probe_terminal_graphics_caps(image_protocol);
+
         let mut stdout = io::stdout();
+        #[cfg(not(windows))]
         execute!(
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableBracketedPaste
         )?;
+        #[cfg(windows)]
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+
         let keyboard_enhanced = if supports_keyboard_enhancement().unwrap_or(false) {
             execute!(
                 stdout,
@@ -63,6 +189,9 @@ impl TerminalGuard {
             false
         };
 
+        #[cfg(windows)]
+        win_console::enforce_windows_mouse_capture();
+
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.hide_cursor()?;
@@ -72,8 +201,11 @@ impl TerminalGuard {
             Self {
                 keyboard_enhanced,
                 kitty_used: false,
+                #[cfg(windows)]
+                orig_conin_mode,
             },
             terminal,
+            graphics_caps,
         ))
     }
 
@@ -88,13 +220,18 @@ impl TerminalGuard {
         if self.keyboard_enhanced {
             let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         }
+        #[cfg(not(windows))]
         let _ = execute!(
             stdout,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
+        #[cfg(windows)]
+        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
+        #[cfg(windows)]
+        win_console::restore_console_mode(self.orig_conin_mode);
     }
 }
 
@@ -104,20 +241,27 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn install_panic_hook(keyboard_enhanced: bool) {
+fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
+    #[cfg(not(windows))]
+    let _ = orig_conin_mode;
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut stdout = io::stdout();
         if keyboard_enhanced {
             let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         }
+        #[cfg(not(windows))]
         let _ = execute!(
             stdout,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
+        #[cfg(windows)]
+        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
+        #[cfg(windows)]
+        win_console::restore_console_mode(orig_conin_mode);
         prev(info);
     }));
 }
@@ -296,6 +440,22 @@ fn notify_activity_throttled(app: &AppState, last_activity_sent: &mut Option<Ins
     }
 }
 
+fn parse_pixel_key(key: &str) -> (&str, Option<(u16, u16, u16, u16)>) {
+    if let Some((base, crop_str)) = key.rsplit_once("#crop:") {
+        let mut parts = crop_str.split(',');
+        if let (Some(sx), Some(sy), Some(vw), Some(vh), None) = (
+            parts.next().and_then(|s| s.parse::<u16>().ok()),
+            parts.next().and_then(|s| s.parse::<u16>().ok()),
+            parts.next().and_then(|s| s.parse::<u16>().ok()),
+            parts.next().and_then(|s| s.parse::<u16>().ok()),
+            parts.next(),
+        ) {
+            return (base, Some((sx, sy, vw, vh)));
+        }
+    }
+    (key, None)
+}
+
 fn draw_frame(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut AppState,
@@ -323,17 +483,32 @@ fn draw_frame(
         };
 
         if !pending_matches_prev {
-            if let Some((_, _, prev_proto)) = &prev_graphic {
-                if *prev_proto == TerminalImageProtocol::Kitty {
-                    terminal
-                        .backend_mut()
-                        .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
+            // Avoid full `terminal.clear()` flicker when only the `#crop:...` viewport changed
+            // on the exact same rect and base image for Sixel.
+            let sixel_crop_only_update = match (&prev_graphic, &ui.pending_pixel_graphic) {
+                (Some((pk, pr, TerminalImageProtocol::Sixel)), Some(pg))
+                    if pg.protocol == TerminalImageProtocol::Sixel && *pr == pg.rect =>
+                {
+                    let (prev_base, _) = parse_pixel_key(pk);
+                    let (next_base, _) = parse_pixel_key(&pg.cache_key);
+                    prev_base == next_base
                 }
-                terminal.clear()?;
-                ui.active_pixel_graphic = None;
-                terminal.draw(|frame| {
-                    cursor_pos = ui::draw(frame, app, ui);
-                })?;
+                _ => false,
+            };
+
+            if !sixel_crop_only_update {
+                if let Some((_, _, prev_proto)) = &prev_graphic {
+                    if *prev_proto == TerminalImageProtocol::Kitty {
+                        terminal
+                            .backend_mut()
+                            .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
+                    }
+                    terminal.clear()?;
+                    ui.active_pixel_graphic = None;
+                    terminal.draw(|frame| {
+                        cursor_pos = ui::draw(frame, app, ui);
+                    })?;
+                }
             }
 
             if let Some(pg) = ui.pending_pixel_graphic.clone() {
@@ -341,11 +516,25 @@ fn draw_frame(
                     |(ak, ar, ap)| ak == &pg.cache_key && *ar == pg.rect && *ap == pg.protocol,
                 );
                 if !already_active {
-                    if let Some(payload) = app
-                        .image_cache
-                        .get(&pg.cache_key)
-                        .and_then(|r| r.pixel_payload.as_deref())
-                    {
+                    let (base_key, crop) = parse_pixel_key(&pg.cache_key);
+                    let payload: Option<Cow<'_, str>> =
+                        app.image_cache.get(base_key).and_then(|rendered| {
+                            if let Some((sx, sy, vw, vh)) = crop {
+                                rendered
+                                    .viewport_pixel_payload(sx, sy, vw, vh)
+                                    .map(|(p, _, _)| Cow::Owned(p))
+                                    .or_else(|| {
+                                        if rendered.cols <= vw && rendered.rows <= vh {
+                                            rendered.pixel_payload.as_deref().map(Cow::Borrowed)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                            } else {
+                                rendered.pixel_payload.as_deref().map(Cow::Borrowed)
+                            }
+                        });
+                    if let Some(payload) = payload {
                         if pg.protocol == TerminalImageProtocol::Kitty {
                             terminal
                                 .backend_mut()
@@ -584,8 +773,12 @@ pub async fn run(
     client: NotionClient,
     storage: Storage,
 ) -> Result<()> {
-    let (mut guard, mut terminal) = TerminalGuard::enter()?;
-    install_panic_hook(guard.keyboard_enhanced);
+    let (mut guard, mut terminal, graphics_caps) = TerminalGuard::enter(config.image_protocol)?;
+    #[cfg(windows)]
+    let orig_conin_mode = guard.orig_conin_mode;
+    #[cfg(not(windows))]
+    let orig_conin_mode = None;
+    install_panic_hook(guard.keyboard_enhanced, orig_conin_mode);
 
     let (core_tx, mut core_rx) = mpsc::unbounded_channel::<CoreEvent>();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
@@ -598,7 +791,7 @@ pub async fn run(
         ui.term_width = sz.width;
         ui.term_height = sz.height;
     }
-    ui.graphics_caps = crate::img_preview::probe_terminal_graphics_caps(config.image_protocol);
+    ui.graphics_caps = graphics_caps;
     ui.kitty_keyboard_supported = guard.keyboard_enhanced;
     let mut app = AppState::new(
         config.clone(),
@@ -640,12 +833,15 @@ pub async fn run(
             let result = composer::external_edit(&initial_md);
             let mut stdout = io::stdout();
             enable_raw_mode()?;
+            #[cfg(not(windows))]
             execute!(
                 stdout,
                 EnterAlternateScreen,
                 EnableMouseCapture,
                 EnableBracketedPaste
             )?;
+            #[cfg(windows)]
+            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
             if guard.keyboard_enhanced {
                 let _ = execute!(
                     stdout,
@@ -655,6 +851,8 @@ pub async fn run(
                     )
                 );
             }
+            #[cfg(windows)]
+            win_console::enforce_windows_mouse_capture();
             terminal.clear()?;
             dirty = true;
 
@@ -769,4 +967,34 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_pixel_key_extracts_base_and_crop() {
+        assert_eq!(
+            parse_pixel_key("hd:p1:0:92:100:Sixel#crop:2,10,80,25"),
+            ("hd:p1:0:92:100:Sixel", Some((2, 10, 80, 25)))
+        );
+        assert_eq!(
+            parse_pixel_key("hd:p1:0:92:100:Sixel"),
+            ("hd:p1:0:92:100:Sixel", None)
+        );
+        assert_eq!(
+            parse_pixel_key("hd:p1:0:92:100:Sixel#crop:bad"),
+            ("hd:p1:0:92:100:Sixel#crop:bad", None)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_mouse_capture_mode_bits() {
+        // 0x0098 = ENABLE_WINDOW_INPUT (0x0008) | ENABLE_MOUSE_INPUT (0x0010) | ENABLE_EXTENDED_FLAGS (0x0080)
+        assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE, 0x0098);
+        assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE & 0x0040, 0); // QuickEdit cleared
+        assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE & 0x0200, 0); // VTInput cleared
+    }
 }

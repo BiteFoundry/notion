@@ -60,6 +60,7 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     ui.pending_pixel_graphic = None;
 
     let mut hitmap = HitMap::new();
+    hitmap.add(area, HitTarget::Pane(ui.focus));
     let theme = ui.theme.clone();
 
     frame.render_widget(

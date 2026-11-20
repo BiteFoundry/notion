@@ -27,6 +27,46 @@ pub fn key_to_action(
         return None;
     }
 
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    if focus == Focus::Overlay {
+        if let Some(cmd) = keymap.resolve_overlay_global(&key, text_input) {
+            return match cmd {
+                KeyCommand::Quit => Some(Action::QuitConfirm),
+                KeyCommand::SmoothScrollDown => Some(Action::PageDown),
+                KeyCommand::SmoothScrollUp => Some(Action::PageUp),
+                _ => None,
+            };
+        }
+        if ctrl && key.code == KeyCode::Enter
+            || alt && key.code == KeyCode::Enter
+            || ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+        {
+            return Some(Action::OverlaySubmit);
+        }
+        return match key.code {
+            KeyCode::Esc => Some(Action::CloseOverlay),
+            KeyCode::Enter if shift => Some(Action::Newline),
+            KeyCode::Enter => Some(Action::Activate),
+            KeyCode::Tab => Some(Action::Tab),
+            KeyCode::BackTab => Some(Action::PrevFocus),
+            KeyCode::Backspace => Some(Action::Backspace),
+            KeyCode::Delete => Some(Action::Delete),
+            KeyCode::Up => Some(Action::MoveUp),
+            KeyCode::Down => Some(Action::MoveDown),
+            KeyCode::Left => Some(Action::CursorLeft),
+            KeyCode::Right => Some(Action::CursorRight),
+            KeyCode::Home => Some(Action::CursorHome),
+            KeyCode::End => Some(Action::CursorEnd),
+            KeyCode::PageUp => Some(Action::PageUp),
+            KeyCode::PageDown => Some(Action::PageDown),
+            KeyCode::Char(ch) if !ctrl && !alt => Some(Action::Input(ch)),
+            _ => None,
+        };
+    }
+
     if let Some(cmd) = keymap.resolve_global(&key, text_input) {
         return Some(match cmd {
             KeyCommand::Quit => Action::QuitConfirm,
@@ -57,38 +97,6 @@ pub fn key_to_action(
             KeyCommand::SmoothScrollDown => Action::PageDown,
             KeyCommand::SmoothScrollUp => Action::PageUp,
         });
-    }
-
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-
-    if focus == Focus::Overlay {
-        if ctrl && key.code == KeyCode::Enter
-            || alt && key.code == KeyCode::Enter
-            || ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
-        {
-            return Some(Action::OverlaySubmit);
-        }
-        return match key.code {
-            KeyCode::Esc => Some(Action::CloseOverlay),
-            KeyCode::Enter if shift => Some(Action::Newline),
-            KeyCode::Enter => Some(Action::Activate),
-            KeyCode::Tab => Some(Action::Tab),
-            KeyCode::BackTab => Some(Action::PrevFocus),
-            KeyCode::Backspace => Some(Action::Backspace),
-            KeyCode::Delete => Some(Action::Delete),
-            KeyCode::Up => Some(Action::MoveUp),
-            KeyCode::Down => Some(Action::MoveDown),
-            KeyCode::Left => Some(Action::CursorLeft),
-            KeyCode::Right => Some(Action::CursorRight),
-            KeyCode::Home => Some(Action::CursorHome),
-            KeyCode::End => Some(Action::CursorEnd),
-            KeyCode::PageUp => Some(Action::PageUp),
-            KeyCode::PageDown => Some(Action::PageDown),
-            KeyCode::Char(ch) if !ctrl && !alt => Some(Action::Input(ch)),
-            _ => None,
-        };
     }
 
     // Inline comment composer inside Comments Drawer
@@ -178,5 +186,213 @@ pub fn mouse_to_action(mouse: MouseEvent, hitmap: &HitMap) -> Option<Action> {
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn test_overlay_focus_preserves_single_char_inputs_without_global_hijack() {
+        let keymap = KeyMap;
+
+        // Non-text overlays (`text_input == false`) must receive all single-char overlay shortcuts
+        // as `Action::Input(ch)` instead of being hijacked by global shortcuts.
+        for ch in [
+            'v', '[', ']', 'o', 'y', '?', '+', '-', '0', 'p', 'd', 'j', 'k', 'g', 'G', 'h', 'l',
+            '1', '9', 'z', 'n', 'u', '/', '.', 'w', 'C', 'a', 'e', 'D', 'A',
+        ] {
+            let act = key_to_action(
+                press(KeyCode::Char(ch), KeyModifiers::NONE),
+                Focus::Overlay,
+                &keymap,
+                false,
+                false,
+                DatabaseViewMode::Table,
+            );
+            assert_eq!(
+                act,
+                Some(Action::Input(ch)),
+                "overlay focus should deliver '{ch}' as Action::Input('{ch}')"
+            );
+        }
+
+        // Navigation & editing keys route directly to the overlay instead of global Backspace/Delete.
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Backspace, KeyModifiers::NONE),
+                Focus::Overlay,
+                &keymap,
+                false,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            Some(Action::Backspace)
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Delete, KeyModifiers::NONE),
+                Focus::Overlay,
+                &keymap,
+                false,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            Some(Action::Delete)
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Left, KeyModifiers::NONE),
+                Focus::Overlay,
+                &keymap,
+                false,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            Some(Action::CursorLeft)
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::End, KeyModifiers::NONE),
+                Focus::Overlay,
+                &keymap,
+                false,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            Some(Action::CursorEnd)
+        );
+
+        // Allowed overlay globals: Ctrl+Q always, and Ctrl+D / Ctrl+U when `!text_input`.
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                Focus::Overlay,
+                &keymap,
+                false,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            Some(Action::QuitConfirm)
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                Focus::Overlay,
+                &keymap,
+                true,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            Some(Action::QuitConfirm)
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                Focus::Overlay,
+                &keymap,
+                false,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            Some(Action::PageDown)
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                Focus::Overlay,
+                &keymap,
+                false,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            Some(Action::PageUp)
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                Focus::Overlay,
+                &keymap,
+                true,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            None
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                Focus::Overlay,
+                &keymap,
+                true,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            None
+        );
+
+        // Other global shortcuts (e.g. Ctrl+K, Ctrl+B, F5, Alt+V) must not hijack an active overlay.
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                Focus::Overlay,
+                &keymap,
+                false,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            None
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('v'), KeyModifiers::ALT),
+                Focus::Overlay,
+                &keymap,
+                false,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            None
+        );
+
+        // Non-overlay focus still resolves global shortcuts normally.
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('v'), KeyModifiers::NONE),
+                Focus::Canvas,
+                &keymap,
+                false,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            Some(Action::OpenImagePreview)
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('['), KeyModifiers::NONE),
+                Focus::Canvas,
+                &keymap,
+                false,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            Some(Action::ToggleSidebar)
+        );
+        assert_eq!(
+            key_to_action(
+                press(KeyCode::Char('?'), KeyModifiers::NONE),
+                Focus::Canvas,
+                &keymap,
+                false,
+                false,
+                DatabaseViewMode::Table,
+            ),
+            Some(Action::OpenOverlay(OverlayKind::Help))
+        );
     }
 }

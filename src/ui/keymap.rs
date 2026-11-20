@@ -37,6 +37,25 @@ pub enum KeyCommand {
 pub struct KeyMap;
 
 impl KeyMap {
+    /// Resolves the narrow subset of global shortcuts permitted while a modal overlay is active:
+    /// `Ctrl+Q` (`Quit`) always, plus `Ctrl+D` / `Ctrl+U` (`SmoothScrollDown` / `SmoothScrollUp`)
+    /// when the active overlay is not accepting text input.
+    pub fn resolve_overlay_global(&self, key: &KeyEvent, text_input: bool) -> Option<KeyCommand> {
+        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            return None;
+        }
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('Q') => Some(KeyCommand::Quit),
+            KeyCode::Char('d') | KeyCode::Char('D') if !text_input => {
+                Some(KeyCommand::SmoothScrollDown)
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') if !text_input => {
+                Some(KeyCommand::SmoothScrollUp)
+            }
+            _ => None,
+        }
+    }
+
     pub fn resolve_global(&self, key: &KeyEvent, text_input: bool) -> Option<KeyCommand> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);

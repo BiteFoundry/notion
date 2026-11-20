@@ -17,7 +17,7 @@ use crate::ui::{
     action::Action,
     app::UiState,
     hitmap::{HitMap, HitTarget},
-    overlays::{centered_rect, OverlayOutcome},
+    overlays::{centered_rect, scroll_selection_clamped, OverlayOutcome},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +184,21 @@ impl FilePickerOverlay {
                 self.selected = len.saturating_sub(1);
                 OverlayOutcome::Handled
             }
+            Action::PageUp => {
+                let len = self.filtered_entries().len();
+                self.selected = scroll_selection_clamped(self.selected, len, -8);
+                OverlayOutcome::Handled
+            }
+            Action::PageDown => {
+                let len = self.filtered_entries().len();
+                self.selected = scroll_selection_clamped(self.selected, len, 8);
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } => {
+                let len = self.filtered_entries().len();
+                self.selected = scroll_selection_clamped(self.selected, len, *delta as isize);
+                OverlayOutcome::Handled
+            }
             Action::Backspace => {
                 if !self.filter.is_empty() {
                     self.filter.pop();
@@ -264,6 +279,31 @@ impl FilePickerOverlay {
                     let cur = self.zoxide_selected.min(len - 1);
                     self.zoxide_selected = (cur + 1) % len;
                 }
+                OverlayOutcome::Handled
+            }
+            Action::CursorHome | Action::ScrollTop => {
+                self.zoxide_selected = 0;
+                OverlayOutcome::Handled
+            }
+            Action::CursorEnd | Action::ScrollBottom => {
+                let len = self.filtered_zoxide_dirs().len();
+                self.zoxide_selected = len.saturating_sub(1);
+                OverlayOutcome::Handled
+            }
+            Action::PageUp => {
+                let len = self.filtered_zoxide_dirs().len();
+                self.zoxide_selected = scroll_selection_clamped(self.zoxide_selected, len, -8);
+                OverlayOutcome::Handled
+            }
+            Action::PageDown => {
+                let len = self.filtered_zoxide_dirs().len();
+                self.zoxide_selected = scroll_selection_clamped(self.zoxide_selected, len, 8);
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } => {
+                let len = self.filtered_zoxide_dirs().len();
+                self.zoxide_selected =
+                    scroll_selection_clamped(self.zoxide_selected, len, *delta as isize);
                 OverlayOutcome::Handled
             }
             Action::Backspace => {
@@ -378,7 +418,7 @@ impl FilePickerOverlay {
                     );
                 } else if list_h > 0 {
                     let active_sel = self.selected.min(items.len() - 1);
-                    let skip = active_sel.saturating_sub(list_h.saturating_sub(1));
+                    let skip = crate::ui::nav_pane::selection_offset(active_sel, list_h, items.len());
                     for (row, (idx, entry)) in items
                         .iter()
                         .enumerate()
@@ -443,7 +483,7 @@ impl FilePickerOverlay {
                     );
                 } else if list_h > 0 {
                     let active_sel = self.zoxide_selected.min(dirs.len() - 1);
-                    let skip = active_sel.saturating_sub(list_h.saturating_sub(1));
+                    let skip = crate::ui::nav_pane::selection_offset(active_sel, list_h, dirs.len());
                     for (row, (idx, dir)) in dirs
                         .iter()
                         .enumerate()

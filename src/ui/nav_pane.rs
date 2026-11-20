@@ -8,7 +8,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 
@@ -29,6 +29,8 @@ pub fn selection_offset(selected: usize, visible_rows: usize, total: usize) -> u
 pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap: &mut HitMap) {
     let theme = &ui.theme;
     let focused = ui.focus == Focus::Sidebar;
+
+    hitmap.add(area, HitTarget::Pane(Focus::Sidebar));
 
     frame.render_widget(
         Block::default()
@@ -54,11 +56,17 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     let visible_rows = area.height as usize;
     let selected = ui.sidebar_selected.min(items.len().saturating_sub(1));
     let offset = selection_offset(selected, visible_rows, items.len());
+    let show_scrollbar = items.len() > visible_rows && area.width >= 8;
+    let content_w = if show_scrollbar {
+        area.width.saturating_sub(1)
+    } else {
+        area.width
+    };
 
     for (row_idx, item) in items.iter().skip(offset).take(visible_rows).enumerate() {
         let idx = offset + row_idx;
         let y = area.y + row_idx as u16;
-        let row_rect = Rect::new(area.x, y, area.width, 1);
+        let row_rect = Rect::new(area.x, y, content_w, 1);
 
         if item.is_section_header {
             let header = if item.icon.is_empty() {
@@ -68,7 +76,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             };
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    crate::ui::truncate_width(&header, area.width as usize),
+                    crate::ui::truncate_width(&header, content_w as usize),
                     theme.muted_style().add_modifier(Modifier::BOLD),
                 ))
                 .style(Style::default().bg(theme.bg_sidebar)),
@@ -98,7 +106,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
 
         let fav_suffix = if item.is_favorite { " ★" } else { "" };
         let prefix = format!(" {indent}{arrow}{} ", item.icon);
-        let label_budget = (area.width as usize)
+        let label_budget = (content_w as usize)
             .saturating_sub(unicode_width::UnicodeWidthStr::width(prefix.as_str()) + fav_suffix.len() + 1)
             .max(4);
         let text = format!(
@@ -129,6 +137,29 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             Paragraph::new(Line::from(Span::styled(text, row_style))).style(row_style),
             row_rect,
         );
-        hitmap.add_line(area.x, y, area.width, HitTarget::SidebarRow(idx));
+        hitmap.add_line(area.x, y, content_w, HitTarget::SidebarRow(idx));
+        if item.collapsible {
+            let arrow_offset = (item.depth as u16).saturating_mul(2);
+            let arrow_x = area.x.saturating_add(arrow_offset);
+            let arrow_w = 3u16.min(content_w.saturating_sub(arrow_offset));
+            if arrow_w > 0 {
+                hitmap.add_line(arrow_x, y, arrow_w, HitTarget::SidebarToggle(idx));
+            }
+        }
+    }
+
+    if show_scrollbar {
+        let max_off = items.len().saturating_sub(visible_rows);
+        let mut sb_state = ScrollbarState::new(max_off.saturating_add(1))
+            .position(offset.min(max_off))
+            .viewport_content_length(visible_rows);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("┃")
+            .track_style(Style::default().fg(theme.divider).bg(theme.bg_sidebar))
+            .thumb_style(Style::default().fg(theme.fg_muted).bg(theme.bg_sidebar));
+        frame.render_stateful_widget(scrollbar, area, &mut sb_state);
     }
 }

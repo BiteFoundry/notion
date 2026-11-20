@@ -37,7 +37,9 @@ pub enum ButtonId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
+    Pane(crate::ui::app::Focus),
     SidebarRow(usize),
+    SidebarToggle(usize),
     BreadcrumbSegment(usize),
     CanvasBlock(usize),
     TodoToggle(usize),

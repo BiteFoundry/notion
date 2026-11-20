@@ -13,7 +13,7 @@ use crate::ui::{
     action::Action,
     app::{AppState, UiState},
     hitmap::{HitMap, HitTarget},
-    overlays::{centered_rect, OverlayKind, OverlayOutcome},
+    overlays::{centered_rect, scroll_selection_clamped, OverlayKind, OverlayOutcome},
 };
 
 #[derive(Debug, Clone)]
@@ -132,6 +132,26 @@ impl CommandPalette {
                     let cur = self.selected.min(items.len() - 1);
                     self.selected = (cur + 1) % items.len();
                 }
+                OverlayOutcome::Handled
+            }
+            Action::PageUp => {
+                self.selected = scroll_selection_clamped(self.selected, items.len(), -5);
+                OverlayOutcome::Handled
+            }
+            Action::PageDown => {
+                self.selected = scroll_selection_clamped(self.selected, items.len(), 5);
+                OverlayOutcome::Handled
+            }
+            Action::CursorHome | Action::ScrollTop => {
+                self.selected = 0;
+                OverlayOutcome::Handled
+            }
+            Action::CursorEnd | Action::ScrollBottom => {
+                self.selected = items.len().saturating_sub(1);
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } => {
+                self.selected = scroll_selection_clamped(self.selected, items.len(), *delta as isize);
                 OverlayOutcome::Handled
             }
             Action::Backspace => {

@@ -14,7 +14,7 @@ use crate::ui::{
     action::Action,
     app::{AppState, UiState},
     hitmap::{HitMap, HitTarget},
-    overlays::{centered_rect, OverlayOutcome},
+    overlays::{centered_rect, scroll_selection_clamped, OverlayOutcome},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -41,6 +41,27 @@ impl SettingsState {
             }
             Action::MoveDown | Action::Input('j') => {
                 self.selected = (self.selected + 1) % SETTING_COUNT;
+                OverlayOutcome::Handled
+            }
+            Action::PageUp => {
+                self.selected = scroll_selection_clamped(self.selected, SETTING_COUNT, -5);
+                OverlayOutcome::Handled
+            }
+            Action::PageDown => {
+                self.selected = scroll_selection_clamped(self.selected, SETTING_COUNT, 5);
+                OverlayOutcome::Handled
+            }
+            Action::CursorHome | Action::ScrollTop | Action::Input('g') => {
+                self.selected = 0;
+                OverlayOutcome::Handled
+            }
+            Action::CursorEnd | Action::ScrollBottom | Action::Input('G') => {
+                self.selected = SETTING_COUNT.saturating_sub(1);
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } => {
+                self.selected =
+                    scroll_selection_clamped(self.selected, SETTING_COUNT, *delta as isize);
                 OverlayOutcome::Handled
             }
             Action::Activate | Action::OverlaySubmit | Action::Input(' ') | Action::CursorRight => {
@@ -113,9 +134,13 @@ impl SettingsState {
             ),
         ];
 
-        for (idx, (label, val)) in rows.iter().take(inner.height as usize).enumerate() {
-            let y = inner.y + idx as u16;
-            let is_sel = idx == self.selected;
+        let visible_rows = inner.height as usize;
+        let sel = self.selected.min(rows.len().saturating_sub(1));
+        let offset = crate::ui::nav_pane::selection_offset(sel, visible_rows, rows.len());
+        for (row, (label, val)) in rows.iter().skip(offset).take(visible_rows).enumerate() {
+            let idx = offset + row;
+            let y = inner.y + row as u16;
+            let is_sel = idx == sel;
             let style = if is_sel {
                 theme.selection()
             } else {

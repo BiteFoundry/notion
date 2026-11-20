@@ -412,6 +412,19 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         let u = url.clone();
                         return dispatch(Action::OpenUrl(u), app, ui);
                     }
+                    NotionBlockKind::File { url, .. } | NotionBlockKind::Pdf { url, .. } => {
+                        let bid = vblk.block.id.clone();
+                        let u = url.clone();
+                        let media_idx = app
+                            .active_page_detail
+                            .as_ref()
+                            .and_then(|d| find_media_index_for_block(d, &bid, &u));
+                        if let Some(midx) = media_idx {
+                            return dispatch(Action::DownloadMedia(midx), app, ui);
+                        } else if !u.trim().is_empty() {
+                            return dispatch(Action::OpenUrl(u), app, ui);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -570,7 +583,16 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::OpenImagePreview => {
             if let Some(detail) = app.active_page_detail.as_ref() {
-                if let Some(ov) = ImagePreviewOverlay::from_notion_page(detail, None) {
+                let visible = app.visible_blocks(ui);
+                let preferred_media_idx = visible.get(ui.selected_block).and_then(|vblk| {
+                    if let NotionBlockKind::Image { url, .. } = &vblk.block.kind {
+                        find_media_index_for_block(detail, &vblk.block.id, url)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(ov) = ImagePreviewOverlay::from_notion_page(detail, preferred_media_idx)
+                {
                     ui.overlays.push(Overlay::ImagePreview(ov));
                     return dispatch(Action::LoadPreviewImage, app, ui);
                 } else {
@@ -1086,11 +1108,111 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             };
             let _ = app.config.save();
         }
-        Action::MouseScroll { delta, .. } => {
-            if delta < 0 {
-                ui.canvas_scroll = ui.canvas_scroll.saturating_sub((-delta) as u16);
-            } else {
-                ui.canvas_scroll = ui.canvas_scroll.saturating_add(delta as u16);
+        Action::MouseScroll { delta, column, row } => {
+            if delta == 0 {
+                return false;
+            }
+            let pos = ratatui::layout::Position::new(column, row);
+            let hit = ui.hitmap.hit(row, column);
+            let target_pane = match hit {
+                Some(HitTarget::SidebarRow(_))
+                | Some(HitTarget::SidebarToggle(_))
+                | Some(HitTarget::Pane(Focus::Sidebar)) => Focus::Sidebar,
+                Some(HitTarget::Pane(Focus::Comments)) if ui.comments_drawer_open => {
+                    Focus::Comments
+                }
+                Some(HitTarget::CanvasBlock(_))
+                | Some(HitTarget::TodoToggle(_))
+                | Some(HitTarget::ToggleBlock(_))
+                | Some(HitTarget::ChildCard(_))
+                | Some(HitTarget::MediaChip(_))
+                | Some(HitTarget::DbViewTab(_))
+                | Some(HitTarget::DbRow(_))
+                | Some(HitTarget::DbBoardCard { .. })
+                | Some(HitTarget::Pane(Focus::Canvas)) => Focus::Canvas,
+                _ => {
+                    if ui.comments_drawer_open
+                        && ui
+                            .hitmap
+                            .region_of(HitTarget::Pane(Focus::Comments))
+                            .is_some_and(|r| r.contains(pos))
+                    {
+                        Focus::Comments
+                    } else if ui
+                        .hitmap
+                        .region_of(HitTarget::Pane(Focus::Sidebar))
+                        .is_some_and(|r| r.contains(pos))
+                    {
+                        Focus::Sidebar
+                    } else if ui
+                        .hitmap
+                        .region_of(HitTarget::Pane(Focus::Canvas))
+                        .is_some_and(|r| r.contains(pos))
+                    {
+                        Focus::Canvas
+                    } else {
+                        match ui.focus {
+                            Focus::Comments if ui.comments_drawer_open => Focus::Comments,
+                            Focus::Sidebar => Focus::Sidebar,
+                            _ => Focus::Canvas,
+                        }
+                    }
+                }
+            };
+
+            match target_pane {
+                Focus::Sidebar => {
+                    let items = app.build_sidebar_items(ui);
+                    ui.sidebar_selected = step_sidebar_selection(&items, ui.sidebar_selected, delta);
+                }
+                Focus::Comments => {
+                    let mag = delta.unsigned_abs();
+                    if delta < 0 {
+                        ui.comments_scroll = ui.comments_scroll.saturating_sub(mag);
+                    } else {
+                        ui.comments_scroll = ui.comments_scroll.saturating_add(mag);
+                    }
+                }
+                Focus::Canvas | Focus::Overlay => match app.active_view {
+                    CanvasView::Page => {
+                        let mag = delta.unsigned_abs();
+                        if delta < 0 {
+                            ui.canvas_scroll = ui.canvas_scroll.saturating_sub(mag);
+                        } else {
+                            ui.canvas_scroll = ui.canvas_scroll.saturating_add(mag);
+                        }
+                    }
+                    CanvasView::Database => match ui.db_view_mode {
+                        DatabaseViewMode::Table | DatabaseViewMode::List => {
+                            let len = app.filtered_sorted_db_rows(ui).len();
+                            let max_idx = len.saturating_sub(1);
+                            let steps = delta.unsigned_abs() as usize;
+                            if delta < 0 {
+                                ui.db_selected_row = ui.db_selected_row.saturating_sub(steps);
+                            } else {
+                                ui.db_selected_row =
+                                    ui.db_selected_row.saturating_add(steps).min(max_idx);
+                            }
+                        }
+                        DatabaseViewMode::Board => {
+                            let cols = app.build_board_columns(ui);
+                            if let Some(HitTarget::DbBoardCard { col, .. }) = hit {
+                                if col < cols.len() {
+                                    ui.db_board_col = col;
+                                }
+                            }
+                            if let Some(col) = cols.get(ui.db_board_col) {
+                                let max_row = col.cards.len().saturating_sub(1);
+                                let cur = ui.db_board_row.min(max_row);
+                                if delta < 0 {
+                                    ui.db_board_row = cur.saturating_sub(1);
+                                } else {
+                                    ui.db_board_row = cur.saturating_add(1).min(max_row);
+                                }
+                            }
+                        }
+                    },
+                },
             }
         }
         _ => {}
@@ -1121,16 +1243,32 @@ fn handle_mouse_click(
             }
             _ => {
                 ui.overlays.pop();
+                ui.active_pixel_graphic = None;
                 return false;
             }
         }
     }
 
     match target {
+        HitTarget::Pane(focus) => {
+            if focus != Focus::Overlay && (focus != Focus::Comments || ui.comments_drawer_open) {
+                ui.focus = focus;
+            }
+        }
         HitTarget::SidebarRow(idx) => {
             ui.focus = Focus::Sidebar;
             ui.sidebar_selected = idx;
             return dispatch(Action::Activate, app, ui);
+        }
+        HitTarget::SidebarToggle(idx) => {
+            ui.focus = Focus::Sidebar;
+            let items = app.build_sidebar_items(ui);
+            if let Some(item) = items.get(idx) {
+                ui.sidebar_selected = idx;
+                if item.collapsible && !ui.collapsed_nodes.remove(&item.id) {
+                    ui.collapsed_nodes.insert(item.id.clone());
+                }
+            }
         }
         HitTarget::BreadcrumbSegment(idx) => {
             return dispatch(Action::NavigateBreadcrumb(idx), app, ui);
@@ -1147,7 +1285,52 @@ fn handle_mouse_click(
             ui.focus = Focus::Canvas;
             return dispatch(Action::ActivateChildBlockAt(idx), app, ui);
         }
-        HitTarget::MediaChip(_) => {
+        HitTarget::MediaChip(idx) => {
+            ui.focus = Focus::Canvas;
+            ui.selected_block = idx;
+            let visible = app.visible_blocks(ui);
+            if let Some(vblk) = visible.get(idx) {
+                match &vblk.block.kind {
+                    NotionBlockKind::Image { url, .. } => {
+                        let block_id = vblk.block.id.clone();
+                        let url = url.clone();
+                        if let Some(detail) = app.active_page_detail.as_ref() {
+                            let media_idx = find_media_index_for_block(detail, &block_id, &url);
+                            if let Some(ov) =
+                                ImagePreviewOverlay::from_notion_page(detail, media_idx)
+                            {
+                                ui.overlays.push(Overlay::ImagePreview(ov));
+                                return dispatch(Action::LoadPreviewImage, app, ui);
+                            }
+                        }
+                        ui.info("No images on the current page");
+                        return false;
+                    }
+                    NotionBlockKind::Video { url, .. }
+                    | NotionBlockKind::Audio { url, .. }
+                    | NotionBlockKind::Bookmark { url, .. }
+                    | NotionBlockKind::Embed { url, .. }
+                    | NotionBlockKind::LinkPreview { url } => {
+                        let u = url.clone();
+                        return dispatch(Action::OpenUrl(u), app, ui);
+                    }
+                    NotionBlockKind::File { url, .. } | NotionBlockKind::Pdf { url, .. } => {
+                        let block_id = vblk.block.id.clone();
+                        let u = url.clone();
+                        let media_idx = app
+                            .active_page_detail
+                            .as_ref()
+                            .and_then(|d| find_media_index_for_block(d, &block_id, &u));
+                        if let Some(midx) = media_idx {
+                            return dispatch(Action::DownloadMedia(midx), app, ui);
+                        } else if !u.trim().is_empty() {
+                            return dispatch(Action::OpenUrl(u), app, ui);
+                        }
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
             return dispatch(Action::OpenImagePreview, app, ui);
         }
         HitTarget::DbViewTab(mode) => {
@@ -1220,9 +1403,530 @@ fn selected_db_row_page(app: &AppState, ui: &UiState) -> Option<NotionPage> {
     }
 }
 
+fn find_media_index_for_block(
+    detail: &crate::models::NotionPageDetail,
+    block_id: &str,
+    url: &str,
+) -> Option<usize> {
+    detail
+        .media
+        .iter()
+        .position(|m| !block_id.is_empty() && m.block_id == block_id)
+        .or_else(|| {
+            detail
+                .media
+                .iter()
+                .position(|m| !url.is_empty() && m.url == url)
+        })
+}
+
+fn step_sidebar_selection(
+    items: &[crate::ui::app::SidebarItem],
+    current: usize,
+    delta: i16,
+) -> usize {
+    if items.is_empty() || delta == 0 {
+        return current.min(items.len().saturating_sub(1));
+    }
+    let max_idx = items.len().saturating_sub(1);
+    let mut idx = current.min(max_idx);
+    let steps = delta.unsigned_abs() as usize;
+    if delta > 0 {
+        for _ in 0..steps {
+            if let Some(next) = ((idx + 1)..items.len()).find(|&i| !items[i].is_section_header) {
+                idx = next;
+            } else {
+                break;
+            }
+        }
+    } else {
+        for _ in 0..steps {
+            if let Some(prev) = (0..idx).rev().find(|&i| !items[i].is_section_header) {
+                idx = prev;
+            } else {
+                break;
+            }
+        }
+    }
+    idx
+}
+
 fn copy_to_clipboard(text: &str, ok_msg: &str, ui: &mut UiState) {
     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_string())) {
         Ok(()) => ui.success(ok_msg),
         Err(err) => ui.error(format!("Clipboard error: {err}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+
+    use super::*;
+    use crate::{
+        auth::AuthManager,
+        config::AppConfig,
+        img_preview::TerminalImageProtocol,
+        models::{
+            NotionBlock, NotionComment, NotionColor, NotionDatabase, NotionMediaRef,
+            NotionPageDetail, NotionPropertySchema, NotionPropertyValue, RichTextSpan, SelectOption,
+        },
+        notion::NotionClient,
+        storage::Storage,
+        sync::{FocusTarget, SyncController},
+        ui,
+    };
+
+    fn make_test_app_and_ui() -> (AppState, UiState) {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_unit_test_token");
+        let client = NotionClient::new(&cfg, auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = tokio::sync::watch::channel(FocusTarget::default());
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+
+        let mut ui_state = UiState::from_config(&cfg);
+        ui_state.show_sidebar = true;
+        let mut app = AppState::new(cfg, auth, client, storage, sync_ctrl, ui_tx);
+
+        let root_page = NotionPage {
+            id: "page-root".into(),
+            title: "Root Page".into(),
+            parent_type: "workspace".into(),
+            ..Default::default()
+        };
+        let child_page = NotionPage {
+            id: "page-child".into(),
+            title: "Child Page".into(),
+            parent_type: "page_id".into(),
+            parent_id: Some("page-root".into()),
+            ..Default::default()
+        };
+        let sibling_page = NotionPage {
+            id: "page-sibling".into(),
+            title: "Sibling Page".into(),
+            parent_type: "workspace".into(),
+            ..Default::default()
+        };
+        app.pages = vec![root_page.clone(), child_page, sibling_page];
+
+        let mut schema = BTreeMap::new();
+        schema.insert(
+            "Status".into(),
+            NotionPropertySchema {
+                id: "st".into(),
+                name: "Status".into(),
+                prop_type: "status".into(),
+                options: vec![
+                    SelectOption {
+                        id: Some("1".into()),
+                        name: "Todo".into(),
+                        color: NotionColor::Gray,
+                    },
+                    SelectOption {
+                        id: Some("2".into()),
+                        name: "Done".into(),
+                        color: NotionColor::Green,
+                    },
+                ],
+            },
+        );
+        app.databases = vec![NotionDatabase {
+            id: "db-1".into(),
+            title: "Tasks".into(),
+            schema,
+            ..Default::default()
+        }];
+        app.active_database_rows = (0..6)
+            .map(|i| {
+                let mut props = BTreeMap::new();
+                let status = if i < 3 { "Todo" } else { "Done" };
+                props.insert(
+                    "Status".into(),
+                    NotionPropertyValue::Status(Some(SelectOption {
+                        id: None,
+                        name: status.into(),
+                        color: NotionColor::Blue,
+                    })),
+                );
+                NotionPage {
+                    id: format!("row-{i}"),
+                    title: format!("Task {i}"),
+                    parent_type: "database_id".into(),
+                    parent_id: Some("db-1".into()),
+                    properties: props,
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        let mut blocks: Vec<NotionBlock> = (0..50)
+            .map(|i| NotionBlock {
+                id: format!("blk-p-{i}"),
+                page_id: "page-root".into(),
+                kind: NotionBlockKind::Paragraph {
+                    rich_text: vec![RichTextSpan::plain(format!("Paragraph line number {i}"))],
+                    color: NotionColor::Default,
+                },
+                ..Default::default()
+            })
+            .collect();
+        blocks.insert(
+            0,
+            NotionBlock {
+                id: "blk-img-1".into(),
+                page_id: "page-root".into(),
+                kind: NotionBlockKind::Image {
+                    url: "https://example.com/1.png".into(),
+                    caption: vec![RichTextSpan::plain("First image")],
+                    is_hosted: false,
+                },
+                ..Default::default()
+            },
+        );
+        blocks.insert(
+            1,
+            NotionBlock {
+                id: "blk-img-2".into(),
+                page_id: "page-root".into(),
+                kind: NotionBlockKind::Image {
+                    url: "https://example.com/2.png".into(),
+                    caption: vec![RichTextSpan::plain("Second image")],
+                    is_hosted: false,
+                },
+                ..Default::default()
+            },
+        );
+        blocks.insert(
+            2,
+            NotionBlock {
+                id: "blk-bookmark".into(),
+                page_id: "page-root".into(),
+                kind: NotionBlockKind::Bookmark {
+                    url: "https://notion.so".into(),
+                    caption: vec![RichTextSpan::plain("Notion Docs")],
+                },
+                ..Default::default()
+            },
+        );
+
+        let comments: Vec<NotionComment> = (0..15)
+            .map(|i| NotionComment {
+                id: format!("c-{i}"),
+                page_id: "page-root".into(),
+                author: format!("User {i}"),
+                body: format!("Comment body line {i}"),
+                created_time: "2026-11-20T01:00:00Z".into(),
+                ..Default::default()
+            })
+            .collect();
+
+        let media = vec![
+            NotionMediaRef {
+                block_id: "blk-img-1".into(),
+                url: "https://example.com/1.png".into(),
+                display_name: "First image".into(),
+                mime_type: "image/png".into(),
+                is_image: true,
+            },
+            NotionMediaRef {
+                block_id: "blk-img-2".into(),
+                url: "https://example.com/2.png".into(),
+                display_name: "Second image".into(),
+                mime_type: "image/png".into(),
+                is_image: true,
+            },
+        ];
+
+        app.active_view = CanvasView::Page;
+        app.active_page_id = Some("page-root".into());
+        app.active_page_detail = Some(NotionPageDetail {
+            page: root_page,
+            blocks,
+            comments,
+            markdown: String::new(),
+            media,
+        });
+        (app, ui_state)
+    }
+
+    #[test]
+    fn test_mouse_scroll_routes_by_hovered_pane_sidebar_canvas_database_and_comments() {
+        let (mut app, mut ui) = make_test_app_and_ui();
+        ui.focus = Focus::Canvas;
+        ui.comments_drawer_open = true;
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        // 1. Scroll over Sidebar (col = 5)
+        let before_sidebar = ui.sidebar_selected;
+        dispatch(
+            Action::MouseScroll {
+                delta: 1,
+                column: 5,
+                row: 10,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(ui.sidebar_selected > before_sidebar);
+        assert_eq!(ui.canvas_scroll, 0);
+        assert_eq!(ui.comments_scroll, 0);
+
+        // 2. Scroll over Page Canvas (col = 60)
+        dispatch(
+            Action::MouseScroll {
+                delta: 4,
+                column: 60,
+                row: 10,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.canvas_scroll, 4);
+        assert_eq!(ui.comments_scroll, 0);
+
+        // 3. Scroll over Comments Drawer (col = 130)
+        dispatch(
+            Action::MouseScroll {
+                delta: 3,
+                column: 130,
+                row: 10,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.comments_scroll, 3);
+        assert_eq!(ui.canvas_scroll, 4);
+
+        // 4. Switch to Database View (Table, List, Board)
+        app.active_view = CanvasView::Database;
+        app.active_database_id = Some("db-1".into());
+        ui.comments_drawer_open = false;
+
+        for mode in [DatabaseViewMode::Table, DatabaseViewMode::List] {
+            ui.db_view_mode = mode;
+            ui.db_selected_row = 0;
+            terminal
+                .draw(|f| {
+                    ui::draw(f, &mut app, &mut ui);
+                })
+                .unwrap();
+            dispatch(
+                Action::MouseScroll {
+                    delta: 2,
+                    column: 60,
+                    row: 10,
+                },
+                &mut app,
+                &mut ui,
+            );
+            assert_eq!(ui.db_selected_row, 2, "failed for {mode:?}");
+            dispatch(
+                Action::MouseScroll {
+                    delta: -1,
+                    column: 60,
+                    row: 10,
+                },
+                &mut app,
+                &mut ui,
+            );
+            assert_eq!(ui.db_selected_row, 1, "failed scroll up for {mode:?}");
+        }
+
+        // Board mode: hovering card in column 1 switches db_board_col and scrolls db_board_row
+        ui.db_view_mode = DatabaseViewMode::Board;
+        ui.db_board_col = 0;
+        ui.db_board_row = 0;
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        let card_rect = ui
+            .hitmap
+            .region_of(HitTarget::DbBoardCard { col: 1, row: 0 })
+            .expect("board card col=1 row=0 should be in hitmap");
+        dispatch(
+            Action::MouseScroll {
+                delta: 1,
+                column: card_rect.x + 1,
+                row: card_rect.y + 1,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.db_board_col, 1);
+        assert_eq!(ui.db_board_row, 1);
+    }
+
+    #[test]
+    fn test_canvas_scroll_clamps_after_scroll_bottom_so_wheel_up_responds_immediately() {
+        let (mut app, mut ui) = make_test_app_and_ui();
+        ui.focus = Focus::Canvas;
+        let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+
+        dispatch(Action::ScrollBottom, &mut app, &mut ui);
+        assert_eq!(ui.canvas_scroll, u16::MAX / 2);
+
+        // Drawing clamps ui.canvas_scroll back to exact max_scroll
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        let clamped_max = ui.canvas_scroll;
+        assert!(clamped_max > 0 && clamped_max < 200);
+
+        // Immediately wheeling up moves canvas_scroll back by 3 without lag
+        dispatch(
+            Action::MouseScroll {
+                delta: -3,
+                column: 60,
+                row: 10,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.canvas_scroll, clamped_max.saturating_sub(3));
+    }
+
+    #[test]
+    fn test_clicking_outside_overlay_on_canvas_margin_closes_overlay_and_clears_pixel_graphic() {
+        let (mut app, mut ui) = make_test_app_and_ui();
+        ui.overlays.push(Overlay::help());
+        ui.active_pixel_graphic = Some((
+            "hd:page-root:0".into(),
+            Rect::new(10, 5, 40, 20),
+            TerminalImageProtocol::Sixel,
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        // Top-left margin inside sidebar/canvas outside the centered Help overlay
+        let target = ui
+            .hitmap
+            .hit(2, 2)
+            .expect("outside click must hit a Pane backdrop target");
+        assert!(!matches!(
+            target,
+            HitTarget::OverlayBody | HitTarget::OverlayItem { .. }
+        ));
+
+        dispatch(
+            Action::MouseClick {
+                target,
+                col: 2,
+                row: 2,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(ui.overlays.is_empty());
+        assert!(ui.active_pixel_graphic.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_clicking_nth_image_chip_opens_matching_media_index_and_sidebar_arrow_toggles_tree()
+    {
+        let (mut app, mut ui) = make_test_app_and_ui();
+        let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        // 1. Verify Bookmark block registered as ChildCard(2)
+        assert!(ui.hitmap.region_of(HitTarget::ChildCard(2)).is_some());
+
+        // 2. Clicking 2nd MediaChip (block index 1) opens ImagePreviewOverlay at index == 1
+        let chip2 = ui
+            .hitmap
+            .region_of(HitTarget::MediaChip(1))
+            .expect("2nd image MediaChip should be mapped");
+        let hit = ui.hitmap.hit(chip2.y, chip2.x).unwrap();
+        assert_eq!(hit, HitTarget::MediaChip(1));
+        dispatch(
+            Action::MouseClick {
+                target: hit,
+                col: chip2.x,
+                row: chip2.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        match ui.overlays.last() {
+            Some(Overlay::ImagePreview(ov)) => {
+                assert_eq!(ov.index, 1);
+                assert_eq!(ov.current().unwrap().url, "https://example.com/2.png");
+            }
+            other => panic!("expected ImagePreview overlay, got {other:?}"),
+        }
+        ui.overlays.clear();
+
+        // 3. Clicking SidebarToggle arrow toggles collapsed_nodes while keeping Focus::Sidebar
+        let items = app.build_sidebar_items(&ui);
+        let root_idx = items
+            .iter()
+            .position(|it| it.id == "page-root")
+            .expect("root page in sidebar");
+        let toggle_rect = ui
+            .hitmap
+            .region_of(HitTarget::SidebarToggle(root_idx))
+            .expect("collapsible root page arrow should be in hitmap");
+        let arrow_hit = ui.hitmap.hit(toggle_rect.y, toggle_rect.x + 1).unwrap();
+        assert_eq!(arrow_hit, HitTarget::SidebarToggle(root_idx));
+
+        ui.focus = Focus::Canvas;
+        dispatch(
+            Action::MouseClick {
+                target: arrow_hit,
+                col: toggle_rect.x + 1,
+                row: toggle_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.focus, Focus::Sidebar);
+        assert!(ui.collapsed_nodes.contains("page-root"));
+
+        // Clicking again expands it and stays in Focus::Sidebar
+        dispatch(
+            Action::MouseClick {
+                target: arrow_hit,
+                col: toggle_rect.x + 1,
+                row: toggle_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.focus, Focus::Sidebar);
+        assert!(!ui.collapsed_nodes.contains("page-root"));
+
+        // 4. Page Header metadata badges (💬 N and 🖼 N media) are clickable
+        let comment_btn = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::ToggleComments))
+            .expect("comment metadata badge should be clickable");
+        let media_btn = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::ImagePreview))
+            .expect("media metadata badge should be clickable");
+        assert!(media_btn.x > comment_btn.x);
     }
 }

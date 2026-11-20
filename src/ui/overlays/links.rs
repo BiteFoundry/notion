@@ -17,7 +17,7 @@ use crate::{
         action::Action,
         app::UiState,
         hitmap::{HitMap, HitTarget},
-        overlays::{centered_rect, OverlayOutcome},
+        overlays::{centered_rect, scroll_selection_clamped, OverlayOutcome},
     },
 };
 
@@ -74,6 +74,27 @@ impl LinkExtractorOverlay {
                     let cur = self.selected.min(self.links.len() - 1);
                     self.selected = (cur + 1) % self.links.len();
                 }
+                OverlayOutcome::Handled
+            }
+            Action::PageUp => {
+                self.selected = scroll_selection_clamped(self.selected, self.links.len(), -5);
+                OverlayOutcome::Handled
+            }
+            Action::PageDown => {
+                self.selected = scroll_selection_clamped(self.selected, self.links.len(), 5);
+                OverlayOutcome::Handled
+            }
+            Action::CursorHome | Action::ScrollTop | Action::Input('g') => {
+                self.selected = 0;
+                OverlayOutcome::Handled
+            }
+            Action::CursorEnd | Action::ScrollBottom | Action::Input('G') => {
+                self.selected = self.links.len().saturating_sub(1);
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } => {
+                self.selected =
+                    scroll_selection_clamped(self.selected, self.links.len(), *delta as isize);
                 OverlayOutcome::Handled
             }
             Action::Activate | Action::OverlaySubmit => {

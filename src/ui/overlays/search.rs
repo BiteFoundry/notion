@@ -14,7 +14,7 @@ use crate::{
         action::Action,
         app::{AppState, UiState},
         hitmap::{HitMap, HitTarget},
-        overlays::{centered_rect, OverlayOutcome},
+        overlays::{centered_rect, scroll_selection_clamped, OverlayOutcome},
     },
 };
 
@@ -71,6 +71,26 @@ impl SearchOverlay {
                     let cur = self.selected.min(hits.len() - 1);
                     self.selected = (cur + 1) % hits.len();
                 }
+                OverlayOutcome::Handled
+            }
+            Action::PageUp => {
+                self.selected = scroll_selection_clamped(self.selected, hits.len(), -5);
+                OverlayOutcome::Handled
+            }
+            Action::PageDown => {
+                self.selected = scroll_selection_clamped(self.selected, hits.len(), 5);
+                OverlayOutcome::Handled
+            }
+            Action::CursorHome | Action::ScrollTop => {
+                self.selected = 0;
+                OverlayOutcome::Handled
+            }
+            Action::CursorEnd | Action::ScrollBottom => {
+                self.selected = hits.len().saturating_sub(1);
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } => {
+                self.selected = scroll_selection_clamped(self.selected, hits.len(), *delta as isize);
                 OverlayOutcome::Handled
             }
             Action::Backspace => {

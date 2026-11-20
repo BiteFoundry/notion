@@ -1044,3 +1044,106 @@ async fn e2e_tui_renders_notion_page_canvas_and_database_table_board_list() {
 
     mock_server.abort();
 }
+
+#[tokio::test]
+async fn e2e_tui_mouse_scroll_clamping_hitmap_and_sidebar_toggle() {
+    let (base_url, _state, mock_server) = start_mock_notion_server().await;
+    let cfg = test_config(&base_url);
+    let auth = AuthManager::from_token(cfg.clone(), "ntn_mock_token_123");
+    let client = NotionClient::new(&cfg, auth.clone()).unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+
+    sync::sync_workspace_tree(&client, &storage).await.unwrap();
+    sync::sync_page_detail(&client, &storage, "page-roadmap")
+        .await
+        .unwrap();
+
+    let (focus_tx, _focus_rx) = tokio::sync::watch::channel(sync::FocusTarget::default());
+    let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let sync_ctrl = sync::SyncController::from_channels(focus_tx, cmd_tx);
+
+    let mut ui_state = UiState::from_config(&cfg);
+    let mut app = AppState::new(cfg, auth, client, storage, sync_ctrl, ui_tx);
+    app.load_cached_initial();
+    app.open_page("page-roadmap", &mut ui_state, false);
+    ui_state.focus = Focus::Canvas;
+    ui_state.comments_drawer_open = true;
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+    terminal
+        .draw(|f| {
+            ui::draw(f, &mut app, &mut ui_state);
+        })
+        .unwrap();
+
+    // 1. Clicking sidebar arrow on collapsible `page-roadmap` (parent of `page-ko`) collapses it
+    // without moving focus away from Sidebar.
+    let items = app.build_sidebar_items(&ui_state);
+    let roadmap_idx = items
+        .iter()
+        .position(|i| i.id == "page-roadmap")
+        .expect("page-roadmap should be in sidebar");
+    let toggle_rect = ui_state
+        .hitmap
+        .region_of(ui::hitmap::HitTarget::SidebarToggle(roadmap_idx))
+        .expect("page-roadmap should have a clickable SidebarToggle region");
+    let toggle_hit = ui_state.hitmap.hit(toggle_rect.y, toggle_rect.x + 1).unwrap();
+    assert_eq!(
+        toggle_hit,
+        ui::hitmap::HitTarget::SidebarToggle(roadmap_idx)
+    );
+    action::dispatch(
+        Action::MouseClick {
+            target: toggle_hit,
+            col: toggle_rect.x + 1,
+            row: toggle_rect.y,
+        },
+        &mut app,
+        &mut ui_state,
+    );
+    assert_eq!(ui_state.focus, Focus::Sidebar);
+    assert!(ui_state.collapsed_nodes.contains("page-roadmap"));
+
+    // 2. ScrollBottom clamps on draw so MouseScroll up immediately responds
+    action::dispatch(Action::ScrollBottom, &mut app, &mut ui_state);
+    terminal
+        .draw(|f| {
+            ui::draw(f, &mut app, &mut ui_state);
+        })
+        .unwrap();
+    let max_scroll = ui_state.canvas_scroll;
+    assert!(max_scroll < 100);
+    if max_scroll > 0 {
+        action::dispatch(
+            Action::MouseScroll {
+                delta: -1,
+                column: 60,
+                row: 10,
+            },
+            &mut app,
+            &mut ui_state,
+        );
+        assert_eq!(ui_state.canvas_scroll, max_scroll - 1);
+    }
+
+    // 3. Clicking Comments Drawer close hint closes the drawer
+    let close_rect = ui_state
+        .hitmap
+        .region_of(ui::hitmap::HitTarget::Button(
+            ui::hitmap::ButtonId::ToggleComments,
+        ))
+        .expect("comments close hint should be mapped");
+    action::dispatch(
+        Action::MouseClick {
+            target: ui::hitmap::HitTarget::Button(ui::hitmap::ButtonId::ToggleComments),
+            col: close_rect.x,
+            row: close_rect.y,
+        },
+        &mut app,
+        &mut ui_state,
+    );
+    assert!(!ui_state.comments_drawer_open);
+
+    mock_server.abort();
+}

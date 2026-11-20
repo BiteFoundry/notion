@@ -12,7 +12,7 @@ use crate::ui::{
     action::Action,
     app::{AppState, UiState},
     hitmap::{HitMap, HitTarget},
-    overlays::{centered_rect, OverlayOutcome},
+    overlays::{centered_rect, scroll_selection_clamped, OverlayOutcome},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -46,6 +46,26 @@ impl AttachmentsState {
                     let cur = self.selected.min(len - 1);
                     self.selected = (cur + 1) % len;
                 }
+                OverlayOutcome::Handled
+            }
+            Action::PageUp => {
+                self.selected = scroll_selection_clamped(self.selected, len, -5);
+                OverlayOutcome::Handled
+            }
+            Action::PageDown => {
+                self.selected = scroll_selection_clamped(self.selected, len, 5);
+                OverlayOutcome::Handled
+            }
+            Action::CursorHome | Action::ScrollTop | Action::Input('g') => {
+                self.selected = 0;
+                OverlayOutcome::Handled
+            }
+            Action::CursorEnd | Action::ScrollBottom | Action::Input('G') => {
+                self.selected = len.saturating_sub(1);
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } => {
+                self.selected = scroll_selection_clamped(self.selected, len, *delta as isize);
                 OverlayOutcome::Handled
             }
             Action::Activate | Action::Input('d') => {
@@ -103,9 +123,12 @@ impl AttachmentsState {
             return;
         }
 
+        let visible_rows = inner.height as usize;
         let sel = self.selected.min(media.len().saturating_sub(1));
-        for (idx, item) in media.iter().take(inner.height as usize).enumerate() {
-            let y = inner.y + idx as u16;
+        let offset = crate::ui::nav_pane::selection_offset(sel, visible_rows, media.len());
+        for (row, item) in media.iter().skip(offset).take(visible_rows).enumerate() {
+            let idx = offset + row;
+            let y = inner.y + row as u16;
             let style = if idx == sel {
                 theme.selection()
             } else {

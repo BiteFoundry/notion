@@ -10,7 +10,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    },
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -181,7 +183,7 @@ fn draw_page_workspace(
             Paragraph::new(div_lines).style(Style::default().bg(ui.theme.bg_canvas)),
             split[1],
         );
-        draw_comments_drawer(frame, split[2], app, ui);
+        draw_comments_drawer(frame, split[2], app, ui, hitmap);
     } else {
         draw_page_canvas(frame, area, app, ui, hitmap);
     }
@@ -191,10 +193,12 @@ fn draw_page_canvas(
     frame: &mut Frame,
     area: Rect,
     app: &AppState,
-    ui: &UiState,
+    ui: &mut UiState,
     hitmap: &mut HitMap,
 ) {
-    let theme = &ui.theme;
+    hitmap.add(area, HitTarget::Pane(Focus::Canvas));
+
+    let theme = ui.theme.clone();
     frame.render_widget(
         Block::default()
             .borders(Borders::NONE)
@@ -221,7 +225,8 @@ fn draw_page_canvas(
     };
 
     let Some(detail) = app.active_page_detail.as_ref() else {
-        draw_empty_page_welcome(frame, content_area, theme);
+        ui.canvas_scroll = 0;
+        draw_empty_page_welcome(frame, content_area, &theme);
         return;
     };
 
@@ -230,6 +235,7 @@ fn draw_page_canvas(
     let canvas_focused = ui.focus == Focus::Canvas;
 
     let mut rendered_lines: Vec<(Line<'static>, Option<HitTarget>)> = Vec::new();
+    let mut inline_hits: Vec<(usize, u16, u16, HitTarget)> = Vec::new();
 
     // Generous breathing room at top
     rendered_lines.push((Line::from(""), None));
@@ -259,29 +265,49 @@ fn draw_page_canvas(
         .as_deref()
         .map(short_timestamp)
         .unwrap_or_else(|| "Synced".into());
+    let edited_prefix = format!("Edited {edited}  ·  ");
     let comment_badge = if detail.comments.is_empty() {
         "💬 0".to_string()
     } else {
         format!("💬 {}", detail.comments.len())
     };
-    rendered_lines.push((
-        Line::from(vec![
-            Span::styled(format!("Edited {edited}  ·  "), theme.muted_style()),
-            Span::styled(comment_badge, theme.accent_style()),
-            Span::styled(
-                if detail.media.is_empty() {
-                    String::new()
-                } else {
-                    format!("  ·  🖼 {} media", detail.media.len())
-                },
-                theme.muted_style(),
-            ),
-        ]),
-        None,
-    ));
+    let meta_line_idx = rendered_lines.len();
+    let comment_x = edited_prefix.width() as u16;
+    let comment_w = comment_badge.width() as u16;
+    if comment_w > 0 {
+        inline_hits.push((
+            meta_line_idx,
+            comment_x,
+            comment_w,
+            HitTarget::Button(ButtonId::ToggleComments),
+        ));
+    }
+    let mut meta_spans = vec![
+        Span::styled(edited_prefix, theme.muted_style()),
+        Span::styled(comment_badge, theme.accent_style()),
+    ];
+    if !detail.media.is_empty() {
+        let sep = "  ·  ";
+        let media_badge = format!("🖼 {} media", detail.media.len());
+        let media_x = comment_x
+            .saturating_add(comment_w)
+            .saturating_add(sep.width() as u16);
+        let media_w = media_badge.width() as u16;
+        if media_w > 0 {
+            inline_hits.push((
+                meta_line_idx,
+                media_x,
+                media_w,
+                HitTarget::Button(ButtonId::ImagePreview),
+            ));
+        }
+        meta_spans.push(Span::styled(sep, theme.muted_style()));
+        meta_spans.push(Span::styled(media_badge, theme.muted_style()));
+    }
+    rendered_lines.push((Line::from(meta_spans), None));
 
     // Properties Strip (for database rows or pages with properties)
-    push_properties_strip(detail, theme, &mut rendered_lines);
+    push_properties_strip(detail, &theme, &mut rendered_lines);
 
     // Subtle hairline divider
     let rule = "─".repeat(content_area.width.min(96) as usize);
@@ -309,17 +335,18 @@ fn draw_page_canvas(
                 is_sel,
                 content_area.width as usize,
                 ui,
-                theme,
+                &theme,
                 &mut rendered_lines,
             );
         }
     }
 
-    // Compute viewport scroll
+    // Compute and clamp viewport scroll in-place so ScrollBottom / wheel down never outruns content
     let max_scroll = rendered_lines
         .len()
         .saturating_sub(content_area.height as usize);
     let scroll = (ui.canvas_scroll as usize).min(max_scroll);
+    ui.canvas_scroll = scroll as u16;
 
     for (row_offset, (line, target)) in rendered_lines
         .iter()
@@ -327,12 +354,35 @@ fn draw_page_canvas(
         .take(content_area.height as usize)
         .enumerate()
     {
+        let line_idx = scroll + row_offset;
         let y = content_area.y + row_offset as u16;
         let row_rect = Rect::new(content_area.x, y, content_area.width, 1);
         frame.render_widget(Paragraph::new(line.clone()), row_rect);
         if let Some(hit) = *target {
             hitmap.add_line(content_area.x, y, content_area.width, hit);
         }
+        for &(hl_idx, rel_x, w, hit) in &inline_hits {
+            if hl_idx == line_idx && rel_x < content_area.width {
+                let clamped_w = w.min(content_area.width.saturating_sub(rel_x));
+                if clamped_w > 0 {
+                    hitmap.add_line(content_area.x.saturating_add(rel_x), y, clamped_w, hit);
+                }
+            }
+        }
+    }
+
+    if rendered_lines.len() > content_area.height as usize && area.width >= 4 {
+        let mut sb_state = ScrollbarState::new(max_scroll.saturating_add(1))
+            .position(scroll)
+            .viewport_content_length(content_area.height as usize);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("┃")
+            .track_style(Style::default().fg(theme.divider).bg(theme.bg_canvas))
+            .thumb_style(Style::default().fg(theme.fg_muted).bg(theme.bg_canvas));
+        frame.render_stateful_widget(scrollbar, area, &mut sb_state);
     }
 }
 
@@ -826,7 +876,7 @@ fn render_block_lines(
                     ),
                 ])
                 .style(sel_bg),
-                Some(HitTarget::CanvasBlock(idx)),
+                Some(HitTarget::ChildCard(idx)),
             ));
         }
         NotionBlockKind::LinkPreview { url } => {
@@ -837,7 +887,7 @@ fn render_block_lines(
                     Span::styled(format!(" 🔗 {url}"), Style::default().fg(theme.accent_soft)),
                 ])
                 .style(sel_bg),
-                Some(HitTarget::CanvasBlock(idx)),
+                Some(HitTarget::ChildCard(idx)),
             ));
         }
         NotionBlockKind::File { url, name, .. } => {
@@ -1039,8 +1089,16 @@ fn style_rich_text(
     out
 }
 
-fn draw_comments_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState) {
-    let theme = &ui.theme;
+fn draw_comments_drawer(
+    frame: &mut Frame,
+    area: Rect,
+    app: &AppState,
+    ui: &mut UiState,
+    hitmap: &mut HitMap,
+) {
+    hitmap.add(area, HitTarget::Pane(Focus::Comments));
+
+    let theme = ui.theme.clone();
     let focused = ui.focus == Focus::Comments;
     frame.render_widget(
         Block::default()
@@ -1062,17 +1120,29 @@ fn draw_comments_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiSt
         ])
         .split(area);
 
+    let title_label = " 💬 Comments ";
+    let close_label = "(C to close)";
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " 💬 Comments ",
+                title_label,
                 theme.title(focused).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("(C to close)", theme.muted_style()),
+            Span::styled(close_label, theme.muted_style()),
         ]))
         .style(Style::default().bg(theme.bg_sidebar)),
         chunks[0],
     );
+    let close_x = chunks[0].x.saturating_add(title_label.width() as u16);
+    let close_w = (close_label.width() as u16).min(chunks[0].right().saturating_sub(close_x));
+    if close_w > 0 {
+        hitmap.add_line(
+            close_x,
+            chunks[0].y,
+            close_w,
+            HitTarget::Button(ButtonId::ToggleComments),
+        );
+    }
 
     let comments = app
         .active_page_detail
@@ -1081,6 +1151,7 @@ fn draw_comments_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiSt
         .unwrap_or(&[]);
 
     if comments.is_empty() {
+        ui.comments_scroll = 0;
         frame.render_widget(
             Paragraph::new(Span::styled(
                 " No comments yet.\n Type below and press Enter.",
@@ -1108,6 +1179,20 @@ fn draw_comments_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiSt
             )));
             lines.push(Line::from(""));
         }
+        let wrap_w = chunks[1].width.max(1) as usize;
+        let visual_lines: usize = lines
+            .iter()
+            .map(|l| {
+                let w = l.width();
+                if w == 0 {
+                    1
+                } else {
+                    w.div_ceil(wrap_w)
+                }
+            })
+            .sum();
+        let max_scroll = visual_lines.saturating_sub(chunks[1].height as usize);
+        ui.comments_scroll = (ui.comments_scroll as usize).min(max_scroll) as u16;
         frame.render_widget(
             Paragraph::new(lines)
                 .scroll((ui.comments_scroll, 0))
@@ -1145,6 +1230,8 @@ fn draw_database_view(
     ui: &UiState,
     hitmap: &mut HitMap,
 ) {
+    hitmap.add(area, HitTarget::Pane(Focus::Canvas));
+
     let theme = &ui.theme;
     frame.render_widget(
         Block::default()
