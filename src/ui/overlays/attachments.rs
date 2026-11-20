@@ -1,5 +1,6 @@
 //! Media & Files Tray Overlay (`A`) for embedded images, files, and PDFs on the active Notion page.
 
+use bitefoundry_html::{is_safe_raster_image, sniff_content_kind, ContentKind};
 use ratatui::{
     layout::Rect,
     style::Style,
@@ -8,12 +9,30 @@ use ratatui::{
     Frame,
 };
 
-use crate::ui::{
-    action::Action,
-    app::{AppState, UiState},
-    hitmap::{HitMap, HitTarget},
-    overlays::{centered_rect, scroll_selection_clamped, OverlayOutcome},
+use crate::{
+    models::NotionMediaRef,
+    ui::{
+        action::Action,
+        app::{AppState, UiState},
+        hitmap::{HitMap, HitTarget},
+        overlays::{centered_rect, scroll_selection_clamped, OverlayOutcome},
+    },
 };
+
+pub fn is_html_media(item: &NotionMediaRef) -> bool {
+    let lower_mime = item.mime_type.to_ascii_lowercase();
+    if lower_mime.contains("html") {
+        return true;
+    }
+    sniff_content_kind(Some(&item.mime_type), Some(&item.display_name), None) == ContentKind::Html
+        || sniff_content_kind(None, Some(&item.url), None) == ContentKind::Html
+}
+
+pub fn is_raster_image_media(item: &NotionMediaRef) -> bool {
+    item.is_image
+        && !is_html_media(item)
+        && is_safe_raster_image(Some(&item.mime_type), Some(&item.display_name), None)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct AttachmentsState {
@@ -77,7 +96,29 @@ impl AttachmentsState {
                     OverlayOutcome::Close
                 }
             }
-            Action::Input('v') => OverlayOutcome::CloseAndDispatch(Action::OpenImagePreview),
+            Action::Input('v') => {
+                if let Some(detail) = app.active_page_detail.as_ref() {
+                    if let Some(item) = detail.media.get(self.selected.min(len.saturating_sub(1))) {
+                        if is_html_media(item) {
+                            return OverlayOutcome::CloseAndDispatch(Action::FetchHtmlPreview {
+                                title: item.display_name.clone(),
+                                url: item.url.clone(),
+                                block_id: (!item.block_id.trim().is_empty())
+                                    .then_some(item.block_id.clone()),
+                                page_id: Some(detail.page.id.clone()),
+                            });
+                        }
+                        if is_raster_image_media(item) {
+                            return OverlayOutcome::CloseAndDispatch(Action::OpenImagePreview);
+                        }
+                        return OverlayOutcome::Dispatch(Action::ShowToast(format!(
+                            "Preview unavailable for {} ({}) — press Enter/d to download",
+                            item.display_name, item.mime_type
+                        )));
+                    }
+                }
+                OverlayOutcome::Handled
+            }
             _ => OverlayOutcome::Handled,
         }
     }
@@ -134,7 +175,13 @@ impl AttachmentsState {
             } else {
                 Style::default().bg(theme.bg_elevated).fg(theme.fg_primary)
             };
-            let icon = if item.is_image { "🖼" } else { "📎" };
+            let icon = if is_html_media(item) {
+                "🌐"
+            } else if is_raster_image_media(item) {
+                "🖼"
+            } else {
+                "📎"
+            };
             let label = format!(" {icon} {}  ({})", item.display_name, item.mime_type);
             frame.render_widget(
                 Paragraph::new(Span::styled(

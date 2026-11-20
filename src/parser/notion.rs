@@ -7,15 +7,13 @@
 use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
+use bitefoundry_html::{is_safe_raster_image, sniff_content_kind, ContentKind};
 use serde_json::{json, Value};
 
-use crate::{
-    img_preview::is_image_mime_or_name,
-    models::{
-        spans_plain_text, NotionBlock, NotionBlockKind, NotionColor, NotionComment, NotionDatabase,
-        NotionMediaRef, NotionPage, NotionPropertySchema, NotionPropertyValue, RichTextAnnotations,
-        RichTextKind, RichTextSpan, SelectOption,
-    },
+use crate::models::{
+    spans_plain_text, NotionBlock, NotionBlockKind, NotionColor, NotionComment, NotionDatabase,
+    NotionMediaRef, NotionPage, NotionPropertySchema, NotionPropertyValue, RichTextAnnotations,
+    RichTextKind, RichTextSpan, SelectOption,
 };
 
 /// Parses a Notion `rich_text` JSON array into typed `RichTextSpan` entries.
@@ -741,6 +739,23 @@ pub fn parse_notion_block(
                 .to_string(),
         },
         "table_of_contents" => NotionBlockKind::TableOfContents { color },
+        "button" => {
+            let mut rich_text = parse_rich_text_array(
+                inner.and_then(|i| i.get("rich_text").or_else(|| i.get("text"))),
+            );
+            if spans_plain_text(&rich_text).trim().is_empty() {
+                if let Some(label) = inner
+                    .and_then(|i| i.get("text").or_else(|| i.get("label")))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    rich_text = vec![RichTextSpan::plain(label)];
+                } else {
+                    rich_text = vec![RichTextSpan::plain("Button")];
+                }
+            }
+            NotionBlockKind::Button { rich_text }
+        }
         other => NotionBlockKind::Unsupported {
             raw_type: other.to_string(),
         },
@@ -821,13 +836,22 @@ fn collect_media_refs_rec(blocks: &[NotionBlock], out: &mut Vec<NotionMediaRef>)
                 } else {
                     file_name_from_url(url).unwrap_or_else(|| format!("image-{}.png", out.len() + 1))
                 };
-                let mime_type = guess_mime_from_url(url, true);
+                let url_kind = sniff_content_kind(None, Some(url), None);
+                let (mime_type, is_image) = match url_kind {
+                    ContentKind::Html => ("text/html".to_string(), false),
+                    ContentKind::Svg => ("image/svg+xml".to_string(), false),
+                    _ => {
+                        let mime = guess_mime_from_url(url, true);
+                        let safe = is_safe_raster_image(Some(&mime), Some(&display_name), None);
+                        (mime, safe)
+                    }
+                };
                 out.push(NotionMediaRef {
                     block_id: blk.id.clone(),
                     url: url.clone(),
                     display_name,
                     mime_type,
-                    is_image: true,
+                    is_image,
                 });
             }
             NotionBlockKind::File { url, name, caption } if !url.trim().is_empty() => {
@@ -838,8 +862,8 @@ fn collect_media_refs_rec(blocks: &[NotionBlock], out: &mut Vec<NotionMediaRef>)
                     .or_else(|| (!cap.trim().is_empty()).then_some(cap))
                     .or_else(|| file_name_from_url(url))
                     .unwrap_or_else(|| format!("file-{}", out.len() + 1));
-                let mime_type = guess_mime_from_url(url, false);
-                let is_img = is_image_mime_or_name(&mime_type, Some(&display_name));
+                let mime_type = guess_mime_from_url_and_name(url, Some(&display_name), false);
+                let is_img = is_safe_raster_image(Some(&mime_type), Some(&display_name), None);
                 out.push(NotionMediaRef {
                     block_id: blk.id.clone(),
                     url: url.clone(),
@@ -911,26 +935,56 @@ fn file_name_from_url(url: &str) -> Option<String> {
     }
 }
 
-fn guess_mime_from_url(url: &str, default_image: bool) -> String {
-    let lower = url
-        .split('?')
-        .next()
-        .unwrap_or(url)
-        .to_ascii_lowercase();
-    if lower.ends_with(".png") {
-        "image/png".to_string()
-    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        "image/jpeg".to_string()
-    } else if lower.ends_with(".gif") {
-        "image/gif".to_string()
-    } else if lower.ends_with(".webp") {
-        "image/webp".to_string()
-    } else if lower.ends_with(".pdf") {
-        "application/pdf".to_string()
-    } else if default_image {
+fn guess_mime_from_url_and_name(url: &str, name_hint: Option<&str>, default_image: bool) -> String {
+    let url_mime = guess_mime_from_url(url, false);
+    if url_mime != "application/octet-stream" {
+        return url_mime;
+    }
+    if let Some(name) = name_hint {
+        let name_mime = guess_mime_from_url(name, false);
+        if name_mime != "application/octet-stream" {
+            return name_mime;
+        }
+    }
+    if default_image {
         "image/png".to_string()
     } else {
         "application/octet-stream".to_string()
+    }
+}
+
+fn guess_mime_from_url(url: &str, default_image: bool) -> String {
+    let lower = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    match sniff_content_kind(None, Some(&lower), None) {
+        ContentKind::Html => "text/html".to_string(),
+        ContentKind::Svg => "image/svg+xml".to_string(),
+        ContentKind::Pdf => "application/pdf".to_string(),
+        ContentKind::Markdown => "text/markdown".to_string(),
+        ContentKind::PlainText => "text/plain".to_string(),
+        ContentKind::RasterImage => {
+            if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+                "image/jpeg".to_string()
+            } else if lower.ends_with(".gif") {
+                "image/gif".to_string()
+            } else if lower.ends_with(".webp") {
+                "image/webp".to_string()
+            } else if lower.ends_with(".bmp") {
+                "image/bmp".to_string()
+            } else {
+                "image/png".to_string()
+            }
+        }
+        ContentKind::Binary => {
+            if default_image {
+                "image/png".to_string()
+            } else {
+                "application/octet-stream".to_string()
+            }
+        }
     }
 }
 
@@ -1161,6 +1215,16 @@ fn render_blocks_md(blocks: &[NotionBlock], depth: usize, out: &mut Vec<String>)
             }
             NotionBlockKind::TableOfContents { .. } => {
                 out.push(format!("{indent}[Table of Contents]"));
+                out.push(String::new());
+            }
+            NotionBlockKind::Button { rich_text } => {
+                let label = spans_plain_text(rich_text);
+                let label = if label.trim().is_empty() {
+                    "Button"
+                } else {
+                    label.trim()
+                };
+                out.push(format!("{indent}[⚡ {label}]"));
                 out.push(String::new());
             }
             NotionBlockKind::Unsupported { raw_type } => {

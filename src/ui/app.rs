@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use bitefoundry_html::NativeHtmlServer;
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
@@ -125,6 +126,13 @@ pub enum UiMsg {
         rendered: Box<RenderedTerminalImage>,
     },
     ImagePreviewFailed(String),
+    HtmlPreviewLoaded {
+        title: String,
+        html: String,
+    },
+    HtmlServed {
+        url: String,
+    },
     TaskDone {
         label: String,
         toast: String,
@@ -280,6 +288,7 @@ pub struct AppState {
     pub sync_summary: String,
     pub image_cache: HashMap<String, RenderedTerminalImage>,
     image_cache_bytes: usize,
+    pub html_server: NativeHtmlServer,
 }
 
 impl AppState {
@@ -321,6 +330,7 @@ impl AppState {
             sync_summary: "Ready".to_string(),
             image_cache: HashMap::new(),
             image_cache_bytes: 0,
+            html_server: NativeHtmlServer::new(),
         }
     }
 
@@ -621,6 +631,26 @@ impl AppState {
             UiMsg::ImagePreviewFailed(err) => {
                 if let Some(Overlay::ImagePreview(ref mut ov)) = ui.overlays.last_mut() {
                     ov.error = Some(err);
+                }
+            }
+            UiMsg::HtmlPreviewLoaded { title, html } => {
+                ui.tasks.finish("html", None);
+                if matches!(
+                    ui.overlays.last(),
+                    Some(Overlay::ImagePreview(_) | Overlay::HtmlPreview(_))
+                ) {
+                    ui.overlays.pop();
+                    ui.active_pixel_graphic = None;
+                    ui.pending_pixel_graphic = None;
+                }
+                ui.overlays.push(Overlay::html_preview(title, html));
+                ui.info("Opened interactive HTML viewer");
+            }
+            UiMsg::HtmlServed { url } => {
+                ui.tasks.finish("html-serve", None);
+                match open::that(&url) {
+                    Ok(()) => ui.success(format!("Served HTML at {url}")),
+                    Err(err) => ui.warning(format!("Served HTML at {url} (browser failed: {err})")),
                 }
             }
             UiMsg::TaskDone { label, toast } => {

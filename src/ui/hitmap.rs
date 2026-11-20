@@ -33,6 +33,8 @@ pub enum ButtonId {
     NarrowCanvas,
     ConfirmOk,
     ConfirmCancel,
+    HtmlToggleMode,
+    HtmlServeBrowser,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +48,8 @@ pub enum HitTarget {
     ToggleBlock(usize),
     ChildCard(usize),
     MediaChip(usize),
+    NotionButton(usize),
+    CodeHtmlPreview(usize),
     DbViewTab(DatabaseViewMode),
     DbRow(usize),
     DbBoardCard { col: usize, row: usize },

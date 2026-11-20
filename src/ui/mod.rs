@@ -233,6 +233,7 @@ fn draw_status_bar(
     }
 
     let right_pills = [
+        (" Ctrl+K Cmd ", ButtonId::CommandPalette),
         (" Ctrl+S WS ", ButtonId::WorkspaceSwitcher),
         (" Ctrl+, ", ButtonId::Settings),
     ];

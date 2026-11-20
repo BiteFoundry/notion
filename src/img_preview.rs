@@ -9,8 +9,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64_STANDARD, Engine as _};
+pub use bitefoundry_html::{is_safe_raster_image, looks_like_html_bytes, looks_like_svg_bytes};
+use bitefoundry_html::{sniff_content_kind, ContentKind};
 use image::{imageops::FilterType, DynamicImage, ImageFormat, Rgba};
 use ratatui::{
+    layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
 };
@@ -263,9 +266,63 @@ impl RenderedTerminalImage {
     }
 }
 
+/// Tracks an active terminal pixel graphic placement (Kitty / iTerm2 / Sixel) painted onto the screen
+/// so frame transitions can deterministically erase stale pixels before Ratatui redraws.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivePixelGraphic {
+    pub cache_key: String,
+    pub rect: Rect,
+    pub protocol: TerminalImageProtocol,
+    pub cols: u16,
+    pub rows: u16,
+    pub payload_len: usize,
+}
+
 /// Returns the Kitty graphics delete sequence for the fixed TUI preview placement (`q=2` suppresses terminal responses).
 pub fn kitty_delete_preview_sequence() -> &'static str {
     "\x1b_Ga=d,d=i,i=4242,q=2\x1b\\"
+}
+
+/// Deletes all visible Kitty graphics placements and frees unused image data (`d=A`, `q=2` quiet).
+pub fn kitty_delete_all_sequence() -> &'static str {
+    "\x1b_Ga=d,d=A,q=2\x1b\\"
+}
+
+/// Builds an ANSI sequence (`\x1b[0m` + row cursor moves + space runs) that overwrites `rect`
+/// (expanded by +2 cols / +2 rows and clamped to `term_cols x term_rows`) so Sixel and iTerm2
+/// cell-bound pixel tiles are deterministically erased before Ratatui redraws.
+pub fn erase_pixel_rect_sequence(
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    term_cols: u16,
+    term_rows: u16,
+) -> String {
+    if width == 0 || height == 0 || x >= term_cols || y >= term_rows {
+        return String::new();
+    }
+    let x_end = x.saturating_add(width).saturating_add(2).min(term_cols);
+    let y_end = y.saturating_add(height).saturating_add(2).min(term_rows);
+    if x >= x_end || y >= y_end {
+        return String::new();
+    }
+    let span_w = (x_end - x) as usize;
+    let rows = (y_end - y) as usize;
+    let spaces = " ".repeat(span_w);
+    let mut out = String::with_capacity(4 + rows * (12 + span_w));
+    out.push_str("\x1b[0m");
+    for row in y..y_end {
+        let _ = write!(out, "\x1b[{};{}H{spaces}", row + 1, x + 1);
+    }
+    out
+}
+
+/// Floors the maximum vertical pixel budget for Sixel encoding to a multiple of 6
+/// (`<= rows * cell_px_h`) so the final 6-pixel band never overhangs into the row below `rect`.
+pub fn compute_sixel_safe_pixel_height(rows: u16, cell_px_h: u16) -> u32 {
+    let budget = (rows as u32).saturating_mul(cell_px_h as u32);
+    (budget / 6) * 6
 }
 
 /// Resolves terminal graphics protocol and cell pixel dimensions without writing queries to stdin/stdout.
@@ -936,27 +993,30 @@ fn parse_cell_pixel_size(raw: &str) -> Option<(u16, u16)> {
     Some((w.clamp(4, 64), h.clamp(8, 128)))
 }
 
-/// Returns true if a MIME type or filename looks like a supported raster image (`png`, `jpeg`, `jpg`, `gif`, `webp`).
+/// Returns true if a MIME type or filename looks like a supported raster image (`png`, `jpeg`, `jpg`, `gif`, `webp`, `bmp`).
+/// Strictly rejects HTML (`text/html`, `.html`/`.htm`) and SVG (`image/svg+xml`, `.svg`).
 pub fn is_image_mime_or_name(content_type: &str, file_name: Option<&str>) -> bool {
-    let ct = content_type.trim().to_ascii_lowercase();
-    if matches!(
-        ct.as_str(),
-        "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp" | "hostedcontent"
-    ) {
-        return true;
+    let ct = content_type.trim();
+    if ct.eq_ignore_ascii_case("hostedcontent") {
+        return !file_name.is_some_and(|n| {
+            matches!(
+                sniff_content_kind(None, Some(n), None),
+                ContentKind::Html | ContentKind::Svg
+            )
+        });
     }
-    if let Some(name) = file_name {
-        let lower = name.trim().to_ascii_lowercase();
-        if lower.ends_with(".png")
-            || lower.ends_with(".jpg")
-            || lower.ends_with(".jpeg")
-            || lower.ends_with(".gif")
-            || lower.ends_with(".webp")
-        {
-            return true;
-        }
+    let mime_opt = (!ct.is_empty()).then_some(ct);
+    is_safe_raster_image(mime_opt, file_name, None)
+}
+
+fn ensure_raster_bytes(bytes: &[u8]) -> Result<()> {
+    if looks_like_html_bytes(bytes) {
+        bail!("Content is HTML, not a raster image");
     }
-    false
+    if looks_like_svg_bytes(bytes) {
+        bail!("SVG vector images cannot be decoded as raster");
+    }
+    Ok(())
 }
 
 /// Decodes an image buffer and renders aspect-ratio-preserving Truecolor Unicode Half-Blocks (`▀`) for `ratatui`.
@@ -966,6 +1026,7 @@ pub fn decode_and_render_halfblocks(
     max_rows: u16,
     bg_rgb: (u8, u8, u8),
 ) -> Result<RenderedTerminalImage> {
+    ensure_raster_bytes(bytes)?;
     let guessed = image::guess_format(bytes).ok();
     let format_label = format_label_for(guessed);
     let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
@@ -1039,6 +1100,7 @@ pub fn decode_and_render_for_protocol(
     bg_rgb: (u8, u8, u8),
     caps: TerminalGraphicsCaps,
 ) -> Result<RenderedTerminalImage> {
+    ensure_raster_bytes(bytes)?;
     if caps.protocol == TerminalImageProtocol::Halfblock {
         return decode_and_render_halfblocks(bytes, max_cols, max_rows, bg_rgb);
     }
@@ -2455,5 +2517,40 @@ mod tests {
             assert!(decoded_img.width() <= 40 * 8);
             assert!(decoded_img.height() <= 15 * 16);
         }
+    }
+
+    #[test]
+    fn test_erase_pixel_rect_sequence_sixel_safe_height_and_html_svg_guards() {
+        let seq = erase_pixel_rect_sequence(4, 2, 5, 3, 80, 24);
+        assert!(seq.starts_with("\x1b[0m"));
+        assert!(seq.contains("\x1b[3;5H       ")); // row 2+1=3, col 4+1=5, width 5+2=7
+        assert!(seq.contains("\x1b[7;5H       ")); // last row 2+3+2-1=6 -> 1-based 7
+
+        let clamped = erase_pixel_rect_sequence(78, 22, 5, 5, 80, 24);
+        assert!(clamped.contains("\x1b[23;79H  "));
+        assert!(clamped.contains("\x1b[24;79H  "));
+        assert!(!clamped.contains("\x1b[25;"));
+
+        assert_eq!(erase_pixel_rect_sequence(0, 0, 0, 5, 80, 24), "");
+        assert_eq!(erase_pixel_rect_sequence(0, 0, 5, 0, 80, 24), "");
+        assert_eq!(erase_pixel_rect_sequence(80, 5, 4, 4, 80, 24), "");
+        assert_eq!(erase_pixel_rect_sequence(5, 24, 4, 4, 80, 24), "");
+
+        assert_eq!(compute_sixel_safe_pixel_height(10, 16), 156); // 160 floored to multiple of 6
+        assert_eq!(compute_sixel_safe_pixel_height(3, 18), 54);
+
+        // HTML & SVG are strictly rejected as raster images
+        assert!(!is_image_mime_or_name("text/html", Some("report.html")));
+        assert!(!is_image_mime_or_name("text/html", Some("fake.png")));
+        assert!(!is_image_mime_or_name("image/svg+xml", Some("logo.svg")));
+        assert!(!is_image_mime_or_name("", Some("index.htm")));
+        assert!(is_image_mime_or_name("image/png", Some("photo.png")));
+
+        let html_bytes = b"<!DOCTYPE html><html><body>Not an image</body></html>";
+        let svg_bytes = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"4\"/></svg>";
+        assert!(looks_like_html_bytes(html_bytes));
+        assert!(looks_like_svg_bytes(svg_bytes));
+        assert!(decode_and_render_halfblocks(html_bytes, 40, 20, (0, 0, 0)).is_err());
+        assert!(decode_and_render_halfblocks(svg_bytes, 40, 20, (0, 0, 0)).is_err());
     }
 }

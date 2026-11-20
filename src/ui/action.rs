@@ -2,11 +2,12 @@
 
 use std::path::PathBuf;
 
+use bitefoundry_html::{sniff_content_kind, ContentKind};
 use serde_json::json;
 
 use crate::{
     config::{ImageProtocolPreference, ThemePreset},
-    models::{DatabaseViewMode, NotionBlockKind, NotionPage},
+    models::{spans_plain_text, DatabaseViewMode, NotionBlockKind, NotionPage},
     notion::media,
     parser::parse_slash_command_blocks,
     sync::SyncCommand,
@@ -61,6 +62,18 @@ pub enum Action {
     OpenContextMenu { col: u16, row: u16 },
     OpenLinkExtractor,
     OpenImagePreview,
+    OpenHtmlPreview {
+        title: String,
+        html: String,
+    },
+    FetchHtmlPreview {
+        title: String,
+        url: String,
+        block_id: Option<String>,
+        page_id: Option<String>,
+    },
+    ServeActiveHtml,
+    ShowToast(String),
     OpenQuickAppend,
     OpenNewPageModal,
     OpenDbFilter,
@@ -115,6 +128,7 @@ pub enum Action {
 /// Dispatches an `Action` against `(AppState, UiState)`. Returns `true` if TUI should exit.
 pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     if matches!(action, Action::Quit) {
+        app.html_server.shutdown();
         app.sync_ctrl.request(SyncCommand::Shutdown);
         return true;
     }
@@ -141,6 +155,10 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::LoadPreviewImage
             | Action::CycleImageProtocol
             | Action::DownloadMedia(_)
+            | Action::OpenHtmlPreview { .. }
+            | Action::FetchHtmlPreview { .. }
+            | Action::ServeActiveHtml
+            | Action::ShowToast(_)
             | Action::OpenUrl(_)
             | Action::CopyUrlToClipboard(_)
             | Action::SetTheme(_)
@@ -401,7 +419,27 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         let id = vblk.block.id.clone();
                         app.open_database(&id, ui, true);
                     }
-                    NotionBlockKind::Image { .. } => {
+                    NotionBlockKind::Image { url, .. } => {
+                        if sniff_content_kind(None, Some(url), None) == ContentKind::Html {
+                            let title = url
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or("HTML Preview")
+                                .to_string();
+                            let u = url.clone();
+                            let bid = vblk.block.id.clone();
+                            let pid = app.active_page_id.clone();
+                            return dispatch(
+                                Action::FetchHtmlPreview {
+                                    title,
+                                    url: u,
+                                    block_id: (!bid.is_empty()).then_some(bid),
+                                    page_id: pid,
+                                },
+                                app,
+                                ui,
+                            );
+                        }
                         return dispatch(Action::OpenImagePreview, app, ui);
                     }
                     NotionBlockKind::Video { url, .. }
@@ -412,7 +450,37 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         let u = url.clone();
                         return dispatch(Action::OpenUrl(u), app, ui);
                     }
-                    NotionBlockKind::File { url, .. } | NotionBlockKind::Pdf { url, .. } => {
+                    NotionBlockKind::File { url, name, .. } => {
+                        let bid = vblk.block.id.clone();
+                        let u = url.clone();
+                        if is_html_file_ref(&u, name.as_deref()) {
+                            let title = name
+                                .clone()
+                                .filter(|s| !s.trim().is_empty())
+                                .unwrap_or_else(|| "HTML File".to_string());
+                            let pid = app.active_page_id.clone();
+                            return dispatch(
+                                Action::FetchHtmlPreview {
+                                    title,
+                                    url: u,
+                                    block_id: (!bid.is_empty()).then_some(bid),
+                                    page_id: pid,
+                                },
+                                app,
+                                ui,
+                            );
+                        }
+                        let media_idx = app
+                            .active_page_detail
+                            .as_ref()
+                            .and_then(|d| find_media_index_for_block(d, &bid, &u));
+                        if let Some(midx) = media_idx {
+                            return dispatch(Action::DownloadMedia(midx), app, ui);
+                        } else if !u.trim().is_empty() {
+                            return dispatch(Action::OpenUrl(u), app, ui);
+                        }
+                    }
+                    NotionBlockKind::Pdf { url, .. } => {
                         let bid = vblk.block.id.clone();
                         let u = url.clone();
                         let media_idx = app
@@ -423,6 +491,34 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                             return dispatch(Action::DownloadMedia(midx), app, ui);
                         } else if !u.trim().is_empty() {
                             return dispatch(Action::OpenUrl(u), app, ui);
+                        }
+                    }
+                    NotionBlockKind::Button { rich_text } => {
+                        let raw_label = spans_plain_text(rich_text);
+                        let label = if raw_label.trim().is_empty() {
+                            "Button".to_string()
+                        } else {
+                            raw_label.trim().to_string()
+                        };
+                        let page_url = app
+                            .active_page_detail
+                            .as_ref()
+                            .map(|d| d.page.url.trim().to_string())
+                            .filter(|u| !u.is_empty());
+                        if let Some(url) = page_url {
+                            ui.info(format!(
+                                "⚡ '{label}': Notion REST API does not expose button triggers — open in Notion Web?"
+                            ));
+                            ui.overlays.push(Overlay::confirm(
+                                format!(
+                                    "⚡ Button '{label}' runs Notion automations.\nNotion's public REST API does not expose button triggers.\nOpen this page in Notion Web?"
+                                ),
+                                Some(Action::OpenUrl(url)),
+                            ));
+                        } else {
+                            ui.info(format!(
+                                "⚡ '{label}': Notion public REST API does not expose button automation triggers"
+                            ));
                         }
                     }
                     _ => {}
@@ -584,6 +680,64 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::OpenImagePreview => {
             if let Some(detail) = app.active_page_detail.as_ref() {
                 let visible = app.visible_blocks(ui);
+                if let Some(vblk) = visible.get(ui.selected_block) {
+                    match &vblk.block.kind {
+                        NotionBlockKind::Code {
+                            rich_text,
+                            language,
+                            ..
+                        } if is_html_code_language(language) => {
+                            let html = spans_plain_text(rich_text);
+                            let title = format!("{} ({language})", detail.page.display_title());
+                            return dispatch(Action::OpenHtmlPreview { title, html }, app, ui);
+                        }
+                        NotionBlockKind::File { url, name, .. }
+                            if is_html_file_ref(url, name.as_deref()) =>
+                        {
+                            let title = name
+                                .clone()
+                                .filter(|s| !s.trim().is_empty())
+                                .unwrap_or_else(|| "HTML File".to_string());
+                            let u = url.clone();
+                            let bid = vblk.block.id.clone();
+                            let pid = Some(detail.page.id.clone());
+                            return dispatch(
+                                Action::FetchHtmlPreview {
+                                    title,
+                                    url: u,
+                                    block_id: (!bid.is_empty()).then_some(bid),
+                                    page_id: pid,
+                                },
+                                app,
+                                ui,
+                            );
+                        }
+                        NotionBlockKind::Image { url, caption, .. }
+                            if sniff_content_kind(None, Some(url), None) == ContentKind::Html =>
+                        {
+                            let cap = spans_plain_text(caption);
+                            let title = if cap.trim().is_empty() {
+                                "HTML Preview".to_string()
+                            } else {
+                                cap
+                            };
+                            let u = url.clone();
+                            let bid = vblk.block.id.clone();
+                            let pid = Some(detail.page.id.clone());
+                            return dispatch(
+                                Action::FetchHtmlPreview {
+                                    title,
+                                    url: u,
+                                    block_id: (!bid.is_empty()).then_some(bid),
+                                    page_id: pid,
+                                },
+                                app,
+                                ui,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
                 let preferred_media_idx = visible.get(ui.selected_block).and_then(|vblk| {
                     if let NotionBlockKind::Image { url, .. } = &vblk.block.kind {
                         find_media_index_for_block(detail, &vblk.block.id, url)
@@ -601,6 +755,95 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             } else {
                 ui.info("Open a Notion page with images first");
             }
+        }
+        Action::OpenHtmlPreview { title, html } => {
+            if matches!(
+                ui.overlays.last(),
+                Some(Overlay::ImagePreview(_) | Overlay::HtmlPreview(_))
+            ) {
+                ui.overlays.pop();
+                ui.active_pixel_graphic = None;
+                ui.pending_pixel_graphic = None;
+            }
+            ui.overlays.push(Overlay::html_preview(title, html));
+        }
+        Action::FetchHtmlPreview {
+            title,
+            url,
+            block_id,
+            page_id,
+        } => {
+            if url.trim().is_empty() {
+                ui.warning("HTML file URL is empty");
+                return false;
+            }
+            let client = app.client.clone();
+            let http = client.http_client().clone();
+            let ui_tx = app.ui_tx.clone();
+            let pid = page_id.unwrap_or_default();
+            ui.tasks.begin("html");
+            tokio::spawn(async move {
+                let fetched = match media::fetch_media_bytes_cached(&http, &url).await {
+                    Ok(ok) => Ok(ok),
+                    Err(first_err) => {
+                        if let Some(bid) = block_id.filter(|s| !s.trim().is_empty()) {
+                            if let Ok(blk) = client.get_block(&bid, &pid).await {
+                                let fresh = match blk.kind {
+                                    NotionBlockKind::File { url: u, .. }
+                                    | NotionBlockKind::Image { url: u, .. } => u,
+                                    _ => String::new(),
+                                };
+                                if !fresh.trim().is_empty() && fresh != url {
+                                    media::fetch_media_bytes_cached(&http, &fresh).await
+                                } else {
+                                    Err(first_err)
+                                }
+                            } else {
+                                Err(first_err)
+                            }
+                        } else {
+                            Err(first_err)
+                        }
+                    }
+                };
+                match fetched {
+                    Ok((bytes, _)) => {
+                        let html = String::from_utf8_lossy(&bytes).into_owned();
+                        let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded { title, html });
+                    }
+                    Err(err) => {
+                        let _ = ui_tx.send(UiMsg::TaskFailed {
+                            label: "html".into(),
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            });
+        }
+        Action::ServeActiveHtml => {
+            if let Some(Overlay::HtmlPreview(ov)) = ui.overlays.last() {
+                let title = ov.title.clone();
+                let raw_html = ov.session.raw_html().to_string();
+                let server = app.html_server.clone();
+                let ui_tx = app.ui_tx.clone();
+                ui.tasks.begin("html-serve");
+                tokio::spawn(async move {
+                    match server.serve_html(&title, &raw_html).await {
+                        Ok(url) => {
+                            let _ = ui_tx.send(UiMsg::HtmlServed { url });
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiMsg::TaskFailed {
+                                label: "html-serve".into(),
+                                error: err.to_string(),
+                            });
+                        }
+                    }
+                });
+            }
+        }
+        Action::ShowToast(msg) => {
+            ui.info(msg);
         }
         Action::OpenQuickAppend => {
             if app.active_page_id.is_none() {
@@ -997,34 +1240,60 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                                 Err(err) => Err(err),
                             };
 
+                            let display_name = target.display_name.clone();
                             match fetched {
-                                Ok((bytes, _)) => {
-                                    let rendered = tokio::task::spawn_blocking(move || {
-                                        crate::img_preview::decode_and_render_for_protocol(
-                                            &bytes,
-                                            cols,
-                                            rows,
-                                            (25, 25, 25),
-                                            caps,
-                                        )
-                                    })
-                                    .await;
-                                    match rendered {
-                                        Ok(Ok(img)) => {
-                                            let _ = ui_tx.send(UiMsg::ImageRendered {
-                                                cache_key,
-                                                rendered: Box::new(img),
+                                Ok((bytes, mime)) => {
+                                    match sniff_content_kind(
+                                        Some(&mime),
+                                        Some(&display_name),
+                                        Some(&bytes),
+                                    ) {
+                                        ContentKind::Html => {
+                                            let html = String::from_utf8_lossy(&bytes).into_owned();
+                                            let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded {
+                                                title: display_name,
+                                                html,
                                             });
                                         }
-                                        Ok(Err(err)) => {
-                                            let _ = ui_tx.send(UiMsg::ImagePreviewFailed(format!(
-                                                "{err} (press 'o' to open in browser)"
-                                            )));
+                                        ContentKind::Svg => {
+                                            let _ = ui_tx.send(UiMsg::ImagePreviewFailed(
+                                                "SVG vector graphic (press 'o' to open in browser)"
+                                                    .into(),
+                                            ));
                                         }
-                                        Err(join_err) => {
-                                            let _ = ui_tx.send(UiMsg::ImagePreviewFailed(format!(
-                                                "Image decode task failed: {join_err}"
-                                            )));
+                                        _ => {
+                                            let rendered = tokio::task::spawn_blocking(move || {
+                                                crate::img_preview::decode_and_render_for_protocol(
+                                                    &bytes,
+                                                    cols,
+                                                    rows,
+                                                    (25, 25, 25),
+                                                    caps,
+                                                )
+                                            })
+                                            .await;
+                                            match rendered {
+                                                Ok(Ok(img)) => {
+                                                    let _ = ui_tx.send(UiMsg::ImageRendered {
+                                                        cache_key,
+                                                        rendered: Box::new(img),
+                                                    });
+                                                }
+                                                Ok(Err(err)) => {
+                                                    let _ = ui_tx.send(UiMsg::ImagePreviewFailed(
+                                                        format!(
+                                                            "{err} (press 'o' to open in browser)"
+                                                        ),
+                                                    ));
+                                                }
+                                                Err(join_err) => {
+                                                    let _ = ui_tx.send(UiMsg::ImagePreviewFailed(
+                                                        format!(
+                                                            "Image decode task failed: {join_err}"
+                                                        ),
+                                                    ));
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1126,6 +1395,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 | Some(HitTarget::ToggleBlock(_))
                 | Some(HitTarget::ChildCard(_))
                 | Some(HitTarget::MediaChip(_))
+                | Some(HitTarget::NotionButton(_))
+                | Some(HitTarget::CodeHtmlPreview(_))
                 | Some(HitTarget::DbViewTab(_))
                 | Some(HitTarget::DbRow(_))
                 | Some(HitTarget::DbBoardCard { .. })
@@ -1223,14 +1494,35 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
 
 fn handle_mouse_click(
     target: HitTarget,
-    _col: u16,
-    _row: u16,
+    col: u16,
+    row: u16,
     app: &mut AppState,
     ui: &mut UiState,
 ) -> bool {
     if !ui.overlays.is_empty() {
         match target {
-            HitTarget::OverlayBody => return false,
+            HitTarget::OverlayBody => {
+                let outcome = match ui.overlays.last_mut() {
+                    Some(Overlay::HtmlPreview(ov)) => ov.handle_click(col, row),
+                    _ => return false,
+                };
+                match outcome {
+                    OverlayOutcome::Handled | OverlayOutcome::NotHandled => return false,
+                    OverlayOutcome::Close => {
+                        ui.overlays.pop();
+                        ui.active_pixel_graphic = None;
+                        ui.pending_pixel_graphic = None;
+                        return false;
+                    }
+                    OverlayOutcome::Dispatch(next) => return dispatch(next, app, ui),
+                    OverlayOutcome::CloseAndDispatch(next) => {
+                        ui.overlays.pop();
+                        ui.active_pixel_graphic = None;
+                        ui.pending_pixel_graphic = None;
+                        return dispatch(next, app, ui);
+                    }
+                }
+            }
             HitTarget::OverlayItem { index } => {
                 if let Some(top) = ui.overlays.last_mut() {
                     top.select(index);
@@ -1241,9 +1533,16 @@ fn handle_mouse_click(
             HitTarget::Button(ButtonId::ConfirmCancel) => {
                 return dispatch(Action::CloseOverlay, app, ui);
             }
+            HitTarget::Button(ButtonId::HtmlToggleMode) => {
+                return dispatch(Action::Input('m'), app, ui);
+            }
+            HitTarget::Button(ButtonId::HtmlServeBrowser) => {
+                return dispatch(Action::ServeActiveHtml, app, ui);
+            }
             _ => {
                 ui.overlays.pop();
                 ui.active_pixel_graphic = None;
+                ui.pending_pixel_graphic = None;
                 return false;
             }
         }
@@ -1291,9 +1590,28 @@ fn handle_mouse_click(
             let visible = app.visible_blocks(ui);
             if let Some(vblk) = visible.get(idx) {
                 match &vblk.block.kind {
-                    NotionBlockKind::Image { url, .. } => {
+                    NotionBlockKind::Image { url, caption, .. } => {
                         let block_id = vblk.block.id.clone();
                         let url = url.clone();
+                        if sniff_content_kind(None, Some(&url), None) == ContentKind::Html {
+                            let cap = spans_plain_text(caption);
+                            let title = if cap.trim().is_empty() {
+                                "HTML Preview".to_string()
+                            } else {
+                                cap
+                            };
+                            let pid = app.active_page_id.clone();
+                            return dispatch(
+                                Action::FetchHtmlPreview {
+                                    title,
+                                    url,
+                                    block_id: (!block_id.is_empty()).then_some(block_id),
+                                    page_id: pid,
+                                },
+                                app,
+                                ui,
+                            );
+                        }
                         if let Some(detail) = app.active_page_detail.as_ref() {
                             let media_idx = find_media_index_for_block(detail, &block_id, &url);
                             if let Some(ov) =
@@ -1314,7 +1632,38 @@ fn handle_mouse_click(
                         let u = url.clone();
                         return dispatch(Action::OpenUrl(u), app, ui);
                     }
-                    NotionBlockKind::File { url, .. } | NotionBlockKind::Pdf { url, .. } => {
+                    NotionBlockKind::File { url, name, .. } => {
+                        let block_id = vblk.block.id.clone();
+                        let u = url.clone();
+                        if is_html_file_ref(&u, name.as_deref()) {
+                            let title = name
+                                .clone()
+                                .filter(|s| !s.trim().is_empty())
+                                .unwrap_or_else(|| "HTML File".to_string());
+                            let pid = app.active_page_id.clone();
+                            return dispatch(
+                                Action::FetchHtmlPreview {
+                                    title,
+                                    url: u,
+                                    block_id: (!block_id.is_empty()).then_some(block_id),
+                                    page_id: pid,
+                                },
+                                app,
+                                ui,
+                            );
+                        }
+                        let media_idx = app
+                            .active_page_detail
+                            .as_ref()
+                            .and_then(|d| find_media_index_for_block(d, &block_id, &u));
+                        if let Some(midx) = media_idx {
+                            return dispatch(Action::DownloadMedia(midx), app, ui);
+                        } else if !u.trim().is_empty() {
+                            return dispatch(Action::OpenUrl(u), app, ui);
+                        }
+                        return false;
+                    }
+                    NotionBlockKind::Pdf { url, .. } => {
                         let block_id = vblk.block.id.clone();
                         let u = url.clone();
                         let media_idx = app
@@ -1332,6 +1681,33 @@ fn handle_mouse_click(
                 }
             }
             return dispatch(Action::OpenImagePreview, app, ui);
+        }
+        HitTarget::NotionButton(idx) => {
+            ui.focus = Focus::Canvas;
+            ui.selected_block = idx;
+            return dispatch(Action::ToggleActiveBlock, app, ui);
+        }
+        HitTarget::CodeHtmlPreview(idx) => {
+            ui.focus = Focus::Canvas;
+            ui.selected_block = idx;
+            let visible = app.visible_blocks(ui);
+            if let Some(vblk) = visible.get(idx) {
+                if let NotionBlockKind::Code {
+                    rich_text,
+                    language,
+                    ..
+                } = &vblk.block.kind
+                {
+                    let html = spans_plain_text(rich_text);
+                    let page_title = app
+                        .active_page_detail
+                        .as_ref()
+                        .map(|d| d.page.display_title().to_string())
+                        .unwrap_or_else(|| "Code".to_string());
+                    let title = format!("{page_title} ({language})");
+                    return dispatch(Action::OpenHtmlPreview { title, html }, app, ui);
+                }
+            }
         }
         HitTarget::DbViewTab(mode) => {
             return dispatch(Action::SetDbViewMode(mode), app, ui);
@@ -1380,12 +1756,25 @@ fn handle_mouse_click(
             ButtonId::DbSort => return dispatch(Action::CycleDbSort, app, ui),
             ButtonId::NarrowSidebar => ui.narrow_pane = NarrowPane::Sidebar,
             ButtonId::NarrowCanvas => ui.narrow_pane = NarrowPane::Canvas,
-            ButtonId::ConfirmOk | ButtonId::ConfirmCancel => {}
+            ButtonId::ConfirmOk
+            | ButtonId::ConfirmCancel
+            | ButtonId::HtmlToggleMode
+            | ButtonId::HtmlServeBrowser => {}
         },
         HitTarget::OverlayBody | HitTarget::OverlayItem { .. } => {}
     }
 
     false
+}
+
+pub(crate) fn is_html_code_language(language: &str) -> bool {
+    let lower = language.trim().to_ascii_lowercase();
+    matches!(lower.as_str(), "html" | "xml" | "xhtml")
+}
+
+pub(crate) fn is_html_file_ref(url: &str, name: Option<&str>) -> bool {
+    name.is_some_and(|n| sniff_content_kind(None, Some(n), None) == ContentKind::Html)
+        || sniff_content_kind(None, Some(url), None) == ContentKind::Html
 }
 
 fn selected_db_row_page(app: &AppState, ui: &UiState) -> Option<NotionPage> {
@@ -1928,5 +2317,303 @@ mod tests {
             .region_of(HitTarget::Button(ButtonId::ImagePreview))
             .expect("media metadata badge should be clickable");
         assert!(media_btn.x > comment_btn.x);
+    }
+
+    #[tokio::test]
+    async fn test_html_returned_from_image_auto_routes_to_html_preview() {
+        use axum::{http::header, routing::get, Router};
+        use tokio::net::TcpListener;
+
+        // Mock HTTP endpoint pretending to be an image URL but returning HTML!
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let html_body = "<!DOCTYPE html><html><head><title>Auth Gate</title></head><body><h1>Sign in required</h1><button onclick=\"document.querySelector('h1').textContent='Clicked'\">Continue</button></body></html>";
+        let router = Router::new().route(
+            "/signed-photo",
+            get(move || async move {
+                (
+                    axum::http::StatusCode::OK,
+                    [(header::CONTENT_TYPE, "image/png")],
+                    html_body,
+                )
+            }),
+        );
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let cfg = AppConfig::default();
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_route_test");
+        let client = NotionClient::new(&cfg, auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = tokio::sync::watch::channel(FocusTarget::default());
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+
+        let mut ui = UiState::from_config(&cfg);
+        let mut app = AppState::new(cfg, auth, client, storage, sync_ctrl, ui_tx);
+        let page = NotionPage {
+            id: "page-html-img".into(),
+            title: "HTML Image Test".into(),
+            ..Default::default()
+        };
+        let url = format!("http://{addr}/signed-photo");
+        app.active_view = CanvasView::Page;
+        app.active_page_id = Some(page.id.clone());
+        app.active_page_detail = Some(NotionPageDetail {
+            page,
+            blocks: vec![NotionBlock {
+                id: "blk-img-html".into(),
+                page_id: "page-html-img".into(),
+                kind: NotionBlockKind::Image {
+                    url: url.clone(),
+                    caption: vec![RichTextSpan::plain("Broken Photo")],
+                    is_hosted: false,
+                },
+                ..Default::default()
+            }],
+            comments: Vec::new(),
+            markdown: String::new(),
+            media: vec![NotionMediaRef {
+                block_id: "blk-img-html".into(),
+                url,
+                display_name: "Broken Photo".into(),
+                mime_type: "image/png".into(),
+                is_image: true,
+            }],
+        });
+
+        dispatch(Action::OpenImagePreview, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))));
+
+        // Wait for LoadPreviewImage background task to sniff HTML and send HtmlPreviewLoaded
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+            .await
+            .expect("timed out waiting for HtmlPreviewLoaded")
+            .expect("ui_rx closed");
+        match &msg {
+            UiMsg::HtmlPreviewLoaded { title, html } => {
+                assert_eq!(title, "Broken Photo");
+                assert!(html.contains("Sign in required"));
+            }
+            _ => panic!("expected UiMsg::HtmlPreviewLoaded, got another UiMsg"),
+        }
+
+        app.handle_ui_msg(&mut ui, msg);
+        assert_eq!(ui.overlays.len(), 1);
+        match ui.overlays.last() {
+            Some(Overlay::HtmlPreview(ov)) => {
+                assert!(ov.session.js_active);
+                assert!(ov.session.raw_html().contains("Sign in required"));
+            }
+            other => panic!("expected Overlay::HtmlPreview replacing ImagePreview, got {other:?}"),
+        }
+
+        server_handle.abort();
+    }
+
+    #[test]
+    fn test_html_file_block_mime_code_preview_pill_notion_button_and_all_button_pills() {
+        use crate::parser::{collect_media_refs, parse_notion_block};
+
+        // 1. Parse Notion `button` blocks (rich_text, plain text, and fallback "Button")
+        let btn_rt = parse_notion_block(
+            &serde_json::json!({
+                "id": "blk-btn-1",
+                "type": "button",
+                "button": { "rich_text": [{ "plain_text": "Deploy Release" }] }
+            }),
+            "page-1",
+            None,
+        );
+        assert_eq!(btn_rt.plain_text(), "Deploy Release");
+        assert!(matches!(btn_rt.kind, NotionBlockKind::Button { .. }));
+
+        let btn_fallback = parse_notion_block(
+            &serde_json::json!({
+                "id": "blk-btn-2",
+                "type": "button",
+                "button": {}
+            }),
+            "page-1",
+            None,
+        );
+        assert_eq!(btn_fallback.plain_text(), "Button");
+
+        // 2. Parse `.html` File block & `.html`/`.svg` Image blocks -> verify media refs never mark them as raster image!
+        let html_file = parse_notion_block(
+            &serde_json::json!({
+                "id": "blk-file-html",
+                "type": "file",
+                "file": {
+                    "type": "external",
+                    "name": "dashboard.html",
+                    "external": { "url": "https://example.com/dashboard.html" }
+                }
+            }),
+            "page-1",
+            None,
+        );
+        let fake_img_html = parse_notion_block(
+            &serde_json::json!({
+                "id": "blk-img-htm",
+                "type": "image",
+                "image": {
+                    "type": "external",
+                    "external": { "url": "https://example.com/viewer.htm" }
+                }
+            }),
+            "page-1",
+            None,
+        );
+        let fake_img_svg = parse_notion_block(
+            &serde_json::json!({
+                "id": "blk-img-svg",
+                "type": "image",
+                "image": {
+                    "type": "external",
+                    "external": { "url": "https://example.com/diagram.svg" }
+                }
+            }),
+            "page-1",
+            None,
+        );
+        let html_code = NotionBlock {
+            id: "blk-code-html".into(),
+            page_id: "page-1".into(),
+            kind: NotionBlockKind::Code {
+                rich_text: vec![RichTextSpan::plain(
+                    "<h1>Embedded HTML</h1><button onclick=\"alert('hi')\">Go</button>",
+                )],
+                language: "html".into(),
+                caption: Vec::new(),
+            },
+            ..Default::default()
+        };
+
+        let blocks = vec![btn_rt, html_file, fake_img_html, fake_img_svg, html_code];
+        let media_refs = collect_media_refs(&blocks);
+        assert_eq!(media_refs.len(), 3);
+        assert_eq!(media_refs[0].mime_type, "text/html");
+        assert!(!media_refs[0].is_image);
+        assert_eq!(media_refs[1].mime_type, "text/html");
+        assert!(!media_refs[1].is_image);
+        assert_eq!(media_refs[2].mime_type, "image/svg+xml");
+        assert!(!media_refs[2].is_image);
+
+        // 3. Render page canvas with these blocks and verify HitMap targets + ButtonIds
+        let (mut app, mut ui) = make_test_app_and_ui();
+        let page = NotionPage {
+            id: "page-1".into(),
+            title: "Interactive Page".into(),
+            url: "https://www.notion.so/page-1".into(),
+            ..Default::default()
+        };
+        app.active_view = CanvasView::Page;
+        app.active_page_id = Some(page.id.clone());
+        app.active_page_detail = Some(NotionPageDetail {
+            page,
+            blocks,
+            comments: Vec::new(),
+            markdown: String::new(),
+            media: media_refs,
+        });
+        ui.focus = Focus::Canvas;
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("⚡") && screen.contains("Deploy Release"));
+        assert!(screen.contains("Preview HTML"));
+        assert!(screen.contains("dashboard.html"));
+
+        // Verify previously missing ButtonIds are now wired in HitMap!
+        for btn in [
+            ButtonId::ToggleSidebar,
+            ButtonId::Search,
+            ButtonId::CommandPalette,
+            ButtonId::ToggleFavorite,
+            ButtonId::QuickAppend,
+            ButtonId::NewChildPage,
+            ButtonId::EditExternal,
+            ButtonId::OpenWeb,
+            ButtonId::LinkExtractor,
+            ButtonId::ToggleHrefs,
+            ButtonId::Attachments,
+        ] {
+            assert!(
+                ui.hitmap.region_of(HitTarget::Button(btn)).is_some(),
+                "expected ButtonId::{btn:?} to be registered in HitMap"
+            );
+        }
+
+        // 4. Clicking Notion `button` block shows toast & Confirm dialog offering to open Notion page URL
+        let btn_rect = ui
+            .hitmap
+            .region_of(HitTarget::NotionButton(0))
+            .expect("NotionButton(0) should be in hitmap");
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::NotionButton(0),
+                col: btn_rect.x + 2,
+                row: btn_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(
+            ui.toasts
+                .latest()
+                .is_some_and(|t| t.message.contains("Deploy Release")),
+            "clicking Notion button should display an informative toast"
+        );
+        assert!(matches!(ui.overlays.last(), Some(Overlay::Confirm(_))));
+        ui.overlays.clear();
+
+        // 5. Clicking `[▶ Preview HTML]` pill on the HTML code block opens Overlay::HtmlPreview!
+        let code_pill = ui
+            .hitmap
+            .region_of(HitTarget::CodeHtmlPreview(4))
+            .expect("CodeHtmlPreview(4) pill should be in hitmap");
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::CodeHtmlPreview(4),
+                col: code_pill.x + 1,
+                row: code_pill.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))));
+        ui.overlays.clear();
+
+        // 6. Pressing 'v' in Attachments overlay on `.html` item dispatches FetchHtmlPreview,
+        //    and on `.svg` item does NOT open ImagePreview!
+        let mut att = crate::ui::overlays::attachments::AttachmentsState { selected: 0 };
+        match att.handle(&Action::Input('v'), &app) {
+            OverlayOutcome::CloseAndDispatch(Action::FetchHtmlPreview { title, url, .. }) => {
+                assert_eq!(title, "dashboard.html");
+                assert_eq!(url, "https://example.com/dashboard.html");
+            }
+            other => panic!("expected FetchHtmlPreview for HTML attachment, got {other:?}"),
+        }
+        att.selected = 2; // diagram.svg
+        match att.handle(&Action::Input('v'), &app) {
+            OverlayOutcome::Dispatch(Action::ShowToast(msg)) => {
+                assert!(msg.contains("diagram.svg"));
+            }
+            other => panic!("expected ShowToast (not ImagePreview) for SVG attachment, got {other:?}"),
+        }
     }
 }

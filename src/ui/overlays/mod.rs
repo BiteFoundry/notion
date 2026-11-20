@@ -5,6 +5,7 @@ pub mod command_palette;
 pub mod confirm;
 pub mod context_menu;
 pub mod file_picker;
+pub mod html_preview;
 pub mod image_preview;
 pub mod links;
 pub mod notion_form;
@@ -28,9 +29,10 @@ use crate::ui::{
     overlays::{
         attachments::AttachmentsState, command_palette::CommandPalette, confirm::ConfirmDialog,
         context_menu::ContextMenu, file_picker::FilePickerOverlay,
-        image_preview::ImagePreviewOverlay, links::LinkExtractorOverlay,
-        notion_form::NotionFormOverlay, path_input::PathInputState, search::SearchOverlay,
-        settings::SettingsState, workspace_switcher::WorkspaceSwitcherOverlay,
+        html_preview::HtmlPreviewOverlay, image_preview::ImagePreviewOverlay,
+        links::LinkExtractorOverlay, notion_form::NotionFormOverlay, path_input::PathInputState,
+        search::SearchOverlay, settings::SettingsState,
+        workspace_switcher::WorkspaceSwitcherOverlay,
     },
 };
 
@@ -47,6 +49,7 @@ pub enum OverlayKind {
     Links,
     NotionForm,
     ImagePreview,
+    HtmlPreview,
     Help,
     Confirm,
 }
@@ -60,7 +63,7 @@ pub enum OverlayOutcome {
     NotHandled,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Overlay {
     ContextMenu(ContextMenu),
     CommandPalette(CommandPalette),
@@ -73,6 +76,7 @@ pub enum Overlay {
     Links(LinkExtractorOverlay),
     NotionForm(NotionFormOverlay),
     ImagePreview(ImagePreviewOverlay),
+    HtmlPreview(HtmlPreviewOverlay),
     Help(HelpOverlay),
     Confirm(ConfirmDialog),
 }
@@ -91,6 +95,7 @@ impl Overlay {
             Overlay::Links(_) => OverlayKind::Links,
             Overlay::NotionForm(_) => OverlayKind::NotionForm,
             Overlay::ImagePreview(_) => OverlayKind::ImagePreview,
+            Overlay::HtmlPreview(_) => OverlayKind::HtmlPreview,
             Overlay::Help(_) => OverlayKind::Help,
             Overlay::Confirm(_) => OverlayKind::Confirm,
         }
@@ -103,6 +108,7 @@ impl Overlay {
             | Overlay::PathInput(_)
             | Overlay::FilePicker(_) => true,
             Overlay::NotionForm(form) => form.accepts_text(),
+            Overlay::HtmlPreview(html) => html.accepts_text(),
             _ => false,
         }
     }
@@ -145,6 +151,10 @@ impl Overlay {
 
     pub fn notion_form(form: NotionFormOverlay) -> Self {
         Overlay::NotionForm(form)
+    }
+
+    pub fn html_preview(title: impl Into<String>, html: String) -> Self {
+        Overlay::HtmlPreview(HtmlPreviewOverlay::new(title, html))
     }
 
     pub fn help() -> Self {
@@ -209,6 +219,7 @@ impl Overlay {
             Overlay::Links(links) => links.handle(action),
             Overlay::NotionForm(form) => form.handle(action),
             Overlay::ImagePreview(preview) => preview.handle(action),
+            Overlay::HtmlPreview(html) => html.handle(action),
             Overlay::Help(_) => match action {
                 Action::CloseOverlay | Action::Activate | Action::Input('q') | Action::Input('?') => {
                     OverlayOutcome::Close
@@ -232,6 +243,7 @@ impl Overlay {
             Overlay::Links(links) => links.select(index),
             Overlay::NotionForm(form) => form.select(index),
             Overlay::ImagePreview(_)
+            | Overlay::HtmlPreview(_)
             | Overlay::PathInput(_)
             | Overlay::Help(_)
             | Overlay::Confirm(_) => {}
@@ -258,6 +270,7 @@ impl Overlay {
             Overlay::Links(links) => links.draw(frame, area, ui, hitmap),
             Overlay::NotionForm(form) => form.draw(frame, area, ui, hitmap),
             Overlay::ImagePreview(preview) => preview.draw(frame, area, app, ui, hitmap),
+            Overlay::HtmlPreview(html) => html.draw(frame, area, app, ui, hitmap),
             Overlay::Help(help) => help.draw(frame, area, ui, hitmap),
             Overlay::Confirm(dialog) => dialog.draw(frame, area, ui, hitmap),
         }

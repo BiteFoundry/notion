@@ -44,6 +44,8 @@ pub fn draw_breadcrumb_bar(
     let theme = &ui.theme;
     let bg = theme.bg_header;
 
+    let search_pill = " [/ Find] ".to_string();
+    let cmd_pill = " [⌘] ".to_string();
     let width_pill = format!(" [Width: {}] ", ui.page_width.label());
     let sync_pill = if app.syncing {
         " [Syncing...] ".to_string()
@@ -52,13 +54,32 @@ pub fn draw_breadcrumb_bar(
     };
     let help_pill = " [? Help] ".to_string();
 
-    let right_total = (width_pill.width() + sync_pill.width() + help_pill.width()) as u16;
+    let show_extra_right = area.width >= 96;
+    let right_total = (width_pill.width()
+        + sync_pill.width()
+        + help_pill.width()
+        + if show_extra_right {
+            search_pill.width() + cmd_pill.width()
+        } else {
+            0
+        }) as u16;
     let left_w = area.width.saturating_sub(right_total);
 
     // Left breadcrumb segments
     let mut x = area.x;
     let max_x = area.x.saturating_add(left_w);
     let mut spans: Vec<Span<'static>> = Vec::new();
+
+    let sb_label = if ui.show_sidebar { " [☰]" } else { " [☰+]" };
+    let sb_w = (sb_label.width() as u16).min(max_x.saturating_sub(x));
+    if sb_w > 0 {
+        spans.push(Span::styled(
+            sb_label,
+            Style::default().bg(bg).fg(theme.fg_muted),
+        ));
+        hitmap.add_line(x, area.y, sb_w, HitTarget::Button(ButtonId::ToggleSidebar));
+        x = x.saturating_add(sb_w);
+    }
 
     let ws_label = format!(" {} ▾ ", truncate_width(&app.workspace_name, 20));
     let ws_w = (ws_label.width() as u16).min(max_x.saturating_sub(x));
@@ -121,21 +142,24 @@ pub fn draw_breadcrumb_bar(
         Rect::new(area.x, area.y, left_w, 1),
     );
 
-    // Right pills: [Width: Centered|Full] [Sync] [? Help]
+    // Right pills: [/ Find] [⌘] [Width: Centered|Full] [Sync] [? Help]
     let mut rx = area.x.saturating_add(left_w);
-    let pills = [
-        (width_pill, ButtonId::ToggleWidth, theme.fg_muted),
-        (
-            sync_pill,
-            ButtonId::SyncNow,
-            if app.syncing {
-                theme.accent_soft
-            } else {
-                theme.fg_muted
-            },
-        ),
-        (help_pill, ButtonId::Help, theme.fg_muted),
-    ];
+    let mut pills = Vec::with_capacity(5);
+    if show_extra_right {
+        pills.push((search_pill, ButtonId::Search, theme.fg_muted));
+        pills.push((cmd_pill, ButtonId::CommandPalette, theme.fg_muted));
+    }
+    pills.push((width_pill, ButtonId::ToggleWidth, theme.fg_muted));
+    pills.push((
+        sync_pill,
+        ButtonId::SyncNow,
+        if app.syncing {
+            theme.accent_soft
+        } else {
+            theme.fg_muted
+        },
+    ));
+    pills.push((help_pill, ButtonId::Help, theme.fg_muted));
     for (label, btn, fg) in pills {
         let w = (label.width() as u16).min(area.right().saturating_sub(rx));
         if w == 0 {
@@ -306,6 +330,58 @@ fn draw_page_canvas(
     }
     rendered_lines.push((Line::from(meta_spans), None));
 
+    // Clickable Page Quick Action Pill Bar
+    let action_line_idx = rendered_lines.len();
+    let fav_pill = if detail.page.is_favorite {
+        "[★ Fav]"
+    } else {
+        "[☆ Fav]"
+    };
+    let href_pill = if ui.show_inline_hrefs {
+        "[hrefs:on]"
+    } else {
+        "[hrefs]"
+    };
+    let files_pill = if detail.media.is_empty() {
+        "[📎 Files]".to_string()
+    } else {
+        format!("[📎 Files:{}]", detail.media.len())
+    };
+    let action_pills: [(&str, ButtonId, bool); 8] = [
+        (fav_pill, ButtonId::ToggleFavorite, detail.page.is_favorite),
+        ("[+ Append]", ButtonId::QuickAppend, false),
+        ("[+ Child]", ButtonId::NewChildPage, false),
+        ("[✎ Edit]", ButtonId::EditExternal, false),
+        ("[↗ Web]", ButtonId::OpenWeb, false),
+        ("[🔗 Links]", ButtonId::LinkExtractor, false),
+        (href_pill, ButtonId::ToggleHrefs, ui.show_inline_hrefs),
+        (&files_pill, ButtonId::Attachments, false),
+    ];
+    let mut action_spans: Vec<Span<'static>> = Vec::new();
+    let mut ax = 0u16;
+    for (pill_idx, (label, btn, active)) in action_pills.iter().enumerate() {
+        let sep_w = if pill_idx == 0 { 0 } else { 1 };
+        let w = label.width() as u16;
+        if ax.saturating_add(sep_w + w) > content_area.width {
+            break;
+        }
+        if pill_idx > 0 {
+            action_spans.push(Span::raw(" "));
+            ax = ax.saturating_add(1);
+        }
+        let style = if *active {
+            theme.accent_style().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg_muted).bg(theme.bg_card)
+        };
+        action_spans.push(Span::styled((*label).to_string(), style));
+        inline_hits.push((action_line_idx, ax, w, HitTarget::Button(*btn)));
+        ax = ax.saturating_add(w);
+    }
+    if !action_spans.is_empty() {
+        rendered_lines.push((Line::from(action_spans), None));
+    }
+
     // Properties Strip (for database rows or pages with properties)
     push_properties_strip(detail, &theme, &mut rendered_lines);
 
@@ -337,6 +413,7 @@ fn draw_page_canvas(
                 ui,
                 &theme,
                 &mut rendered_lines,
+                &mut inline_hits,
             );
         }
     }
@@ -437,6 +514,7 @@ fn push_properties_strip(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_block_lines(
     vblk: &VisibleBlock,
     idx: usize,
@@ -445,6 +523,7 @@ fn render_block_lines(
     ui: &UiState,
     theme: &Theme,
     out: &mut Vec<(Line<'static>, Option<HitTarget>)>,
+    inline_hits: &mut Vec<(usize, u16, u16, HitTarget)>,
 ) {
     let indent = "  ".repeat(vblk.depth);
     let sel_bg = if selected {
@@ -693,17 +772,35 @@ fn render_block_lines(
             } else {
                 theme.bg_code
             };
+            let is_html = crate::ui::action::is_html_code_language(language);
+            let header_line_idx = out.len();
             let badge = format!("  {indent}╭─ {language} (y to copy) ");
-            out.push((
-                Line::from(Span::styled(
-                    badge,
+            let mut header_spans = vec![Span::styled(
+                badge.clone(),
+                Style::default()
+                    .fg(theme.fg_muted)
+                    .bg(code_bg)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            if is_html {
+                let preview_pill = "[▶ Preview HTML]";
+                let pill_x = badge.width() as u16;
+                let pill_w = preview_pill.width() as u16;
+                header_spans.push(Span::styled(
+                    preview_pill,
                     Style::default()
-                        .fg(theme.fg_muted)
-                        .bg(code_bg)
+                        .fg(theme.bg_canvas)
+                        .bg(theme.accent)
                         .add_modifier(Modifier::BOLD),
-                )),
-                Some(HitTarget::CanvasBlock(idx)),
-            ));
+                ));
+                inline_hits.push((
+                    header_line_idx,
+                    pill_x,
+                    pill_w,
+                    HitTarget::CodeHtmlPreview(idx),
+                ));
+            }
+            out.push((Line::from(header_spans), Some(HitTarget::CanvasBlock(idx))));
             let raw = spans_plain_text(rich_text);
             for line in raw.lines() {
                 out.push((
@@ -892,13 +989,22 @@ fn render_block_lines(
         }
         NotionBlockKind::File { url, name, .. } => {
             let label = name.as_deref().unwrap_or(url.as_str());
+            let chip = if crate::ui::action::is_html_file_ref(url, name.as_deref()) {
+                Span::styled(
+                    format!(" 🌐 [HTML] {label} (Enter/v: preview) "),
+                    Style::default()
+                        .fg(theme.accent_soft)
+                        .bg(theme.bg_card)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    format!(" 📎 {label} "),
+                    Style::default().fg(theme.fg_secondary).bg(theme.bg_card),
+                )
+            };
             out.push((
-                Line::from(vec![
-                    cursor_gutter,
-                    Span::raw(indent),
-                    Span::styled(format!(" 📎 {label} "), Style::default().fg(theme.fg_secondary).bg(theme.bg_card)),
-                ])
-                .style(sel_bg),
+                Line::from(vec![cursor_gutter, Span::raw(indent), chip]).style(sel_bg),
                 Some(HitTarget::MediaChip(idx)),
             ));
         }
@@ -935,6 +1041,34 @@ fn render_block_lines(
                 ])
                 .style(sel_bg),
                 Some(HitTarget::CanvasBlock(idx)),
+            ));
+        }
+        NotionBlockKind::Button { rich_text } => {
+            let raw_label = spans_plain_text(rich_text);
+            let label = if raw_label.trim().is_empty() {
+                "Button"
+            } else {
+                raw_label.trim()
+            };
+            let pill_style = if selected {
+                Style::default()
+                    .fg(theme.bg_canvas)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(theme.accent_soft)
+                    .bg(theme.bg_card)
+                    .add_modifier(Modifier::BOLD)
+            };
+            out.push((
+                Line::from(vec![
+                    cursor_gutter,
+                    Span::raw(indent),
+                    Span::styled(format!("[ ⚡ {label} ]"), pill_style),
+                ])
+                .style(sel_bg),
+                Some(HitTarget::NotionButton(idx)),
             ));
         }
         NotionBlockKind::ColumnList

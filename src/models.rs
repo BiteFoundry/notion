@@ -434,6 +434,9 @@ pub enum NotionBlockKind {
     TableOfContents {
         color: NotionColor,
     },
+    Button {
+        rich_text: Vec<RichTextSpan>,
+    },
     Unsupported {
         raw_type: String,
     },
@@ -518,6 +521,14 @@ impl NotionBlock {
             NotionBlockKind::Equation { expression } => expression.clone(),
             NotionBlockKind::Divider => "---".to_string(),
             NotionBlockKind::TableOfContents { .. } => "Table of Contents".to_string(),
+            NotionBlockKind::Button { rich_text } => {
+                let text = spans_plain_text(rich_text);
+                if text.trim().is_empty() {
+                    "Button".to_string()
+                } else {
+                    text
+                }
+            }
             NotionBlockKind::Table { .. }
             | NotionBlockKind::ColumnList
             | NotionBlockKind::Column

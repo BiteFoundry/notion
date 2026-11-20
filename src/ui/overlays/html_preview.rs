@@ -1,0 +1,661 @@
+//! Interactive HTML Viewer Overlay (`Overlay::HtmlPreview`) backed by `bitefoundry-html`.
+//!
+//! - `0 MB` idle on static HTML; on-demand QuickJS-NG sandbox when `<script>` / `on*` handlers exist,
+//!   dropped immediately when the overlay closes.
+//! - Keyboard focus cycling (`Tab` / `Shift+Tab`), activation (`Enter` / `Space`), inline `<input>`
+//!   editing, mouse `click_at`, Rendered ↔ Raw toggle (`m`), and lazy localhost Axum serving (`o`).
+
+use std::fmt;
+
+use bitefoundry_html::{HtmlEffect, HtmlTheme, HtmlViewSession};
+use ratatui::{
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
+    },
+    Frame,
+};
+use unicode_width::UnicodeWidthStr;
+
+use crate::ui::{
+    action::Action,
+    app::{AppState, UiState},
+    hitmap::{ButtonId, HitMap, HitTarget},
+    overlays::{centered_rect, OverlayOutcome},
+    theme::Theme,
+};
+
+pub struct HtmlPreviewOverlay {
+    pub title: String,
+    pub session: HtmlViewSession,
+    pub body_rect: Rect,
+    pub last_max_scroll: u16,
+}
+
+impl fmt::Debug for HtmlPreviewOverlay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HtmlPreviewOverlay")
+            .field("title", &self.title)
+            .field("raw_mode", &self.session.raw_mode)
+            .field("js_active", &self.session.js_active)
+            .field("scroll_y", &self.session.scroll_y)
+            .field("focused_control", &self.session.focused_control)
+            .field("editing_input", &self.session.editing_input)
+            .finish()
+    }
+}
+
+impl HtmlPreviewOverlay {
+    pub fn new(title: impl Into<String>, raw_html: String) -> Self {
+        let title_str = title.into();
+        let mut session = HtmlViewSession::new(
+            (!title_str.trim().is_empty()).then_some(title_str.clone()),
+            raw_html,
+        );
+        let resolved_title = session
+            .title()
+            .filter(|t| !t.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if title_str.trim().is_empty() {
+                    "HTML Preview".to_string()
+                } else {
+                    title_str
+                }
+            });
+        // Surface any initial status/toast from startup scripts without losing it.
+        let init_effects = session.take_pending_effects();
+        for eff in init_effects {
+            if let HtmlEffect::Toast(msg) = eff {
+                session.last_status = Some(msg);
+            }
+        }
+        Self {
+            title: resolved_title,
+            session,
+            body_rect: Rect::default(),
+            last_max_scroll: 0,
+        }
+    }
+
+    pub fn accepts_text(&self) -> bool {
+        self.session.editing_input.is_some()
+    }
+
+    pub fn modal_rect(area: Rect) -> Rect {
+        centered_rect(
+            area,
+            area.width.saturating_sub(4).max(24).min(area.width),
+            area.height.saturating_sub(2).max(12).min(area.height),
+        )
+    }
+
+    pub fn html_theme_from(theme: &Theme) -> HtmlTheme {
+        if theme.no_color {
+            return HtmlTheme::no_color();
+        }
+        if theme.ansi16_only {
+            return HtmlTheme {
+                text: Color::White,
+                muted: Color::DarkGray,
+                heading: Color::LightCyan,
+                accent: Color::Cyan,
+                link: Color::LightCyan,
+                code_fg: Color::Yellow,
+                code_bg: Color::Black,
+                quote_border: Color::DarkGray,
+                border: Color::DarkGray,
+                control_fg: Color::White,
+                control_bg: Color::DarkGray,
+                focus_fg: Color::Black,
+                focus_bg: Color::Cyan,
+                raw_tag: Color::LightCyan,
+                raw_attr: Color::Yellow,
+            };
+        }
+        HtmlTheme {
+            text: theme.fg_primary,
+            muted: theme.fg_muted,
+            heading: theme.accent_soft,
+            accent: theme.accent,
+            link: theme.accent_soft,
+            code_fg: theme.code_fg,
+            code_bg: theme.bg_code,
+            quote_border: theme.fg_muted,
+            border: theme.border,
+            control_fg: theme.fg_primary,
+            control_bg: theme.bg_card,
+            focus_fg: theme.bg_canvas,
+            focus_bg: theme.accent,
+            raw_tag: theme.accent_soft,
+            raw_attr: theme.warning,
+        }
+    }
+
+    pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
+        if self.session.editing_input.is_some() {
+            return match action {
+                Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
+                Action::CloseOverlay | Action::Activate | Action::OverlaySubmit => {
+                    let effs = self.session.finish_editing();
+                    self.apply_effects(effs)
+                }
+                Action::Tab => {
+                    let _ = self.session.finish_editing();
+                    self.session.focus_next_control();
+                    OverlayOutcome::Handled
+                }
+                Action::PrevFocus => {
+                    let _ = self.session.finish_editing();
+                    self.session.focus_prev_control();
+                    OverlayOutcome::Handled
+                }
+                Action::Backspace => {
+                    self.session.backspace();
+                    OverlayOutcome::Handled
+                }
+                Action::Input(ch) => {
+                    self.session.input_char(*ch);
+                    OverlayOutcome::Handled
+                }
+                Action::Paste(text) => {
+                    for ch in text.chars() {
+                        if ch != '\r' && ch != '\n' {
+                            self.session.input_char(ch);
+                        }
+                    }
+                    OverlayOutcome::Handled
+                }
+                _ => OverlayOutcome::Handled,
+            };
+        }
+
+        match action {
+            Action::CloseOverlay | Action::Input('q') => OverlayOutcome::Close,
+            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
+            Action::Tab => {
+                self.session.focus_next_control();
+                OverlayOutcome::Handled
+            }
+            Action::PrevFocus => {
+                self.session.focus_prev_control();
+                OverlayOutcome::Handled
+            }
+            Action::Activate | Action::OverlaySubmit | Action::Input(' ') => {
+                let effs = self.session.activate_focused();
+                self.apply_effects(effs)
+            }
+            Action::Input('m') | Action::Input('M') => {
+                let raw = self.session.toggle_raw_mode();
+                self.session.scroll_y = 0;
+                self.session.last_status = Some(if raw {
+                    "Raw HTML source view".to_string()
+                } else {
+                    "Rendered interactive view".to_string()
+                });
+                OverlayOutcome::Handled
+            }
+            Action::OpenActiveInBrowser | Action::Input('o') | Action::Input('O') => {
+                OverlayOutcome::Dispatch(Action::ServeActiveHtml)
+            }
+            Action::MoveUp | Action::Input('k') => {
+                self.session.scroll_y = self.session.scroll_y.saturating_sub(2);
+                OverlayOutcome::Handled
+            }
+            Action::MoveDown | Action::Input('j') => {
+                self.session.scroll_y = self.session.scroll_y.saturating_add(2);
+                OverlayOutcome::Handled
+            }
+            Action::PageUp => {
+                self.session.scroll_y = self.session.scroll_y.saturating_sub(10);
+                OverlayOutcome::Handled
+            }
+            Action::PageDown => {
+                self.session.scroll_y = self.session.scroll_y.saturating_add(10);
+                OverlayOutcome::Handled
+            }
+            Action::CursorHome | Action::ScrollTop | Action::Input('g') => {
+                self.session.scroll_y = 0;
+                OverlayOutcome::Handled
+            }
+            Action::CursorEnd | Action::ScrollBottom | Action::Input('G') => {
+                self.session.scroll_y = u16::MAX;
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } => {
+                if *delta < 0 {
+                    self.session.scroll_y =
+                        self.session.scroll_y.saturating_sub((-*delta) as u16);
+                } else {
+                    self.session.scroll_y =
+                        self.session.scroll_y.saturating_add(*delta as u16);
+                }
+                OverlayOutcome::Handled
+            }
+            _ => OverlayOutcome::Handled,
+        }
+    }
+
+    /// Maps a terminal mouse click `(col, row)` inside the overlay body to `(line_index, rel_col)`
+    /// and invokes `HtmlViewSession::click_at`.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> OverlayOutcome {
+        if self.body_rect.width == 0 || self.body_rect.height == 0 {
+            return OverlayOutcome::Handled;
+        }
+        if col >= self.body_rect.x
+            && col < self.body_rect.right()
+            && row >= self.body_rect.y
+            && row < self.body_rect.bottom()
+        {
+            let line_index = self.session.scroll_y as usize + (row - self.body_rect.y) as usize;
+            let rel_col = col - self.body_rect.x;
+            let effs = self.session.click_at(line_index, rel_col);
+            return self.apply_effects(effs);
+        }
+        OverlayOutcome::Handled
+    }
+
+    fn apply_effects(&mut self, effects: Vec<HtmlEffect>) -> OverlayOutcome {
+        let mut open_url: Option<String> = None;
+        let mut toast: Option<String> = None;
+
+        for eff in effects {
+            match eff {
+                HtmlEffect::None | HtmlEffect::DomChanged => {}
+                HtmlEffect::OpenUrl(url) => {
+                    open_url = Some(url);
+                }
+                HtmlEffect::Toast(msg) => {
+                    self.session.last_status = Some(msg.clone());
+                    toast = Some(msg);
+                }
+                HtmlEffect::FormSubmitted { action, fields } => {
+                    let pairs = fields
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let msg = if action.trim().is_empty() {
+                        format!("Form submitted ({pairs})")
+                    } else {
+                        format!("Form -> {action} ({pairs})")
+                    };
+                    self.session.last_status = Some(msg.clone());
+                    toast = Some(msg);
+                }
+            }
+        }
+
+        if let Some(url) = open_url {
+            return OverlayOutcome::Dispatch(Action::OpenUrl(url));
+        }
+        if let Some(msg) = toast {
+            return OverlayOutcome::Dispatch(Action::ShowToast(msg));
+        }
+        OverlayOutcome::Handled
+    }
+
+    pub fn draw(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        _app: &AppState,
+        ui: &mut UiState,
+        hitmap: &mut HitMap,
+    ) {
+        let theme = ui.theme.clone();
+        let rect = Self::modal_rect(area);
+        frame.render_widget(Clear, rect);
+        hitmap.add(rect, HitTarget::OverlayBody);
+
+        let mode_pill = if self.session.raw_mode {
+            "[m: Raw]"
+        } else {
+            "[m: Rendered]"
+        };
+        let serve_pill = "[o: Serve]";
+        let close_pill = "[✕ Esc]";
+        let pills_w = (mode_pill.width() + 1 + serve_pill.width() + 1 + close_pill.width()) as u16;
+        let show_pills = rect.width > pills_w + 8;
+
+        let js_badge = if self.session.js_active {
+            "JS"
+        } else {
+            "Static"
+        };
+        let title_budget = rect
+            .width
+            .saturating_sub(2 + if show_pills { pills_w + 2 } else { 0 })
+            as usize;
+        let header = format!(
+            " 🌐 {} · {} ",
+            crate::ui::truncate_width(&self.title, 34),
+            js_badge
+        );
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.bg_elevated).fg(theme.fg_primary))
+            .title(Line::from(Span::styled(
+                crate::ui::truncate_width(&header, title_budget),
+                theme.title(true),
+            )))
+            .border_style(theme.border_style(true));
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+
+        if show_pills {
+            let mut px = rect.right().saturating_sub(pills_w + 1);
+            for (label, btn, style) in [
+                (
+                    mode_pill,
+                    ButtonId::HtmlToggleMode,
+                    Style::default()
+                        .fg(theme.accent_soft)
+                        .bg(theme.bg_elevated)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                (
+                    serve_pill,
+                    ButtonId::HtmlServeBrowser,
+                    Style::default()
+                        .fg(theme.success)
+                        .bg(theme.bg_elevated)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                (
+                    close_pill,
+                    ButtonId::ConfirmCancel,
+                    Style::default().fg(theme.fg_primary).bg(theme.bg_elevated),
+                ),
+            ] {
+                let w = label.width() as u16;
+                frame.render_widget(
+                    Paragraph::new(Span::styled(label, style)),
+                    Rect::new(px, rect.y, w, 1),
+                );
+                hitmap.add_line(px, rect.y, w, HitTarget::Button(btn));
+                px = px.saturating_add(w + 1);
+            }
+        }
+
+        if inner.width == 0 || inner.height == 0 {
+            self.body_rect = Rect::default();
+            return;
+        }
+
+        let body_h = inner.height.saturating_sub(1).max(1);
+        let footer_y = inner.y + inner.height.saturating_sub(1);
+        let html_theme = Self::html_theme_from(&theme);
+
+        // First render using full width minus 1 when scrollbar might appear.
+        let probe_w = inner.width.saturating_sub(1).max(12);
+        let total_lines = self
+            .session
+            .render(probe_w, &html_theme, ui.show_inline_hrefs)
+            .lines
+            .len();
+        let show_scrollbar = total_lines > body_h as usize && inner.width > 3;
+        let content_w = if show_scrollbar {
+            inner.width.saturating_sub(1)
+        } else {
+            inner.width
+        };
+
+        let (rendered_lines, controls_len) = {
+            let rendered = self
+                .session
+                .render(content_w, &html_theme, ui.show_inline_hrefs);
+            (rendered.lines.clone(), rendered.controls.len())
+        };
+        let total_rows = rendered_lines.len();
+        let max_scroll = total_rows.saturating_sub(body_h as usize).min(u16::MAX as usize) as u16;
+        self.last_max_scroll = max_scroll;
+        self.session.scroll_y = self.session.scroll_y.min(max_scroll);
+        let sy = self.session.scroll_y;
+
+        self.body_rect = Rect::new(inner.x, inner.y, content_w, body_h);
+        frame.render_widget(
+            Paragraph::new(rendered_lines)
+                .style(Style::default().bg(theme.bg_elevated).fg(theme.fg_primary))
+                .scroll((sy, 0)),
+            self.body_rect,
+        );
+
+        if show_scrollbar {
+            let sb_area = Rect::new(inner.right().saturating_sub(1), inner.y, 1, body_h);
+            let mut sb_state = ScrollbarState::new(max_scroll.saturating_add(1) as usize)
+                .position(sy as usize);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_style(Style::default().fg(theme.accent))
+                .track_style(theme.muted_style());
+            frame.render_stateful_widget(scrollbar, sb_area, &mut sb_state);
+        }
+
+        if inner.height >= 2 {
+            let footer_text = if self.session.editing_input.is_some() {
+                " Editing text input · Type to edit · Backspace delete · Enter/Esc finish "
+                    .to_string()
+            } else if let Some(ref st) = self.session.last_status {
+                format!(" {st} ")
+            } else {
+                format!(
+                    " Tab/Shift+Tab Focus ({controls_len} controls) · Enter/Click Activate · j/k/Wheel Scroll · m Mode · o Serve · Esc Close "
+                )
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    crate::ui::truncate_width(&footer_text, inner.width as usize),
+                    Style::default().fg(theme.fg_muted).bg(theme.bg_header),
+                ))
+                .style(Style::default().bg(theme.bg_header)),
+                Rect::new(inner.x, footer_y, inner.width, 1),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+    use tokio::sync::{mpsc, watch};
+
+    use super::*;
+    use crate::{
+        auth::AuthManager,
+        config::AppConfig,
+        notion::NotionClient,
+        storage::Storage,
+        sync::{FocusTarget, SyncCommand, SyncController},
+    };
+
+    fn make_test_state() -> (AppState, UiState) {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_html_test_token");
+        let client = NotionClient::new(&cfg, auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+        let (nudge_tx, _nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        let app = AppState::new(cfg.clone(), auth, client, storage, sync_ctrl, ui_tx);
+        let ui = UiState::from_config(&cfg);
+        (app, ui)
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn test_html_preview_onclick_js_dom_mutation_mouse_click_at_and_raw_toggle() {
+        let html = r#"<!DOCTYPE html>
+<html>
+<head><title>Interactive Counter</title></head>
+<body>
+  <h1>Demo</h1>
+  <p id="status">Count: 0</p>
+  <button id="inc" onclick="document.getElementById('status').textContent = 'Count: 1'; alert('Incremented!')">Increment</button>
+</body>
+</html>"#;
+
+        let (app, mut ui) = make_test_state();
+        let mut ov = HtmlPreviewOverlay::new("counter.html", html.to_string());
+        assert!(ov.session.js_active, "onclick handler must activate QuickJS");
+
+        let area = Rect::new(0, 0, 100, 28);
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        let mut hitmap = HitMap::new();
+
+        terminal
+            .draw(|frame| {
+                hitmap.clear();
+                ov.draw(frame, area, &app, &mut ui, &mut hitmap);
+            })
+            .unwrap();
+
+        let screen0 = buffer_text(&terminal);
+        assert!(screen0.contains("Count: 0"));
+        assert!(screen0.contains("[m: Rendered]"));
+        assert!(screen0.contains("[o: Serve]"));
+        assert!(hitmap
+            .region_of(HitTarget::Button(ButtonId::HtmlToggleMode))
+            .is_some());
+        assert!(hitmap
+            .region_of(HitTarget::Button(ButtonId::HtmlServeBrowser))
+            .is_some());
+        assert!(hitmap
+            .region_of(HitTarget::Button(ButtonId::ConfirmCancel))
+            .is_some());
+
+        // Locate the rendered button coordinates and click it via handle_click -> click_at!
+        let html_theme = HtmlPreviewOverlay::html_theme_from(&ui.theme);
+        let ctrl = ov
+            .session
+            .render(ov.body_rect.width, &html_theme, false)
+            .controls[0]
+            .clone();
+        let click_col = ov.body_rect.x + ctrl.col_start + 1;
+        let click_row = ov.body_rect.y + ctrl.line as u16;
+
+        let click_outcome = ov.handle_click(click_col, click_row);
+        assert_eq!(
+            click_outcome,
+            OverlayOutcome::Dispatch(Action::ShowToast("Incremented!".to_string()))
+        );
+
+        // Re-render and verify JS DOM mutation is reflected live!
+        terminal
+            .draw(|frame| {
+                hitmap.clear();
+                ov.draw(frame, area, &app, &mut ui, &mut hitmap);
+            })
+            .unwrap();
+        let screen1 = buffer_text(&terminal);
+        assert!(screen1.contains("Count: 1"), "DOM mutation should show Count: 1");
+
+        // Toggle Raw mode with 'm'
+        assert_eq!(ov.handle(&Action::Input('m')), OverlayOutcome::Handled);
+        assert!(ov.session.raw_mode);
+        terminal
+            .draw(|frame| {
+                hitmap.clear();
+                ov.draw(frame, area, &app, &mut ui, &mut hitmap);
+            })
+            .unwrap();
+        let screen_raw = buffer_text(&terminal);
+        assert!(screen_raw.contains("[m: Raw]"));
+        assert!(screen_raw.contains("<!DOCTYPE html>"));
+
+        // Press 'o' to dispatch ServeActiveHtml
+        assert_eq!(
+            ov.handle(&Action::Input('o')),
+            OverlayOutcome::Dispatch(Action::ServeActiveHtml)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_html_preview_native_server_serves_over_localhost() {
+        let (app, _ui) = make_test_state();
+        let url = app
+            .html_server
+            .serve_html("Notion Preview", "<h1>Hello Notion HTML</h1>")
+            .await
+            .unwrap();
+        assert!(url.starts_with("http://127.0.0.1:"));
+        assert!(url.contains("/view/"));
+
+        let resp = reqwest::get(&url).await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.contains("text/html"));
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("<h1>Hello Notion HTML</h1>"));
+        app.html_server.shutdown();
+    }
+
+    #[test]
+    fn test_html_preview_keyboard_focus_input_editing_and_form_submission() {
+        let html = r#"
+            <form action="/apply">
+              <input type="text" name="query" value="notion" />
+              <button type="submit">Go</button>
+            </form>
+            <details><summary>More Info</summary><p>Hidden detail text</p></details>
+        "#;
+        let mut ov = HtmlPreviewOverlay::new("Form Test", html.to_string());
+        assert!(!ov.session.js_active, "static HTML should not spawn QuickJS");
+
+        // Tab to text input, Enter to edit, type & backspace, Enter to finish
+        assert_eq!(ov.handle(&Action::Tab), OverlayOutcome::Handled);
+        assert_eq!(ov.session.focused_control, Some(0));
+        assert_eq!(ov.handle(&Action::Activate), OverlayOutcome::Handled);
+        assert!(ov.accepts_text());
+        assert_eq!(ov.handle(&Action::Input('!')), OverlayOutcome::Handled);
+        assert_eq!(ov.handle(&Action::Backspace), OverlayOutcome::Handled);
+        assert_eq!(ov.handle(&Action::Input('2')), OverlayOutcome::Handled);
+        assert_eq!(ov.handle(&Action::Activate), OverlayOutcome::Handled);
+        assert!(!ov.accepts_text());
+
+        // Tab to submit button, Space/Enter submits form with updated value
+        assert_eq!(ov.handle(&Action::Tab), OverlayOutcome::Handled);
+        assert_eq!(ov.session.focused_control, Some(1));
+        match ov.handle(&Action::Input(' ')) {
+            OverlayOutcome::Dispatch(Action::ShowToast(msg)) => {
+                assert!(msg.contains("/apply"));
+                assert!(msg.contains("query=notion2"));
+            }
+            other => panic!("expected form submission toast, got {other:?}"),
+        }
+
+        // Tab to details summary, Shift+Tab back, Tab forward, activate toggles details open
+        assert_eq!(ov.handle(&Action::Tab), OverlayOutcome::Handled);
+        assert_eq!(ov.session.focused_control, Some(2));
+        assert_eq!(ov.handle(&Action::PrevFocus), OverlayOutcome::Handled);
+        assert_eq!(ov.session.focused_control, Some(1));
+        assert_eq!(ov.handle(&Action::Tab), OverlayOutcome::Handled);
+        assert_eq!(ov.handle(&Action::Activate), OverlayOutcome::Handled);
+        let theme = HtmlTheme::dark();
+        let rendered = ov.session.render(80, &theme, false);
+        let joined: String = rendered
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(joined.contains("Hidden detail text"));
+    }
+}

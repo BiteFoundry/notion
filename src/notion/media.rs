@@ -6,12 +6,12 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use bitefoundry_html::{is_safe_raster_image, sniff_content_kind, ContentKind};
 use reqwest::header::CONTENT_TYPE;
 use sha2::{Digest, Sha256};
 
 use crate::{
     config::{ensure_parent, media_cache_dir, AppConfig},
-    img_preview::is_image_mime_or_name,
     models::{DownloadedMedia, NotionBlockKind},
     notion::NotionClient,
 };
@@ -32,10 +32,11 @@ pub async fn fetch_media_bytes_cached(
 
     if data_path.exists() {
         if let Ok(bytes) = fs::read(&data_path) {
-            let mime = fs::read_to_string(&meta_path)
-                .unwrap_or_else(|_| guess_mime_from_url(trimmed))
-                .trim()
-                .to_string();
+            let cached_mime = fs::read_to_string(&meta_path)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let mime = resolve_mime(cached_mime.as_deref(), trimmed, &bytes);
             return Ok((bytes, mime));
         }
     }
@@ -59,9 +60,7 @@ pub async fn fetch_media_bytes_cached(
         .await
         .context("Failed to read downloaded media bytes")?
         .to_vec();
-    let mime = header_mime
-        .filter(|m| !m.is_empty() && m != "application/octet-stream")
-        .unwrap_or_else(|| detect_mime(&bytes, trimmed));
+    let mime = resolve_mime(header_mime.as_deref(), trimmed, &bytes);
 
     if ensure_parent(&data_path).is_ok() {
         let _ = fs::write(&data_path, &bytes);
@@ -116,7 +115,7 @@ pub async fn download_media_target(
         .and_then(|n| n.to_str())
         .unwrap_or(&safe_name)
         .to_string();
-    let is_image = is_image_mime_or_name(&mime_type, Some(&file_name));
+    let is_image = is_safe_raster_image(Some(&mime_type), Some(&file_name), Some(&bytes));
 
     Ok(DownloadedMedia {
         ok: true,
@@ -193,49 +192,186 @@ fn unique_dest_path(dir: &Path, file_name: &str) -> PathBuf {
     dir.join(format!("{stem}-{}{ext}", uuid::Uuid::new_v4()))
 }
 
-fn detect_mime(bytes: &[u8], url: &str) -> String {
+fn resolve_mime(header_mime: Option<&str>, url: &str, bytes: &[u8]) -> String {
+    let hint = header_mime
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case("application/octet-stream"));
+    match sniff_content_kind(hint, Some(url), Some(bytes)) {
+        ContentKind::RasterImage => raster_mime_from_bytes_or_hint(bytes, hint, url),
+        ContentKind::Svg => "image/svg+xml".to_string(),
+        ContentKind::Html => "text/html".to_string(),
+        ContentKind::Pdf => "application/pdf".to_string(),
+        ContentKind::Markdown => "text/markdown".to_string(),
+        ContentKind::PlainText => {
+            if let Some(h) = hint {
+                if !h.to_ascii_lowercase().starts_with("image/") {
+                    return h.to_ascii_lowercase();
+                }
+            }
+            if url_path_ends_with(url, ".json") {
+                "application/json".to_string()
+            } else {
+                "text/plain".to_string()
+            }
+        }
+        ContentKind::Binary => {
+            if let Some(h) = hint {
+                if !h.to_ascii_lowercase().starts_with("image/") {
+                    return h.to_ascii_lowercase();
+                }
+            }
+            let guessed = guess_mime_from_url(url);
+            if guessed.starts_with("image/") {
+                "application/octet-stream".to_string()
+            } else {
+                guessed
+            }
+        }
+    }
+}
+
+fn raster_mime_from_bytes_or_hint(bytes: &[u8], hint: Option<&str>, url: &str) -> String {
     if let Ok(fmt) = image::guess_format(bytes) {
         return match fmt {
             image::ImageFormat::Png => "image/png".to_string(),
             image::ImageFormat::Jpeg => "image/jpeg".to_string(),
             image::ImageFormat::Gif => "image/gif".to_string(),
             image::ImageFormat::WebP => "image/webp".to_string(),
-            _ => "application/octet-stream".to_string(),
+            image::ImageFormat::Bmp => "image/bmp".to_string(),
+            _ => "image/png".to_string(),
         };
     }
-    if bytes.starts_with(b"%PDF") {
-        return "application/pdf".to_string();
+    if bytes.len() >= 2 && &bytes[0..2] == b"BM" {
+        return "image/bmp".to_string();
+    }
+    if let Some(h) = hint {
+        let lower = h.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp" | "image/bmp"
+        ) {
+            return if lower == "image/jpg" {
+                "image/jpeg".to_string()
+            } else {
+                lower
+            };
+        }
     }
     guess_mime_from_url(url)
 }
 
-fn guess_mime_from_url(url: &str) -> String {
-    let lower = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
-    if lower.ends_with(".png") {
-        "image/png".to_string()
-    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        "image/jpeg".to_string()
-    } else if lower.ends_with(".gif") {
-        "image/gif".to_string()
-    } else if lower.ends_with(".webp") {
-        "image/webp".to_string()
-    } else if lower.ends_with(".pdf") {
-        "application/pdf".to_string()
-    } else {
-        "application/octet-stream".to_string()
+fn url_path_ends_with(url: &str, suffix: &str) -> bool {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase()
+        .ends_with(suffix)
+}
+
+pub fn detect_mime(bytes: &[u8], url: &str) -> String {
+    resolve_mime(None, url, bytes)
+}
+
+pub fn guess_mime_from_url(url: &str) -> String {
+    match sniff_content_kind(None, Some(url), None) {
+        ContentKind::Html => "text/html".to_string(),
+        ContentKind::Svg => "image/svg+xml".to_string(),
+        ContentKind::Pdf => "application/pdf".to_string(),
+        ContentKind::Markdown => "text/markdown".to_string(),
+        ContentKind::PlainText => "text/plain".to_string(),
+        ContentKind::RasterImage => {
+            if url_path_ends_with(url, ".jpg") || url_path_ends_with(url, ".jpeg") {
+                "image/jpeg".to_string()
+            } else if url_path_ends_with(url, ".gif") {
+                "image/gif".to_string()
+            } else if url_path_ends_with(url, ".webp") {
+                "image/webp".to_string()
+            } else if url_path_ends_with(url, ".bmp") {
+                "image/bmp".to_string()
+            } else {
+                "image/png".to_string()
+            }
+        }
+        ContentKind::Binary => {
+            if url_path_ends_with(url, ".json") {
+                "application/json".to_string()
+            } else {
+                "application/octet-stream".to_string()
+            }
+        }
     }
 }
 
-fn ext_for_mime(mime: &str) -> &'static str {
-    match mime.trim().to_ascii_lowercase().as_str() {
+pub fn ext_for_mime(mime: &str) -> &'static str {
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
+    match base.as_str() {
+        "text/html" | "application/xhtml+xml" => ".html",
+        "image/svg+xml" => ".svg",
         "image/png" => ".png",
         "image/jpeg" | "image/jpg" => ".jpg",
         "image/gif" => ".gif",
         "image/webp" => ".webp",
+        "image/bmp" | "image/x-ms-bmp" => ".bmp",
         "application/pdf" => ".pdf",
         "text/plain" => ".txt",
-        "text/markdown" => ".md",
+        "text/markdown" | "text/x-markdown" => ".md",
         "application/json" => ".json",
-        _ => ".bin",
+        _ => match sniff_content_kind(Some(&base), None, None) {
+            ContentKind::Html => ".html",
+            ContentKind::Svg => ".svg",
+            ContentKind::Pdf => ".pdf",
+            ContentKind::Markdown => ".md",
+            ContentKind::PlainText => ".txt",
+            _ => ".bin",
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_html_and_svg_mime_sniffing_never_misclassified_as_raster_or_bin() {
+        let html_bytes = b"<!DOCTYPE html><html><body><h1>Report</h1></body></html>";
+        assert_eq!(
+            detect_mime(html_bytes, "https://example.com/fake.png"),
+            "text/html"
+        );
+        assert_eq!(
+            resolve_mime(Some("image/png"), "https://example.com/fake.png", html_bytes),
+            "text/html"
+        );
+        assert_eq!(
+            guess_mime_from_url("https://example.com/report.html?sig=123"),
+            "text/html"
+        );
+        assert_eq!(
+            guess_mime_from_url("https://example.com/page.htm"),
+            "text/html"
+        );
+        assert_eq!(
+            guess_mime_from_url("https://example.com/doc.xhtml"),
+            "text/html"
+        );
+        assert_eq!(ext_for_mime("text/html"), ".html");
+        assert_eq!(ext_for_mime("text/html; charset=utf-8"), ".html");
+        assert_eq!(ext_for_mime("application/xhtml+xml"), ".html");
+
+        let svg_bytes = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>";
+        assert_eq!(
+            detect_mime(svg_bytes, "https://example.com/logo.png"),
+            "image/svg+xml"
+        );
+        assert_eq!(
+            guess_mime_from_url("https://example.com/logo.svg"),
+            "image/svg+xml"
+        );
+        assert_eq!(ext_for_mime("image/svg+xml"), ".svg");
     }
 }
