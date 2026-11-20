@@ -41,6 +41,44 @@ use crate::{
 };
 
 const OAUTH_CALLBACK_TIMEOUT_SECS: u64 = 300;
+pub const NOTION_INTEGRATIONS_URL: &str = "https://www.notion.so/profile/integrations";
+
+/// Renders a compact, scannable Unicode half-block (`▀`, `▄`, `█`, ` `) QR code for terminal display.
+pub fn render_terminal_qr(data: &str) -> Option<String> {
+    let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
+    let width = code.width();
+    let quiet = 1usize;
+    let total = width + quiet * 2;
+
+    let is_dark = |x: usize, y: usize| -> bool {
+        if x < quiet || y < quiet || x >= width + quiet || y >= width + quiet {
+            false
+        } else {
+            matches!(code[(x - quiet, y - quiet)], qrcode::Color::Dark)
+        }
+    };
+
+    let mut out = String::new();
+    let mut y = 0;
+    while y < total {
+        out.push_str("  ");
+        for x in 0..total {
+            let top = is_dark(x, y);
+            let bottom = if y + 1 < total { is_dark(x, y + 1) } else { false };
+            // Light background (inverted for dark terminals: dark modules = space, light = block)
+            let ch = match (top, bottom) {
+                (false, false) => '█',
+                (false, true) => '▀',
+                (true, false) => '▄',
+                (true, true) => ' ',
+            };
+            out.push(ch);
+        }
+        out.push('\n');
+        y += 2;
+    }
+    Some(out)
+}
 #[cfg(target_os = "linux")]
 const LINUX_KEYRING_TIMEOUT: Duration = Duration::from_millis(800);
 
@@ -79,6 +117,8 @@ pub struct OAuthLoginOptions {
     pub workspace_alias: Option<String>,
     pub port: Option<u16>,
     pub redirect_uri: Option<String>,
+    pub no_browser: bool,
+    pub no_qr: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -300,13 +340,24 @@ impl AuthManager {
         let base_url = self.config.read().await.effective_api_base_url();
         let auth_url = build_oauth_authorize_url(&base_url, &client_id, &redirect_uri, &state)?;
 
-        let no_browser = std::env::var("NOTION_NO_BROWSER")
+        let env_no_browser = std::env::var("NOTION_NO_BROWSER")
             .ok()
             .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
-        if !no_browser {
-            let _ = open::that(&auth_url);
+        let opened = if !opts.no_browser && !env_no_browser {
+            open::that(&auth_url).is_ok()
+        } else {
+            false
+        };
+        if opened {
+            eprintln!("Opened Notion authorization page in your browser.");
         }
-        eprintln!("Open this URL to authorize Notion:\n  {auth_url}\nWaiting for callback on {redirect_uri}...");
+        eprintln!("Open this URL to authorize Notion:\n  {auth_url}");
+        if !opts.no_qr {
+            if let Some(qr) = render_terminal_qr(&auth_url) {
+                eprintln!("\nOr scan this QR code:\n{qr}");
+            }
+        }
+        eprintln!("Waiting for OAuth callback on {redirect_uri}...");
 
         let code = wait_for_oauth_callback(listener, &state).await?;
         let cred = exchange_oauth_code(

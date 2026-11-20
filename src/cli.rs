@@ -318,6 +318,12 @@ pub enum Command {
         port: Option<u16>,
         #[arg(long)]
         redirect_uri: Option<String>,
+        /// Do not auto-open the web browser during login
+        #[arg(long)]
+        no_browser: bool,
+        /// Do not print a terminal QR code during login
+        #[arg(long)]
+        no_qr: bool,
         #[arg(long)]
         json: bool,
     },
@@ -456,6 +462,8 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             client_secret,
             port,
             redirect_uri,
+            no_browser,
+            no_qr,
             json: as_json,
         } => {
             let auth = AuthManager::new(config.clone(), workspace_override.clone())?;
@@ -474,6 +482,8 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         workspace_alias: workspace_override,
                         port,
                         redirect_uri,
+                        no_browser,
+                        no_qr,
                     })
                     .await?;
                 if as_json {
@@ -499,10 +509,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     if !env_t.trim().is_empty() {
                         env_t
                     } else {
-                        prompt_token_interactive()?
+                        prompt_token_interactive(no_browser, no_qr)?
                     }
                 } else {
-                    prompt_token_interactive()?
+                    prompt_token_interactive(no_browser, no_qr)?
                 };
                 let (cred, me) = auth
                     .login_with_token(&raw_tok, workspace_override.as_deref())
@@ -695,11 +705,39 @@ async fn open_runtime(
     Ok((auth, client, storage))
 }
 
-fn prompt_token_interactive() -> Result<String> {
+fn prompt_token_interactive(no_browser: bool, no_qr: bool) -> Result<String> {
     if !io::stdin().is_terminal() {
         bail!("No token provided. Pass `--token <ntn_...>` or set `NOTION_TOKEN`.");
     }
-    eprint!("Enter Notion Internal Integration Token (ntn_... or secret_...): ");
+
+    let url = crate::auth::NOTION_INTEGRATIONS_URL;
+    let env_no_browser = std::env::var("NOTION_NO_BROWSER")
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+    let opened = if !no_browser && !env_no_browser {
+        open::that(url).is_ok()
+    } else {
+        false
+    };
+
+    eprintln!("\nConnect Notion Workspace");
+    eprintln!("────────────────────────────────────────────────────────────");
+    if opened {
+        eprintln!("  Opened Notion Integrations in your browser:");
+    } else {
+        eprintln!("  Open Notion Integrations in your browser:");
+    }
+    eprintln!("  {url}");
+    if !no_qr {
+        if let Some(qr) = crate::auth::render_terminal_qr(url) {
+            eprintln!("\n  Or scan with your phone:\n{qr}");
+        }
+    }
+    eprintln!("  1. Click \"New integration\" (Internal) and copy the secret (`ntn_...`).");
+    eprintln!("  2. In Notion, share target pages/databases with your integration (`···` -> Connections).");
+    eprintln!("  (Prefer OAuth 2.0? Run `notion login --oauth --client-id <ID> --client-secret <SECRET>`)");
+    eprintln!("────────────────────────────────────────────────────────────");
+    eprint!("Paste Notion Internal Integration Token (ntn_... or secret_...): ");
     io::stderr().flush()?;
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
