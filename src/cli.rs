@@ -23,8 +23,8 @@ use crate::{
     notion::{media, NotionClient, SearchFilterObject},
     parser::{
         block_comparison_key, blocks_to_markdown, blocks_to_plain_text, collect_media_refs,
-        markdown_to_notion_blocks, parse_inline_markdown_rich_text, parse_notion_block,
-        parse_slash_command_blocks,
+        is_preserved_anchor_block, markdown_to_notion_blocks, parse_inline_markdown_rich_text,
+        parse_notion_block, parse_slash_command_blocks, partition_blocks_around_anchors,
     },
     resolver, serve,
     storage::Storage,
@@ -1688,57 +1688,97 @@ fn has_real_remote_ids(blocks: &[NotionBlock]) -> bool {
             .all(|b| !b.id.trim().is_empty() && !b.id.starts_with("__optimistic_"))
 }
 
-/// Replaces the editable content blocks of a Notion page with blocks parsed from `edited_markdown`
-/// using fast diff-based sync (preserving child pages and child databases, skipping untouched
-/// prefix/suffix blocks, patching same-type edits in place concurrently, and reconstructing the
-/// updated `NotionPageDetail` + SQLite cache without slow full-tree re-fetches).
-pub async fn op_replace_page_markdown(
-    client: &NotionClient,
-    storage: &Storage,
-    page: &str,
-    edited_markdown: &str,
-) -> Result<NotionPageDetail> {
-    op_diff_sync_page_markdown(client, storage, page, edited_markdown, None).await
+fn is_stale_block_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("404")
+        || msg.contains("object_not_found")
+        || msg.contains("archived")
+        || msg.contains("could not find block")
 }
 
-/// Smart diff-based Markdown -> Notion block sync.
-///
-/// When `known_existing` contains the page's current top-level blocks with real Notion IDs,
-/// skips the initial `GET /v1/blocks/{id}/children` roundtrip.
-pub async fn op_diff_sync_page_markdown(
+async fn patch_blocks_concurrently(
     client: &NotionClient,
-    storage: &Storage,
-    page: &str,
-    edited_markdown: &str,
-    known_existing: Option<Vec<NotionBlock>>,
-) -> Result<NotionPageDetail> {
-    let ws_id = client.auth().active_workspace_id().await;
-    let id = resolver::resolve_page_id(storage, Some(client), &ws_id, page).await?;
-
-    let existing = match known_existing {
-        Some(blocks) if has_real_remote_ids(&blocks) => blocks,
-        _ => client.list_block_children(&id, &id, None).await?,
-    };
-
-    let mut editable_existing: Vec<NotionBlock> = Vec::new();
-    let mut preserved_children: Vec<NotionBlock> = Vec::new();
-    for blk in existing {
-        if matches!(
-            blk.kind,
-            NotionBlockKind::ChildPage { .. } | NotionBlockKind::ChildDatabase { .. }
-        ) {
-            preserved_children.push(blk);
-        } else if !blk.id.trim().is_empty() {
-            editable_existing.push(blk);
-        }
-    }
-
-    let new_payloads = markdown_to_notion_blocks(edited_markdown);
-    let new_parsed: Vec<NotionBlock> = new_payloads
+    page_id: &str,
+    old_slice: &[NotionBlock],
+    payloads_slice: &[Value],
+) -> Result<Vec<NotionBlock>> {
+    let jobs: Vec<(usize, String, Value, Vec<NotionBlock>, bool)> = old_slice
         .iter()
-        .map(|val| parse_notion_block(val, &id, None))
+        .zip(payloads_slice.iter())
+        .enumerate()
+        .map(|(idx, (old_blk, payload))| {
+            let update_payload =
+                build_block_update_payload(payload, &old_blk.block_type).expect("patchable");
+            (
+                idx,
+                old_blk.id.clone(),
+                update_payload,
+                old_blk.children.clone(),
+                old_blk.has_children,
+            )
+        })
         .collect();
 
+    let results: Vec<Result<(usize, NotionBlock)>> = stream::iter(jobs)
+        .map(
+            |(idx, blk_id, update_payload, prev_children, prev_has_children)| async move {
+                let mut updated = client
+                    .update_block(&blk_id, page_id, update_payload)
+                    .await?;
+                if updated.children.is_empty() && !prev_children.is_empty() {
+                    updated.children = prev_children;
+                    updated.has_children = prev_has_children || !updated.children.is_empty();
+                }
+                Ok((idx, updated))
+            },
+        )
+        .buffer_unordered(4)
+        .collect()
+        .await;
+
+    let mut indexed: Vec<(usize, NotionBlock)> = Vec::with_capacity(results.len());
+    for res in results {
+        indexed.push(res?);
+    }
+    indexed.sort_by_key(|(idx, _)| *idx);
+    Ok(indexed.into_iter().map(|(_, blk)| blk).collect())
+}
+
+async fn delete_blocks_concurrently(
+    client: &NotionClient,
+    old_slice: &[NotionBlock],
+) -> Result<()> {
+    let del_jobs: Vec<(String, bool)> = old_slice
+        .iter()
+        .filter(|blk| !is_preserved_anchor_block(blk) && !blk.id.trim().is_empty())
+        .map(|blk| (blk.id.clone(), blk.block_type == "unsupported"))
+        .collect();
+    let del_results: Vec<Result<()>> = stream::iter(del_jobs)
+        .map(|(blk_id, ignore_err)| async move {
+            match client.delete_block(&blk_id).await {
+                Ok(_) => Ok(()),
+                Err(_) if ignore_err => Ok(()),
+                Err(err) => Err(err),
+            }
+        })
+        .buffer_unordered(4)
+        .collect()
+        .await;
+    for res in del_results {
+        res?;
+    }
+    Ok(())
+}
+
+async fn diff_sync_editable_segment(
+    client: &NotionClient,
+    page_id: &str,
+    editable_existing: &[NotionBlock],
+    new_payloads: &[Value],
+    new_parsed: &[NotionBlock],
+    prev_anchor_id: Option<&str>,
+    has_following_anchors: bool,
+) -> Result<Vec<NotionBlock>> {
     let old_keys: Vec<(String, String)> = editable_existing
         .iter()
         .map(block_comparison_key)
@@ -1778,9 +1818,10 @@ pub async fn op_diff_sync_page_markdown(
     };
 
     // Notion's `PATCH /v1/blocks/{id}/children` supports `"after"` (not `"before"`).
-    // If inserting/replacing at index 0 with a non-empty suffix and we cannot patch in place
-    // (and it isn't a pure deletion), include the suffix in the diff so block order stays exact.
-    if prefix_len == 0 && suffix_len > 0 {
+    // When modifying index 0 with no preceding anchor block and a non-empty suffix, fold the
+    // editable suffix if we cannot patch in place (and it isn't a pure deletion) so block order
+    // stays exact — while NEVER touching preserved anchor blocks outside this segment.
+    if prefix_len == 0 && prev_anchor_id.is_none() && suffix_len > 0 {
         let old_mid_end = editable_existing.len() - suffix_len;
         let new_mid_end = new_payloads.len() - suffix_len;
         let old_mid = &editable_existing[..old_mid_end];
@@ -1802,92 +1843,184 @@ pub async fn op_diff_sync_page_markdown(
     let after_id = if prefix_len > 0 {
         Some(editable_existing[prefix_len - 1].id.as_str())
     } else {
-        None
+        prev_anchor_id
     };
 
     let updated_mid: Vec<NotionBlock> = if old_mid.is_empty() && new_mid_payloads.is_empty() {
         Vec::new()
     } else if can_in_place_patch(old_mid, new_mid_parsed, new_mid_payloads) {
-        let jobs: Vec<(usize, String, Value, Vec<NotionBlock>, bool)> = old_mid
-            .iter()
-            .zip(new_mid_payloads.iter())
-            .enumerate()
-            .map(|(idx, (old_blk, payload))| {
-                let update_payload =
-                    build_block_update_payload(payload, &old_blk.block_type).expect("patchable");
-                (
-                    idx,
-                    old_blk.id.clone(),
-                    update_payload,
-                    old_blk.children.clone(),
-                    old_blk.has_children,
-                )
-            })
-            .collect();
-
-        let page_id_ref = id.as_str();
-        let results: Vec<Result<(usize, NotionBlock)>> = stream::iter(jobs)
-            .map(
-                |(idx, blk_id, update_payload, prev_children, prev_has_children)| async move {
-                    let mut updated = client
-                        .update_block(&blk_id, page_id_ref, update_payload)
-                        .await?;
-                    if updated.children.is_empty() && !prev_children.is_empty() {
-                        updated.children = prev_children;
-                        updated.has_children = prev_has_children || !updated.children.is_empty();
-                    }
-                    Ok((idx, updated))
-                },
-            )
-            .buffer_unordered(4)
-            .collect()
-            .await;
-
-        let mut indexed: Vec<(usize, NotionBlock)> = Vec::with_capacity(results.len());
-        for res in results {
-            indexed.push(res?);
-        }
-        indexed.sort_by_key(|(idx, _)| *idx);
-        indexed.into_iter().map(|(_, blk)| blk).collect()
+        patch_blocks_concurrently(client, page_id, old_mid, new_mid_payloads).await?
     } else if old_mid.is_empty() {
         client
-            .append_block_children_after(&id, after_id, new_mid_payloads.to_vec())
+            .append_block_children_after(page_id, after_id, new_mid_payloads.to_vec())
             .await?
-    } else {
-        let del_jobs: Vec<(String, bool)> = old_mid
+    } else if new_mid_payloads.is_empty() {
+        delete_blocks_concurrently(client, old_mid).await?;
+        Vec::new()
+    } else if after_id.is_none() && has_following_anchors {
+        // Modifying blocks before a preserved anchor at index 0 with no preceding block:
+        // First patch any leading same-type blocks in place so their real ID acts as `after_id`,
+        // keeping everything positioned strictly BEFORE the preserved anchor without deleting it!
+        let lead_patch = old_mid
             .iter()
-            .map(|blk| (blk.id.clone(), blk.block_type == "unsupported"))
-            .collect();
-        let del_results: Vec<Result<()>> = stream::iter(del_jobs)
-            .map(|(blk_id, ignore_err)| async move {
-                match client.delete_block(&blk_id).await {
-                    Ok(_) => Ok(()),
-                    Err(_) if ignore_err => Ok(()),
-                    Err(err) => Err(err),
-                }
+            .zip(new_mid_parsed.iter())
+            .zip(new_mid_payloads.iter())
+            .take_while(|((o, n), p)| {
+                o.block_type == n.block_type
+                    && build_block_update_payload(p, &o.block_type).is_some()
             })
-            .buffer_unordered(4)
-            .collect()
-            .await;
-        for res in del_results {
-            res?;
-        }
+            .count();
 
-        if !new_mid_payloads.is_empty() {
-            client
-                .append_block_children_after(&id, after_id, new_mid_payloads.to_vec())
-                .await?
+        if lead_patch > 0 {
+            let mut out = patch_blocks_concurrently(
+                client,
+                page_id,
+                &old_mid[..lead_patch],
+                &new_mid_payloads[..lead_patch],
+            )
+            .await?;
+            let anchor_after = out.last().map(|b| b.id.clone());
+            if lead_patch < old_mid.len() {
+                delete_blocks_concurrently(client, &old_mid[lead_patch..]).await?;
+            }
+            if lead_patch < new_mid_payloads.len() {
+                let appended = client
+                    .append_block_children_after(
+                        page_id,
+                        anchor_after.as_deref(),
+                        new_mid_payloads[lead_patch..].to_vec(),
+                    )
+                    .await?;
+                out.extend(appended);
+            }
+            out
         } else {
-            Vec::new()
+            // Different block type at index 0 before a preserved anchor:
+            // Append new blocks `after: old_mid[0]` (placing them strictly BEFORE the anchor),
+            // then delete `old_mid` — exact position preserved with 0 deletes on the anchor!
+            let temp_after = old_mid[0].id.clone();
+            let appended = client
+                .append_block_children_after(
+                    page_id,
+                    Some(&temp_after),
+                    new_mid_payloads.to_vec(),
+                )
+                .await?;
+            delete_blocks_concurrently(client, old_mid).await?;
+            appended
         }
+    } else {
+        delete_blocks_concurrently(client, old_mid).await?;
+        client
+            .append_block_children_after(page_id, after_id, new_mid_payloads.to_vec())
+            .await?
     };
 
+    let mut seg_result =
+        Vec::with_capacity(prefix_len + updated_mid.len() + suffix_len);
+    seg_result.extend_from_slice(&editable_existing[..prefix_len]);
+    seg_result.extend(updated_mid);
+    seg_result.extend_from_slice(&editable_existing[old_mid_end..]);
+    Ok(seg_result)
+}
+
+async fn diff_sync_with_existing(
+    client: &NotionClient,
+    page_id: &str,
+    existing: Vec<NotionBlock>,
+    edited_markdown: &str,
+) -> Result<Vec<NotionBlock>> {
+    let cleaned_existing: Vec<NotionBlock> = existing
+        .into_iter()
+        .filter(|blk| is_preserved_anchor_block(blk) || !blk.id.trim().is_empty())
+        .collect();
+
+    let new_payloads = markdown_to_notion_blocks(edited_markdown);
+    let new_parsed: Vec<NotionBlock> = new_payloads
+        .iter()
+        .map(|val| parse_notion_block(val, page_id, None))
+        .collect();
+
+    let (old_segments, anchors, new_ranges) =
+        partition_blocks_around_anchors(&cleaned_existing, &new_parsed);
+
     let mut final_blocks: Vec<NotionBlock> =
-        Vec::with_capacity(prefix_len + updated_mid.len() + suffix_len + preserved_children.len());
-    final_blocks.extend_from_slice(&editable_existing[..prefix_len]);
-    final_blocks.extend(updated_mid);
-    final_blocks.extend_from_slice(&editable_existing[old_mid_end..]);
-    final_blocks.extend(preserved_children);
+        Vec::with_capacity(new_parsed.len() + anchors.len());
+    let mut prev_anchor_id: Option<String> = None;
+
+    for (seg_idx, (old_seg, range)) in old_segments
+        .into_iter()
+        .zip(new_ranges.into_iter())
+        .enumerate()
+    {
+        let has_following_anchors = seg_idx < anchors.len();
+        let seg_result = diff_sync_editable_segment(
+            client,
+            page_id,
+            &old_seg,
+            &new_payloads[range.clone()],
+            &new_parsed[range],
+            prev_anchor_id.as_deref(),
+            has_following_anchors,
+        )
+        .await?;
+        final_blocks.extend(seg_result);
+
+        if let Some(anchor) = anchors.get(seg_idx) {
+            if !anchor.id.trim().is_empty() {
+                prev_anchor_id = Some(anchor.id.clone());
+            }
+            final_blocks.push(anchor.clone());
+        }
+    }
+
+    Ok(final_blocks)
+}
+
+/// Replaces the editable content blocks of a Notion page with blocks parsed from `edited_markdown`
+/// using fast diff-based sync (preserving hosted media, child pages, child databases, and structural
+/// blocks in place, skipping untouched prefix/suffix blocks, patching same-type edits concurrently,
+/// and reconstructing the updated `NotionPageDetail` + SQLite cache without slow full-tree re-fetches).
+pub async fn op_replace_page_markdown(
+    client: &NotionClient,
+    storage: &Storage,
+    page: &str,
+    edited_markdown: &str,
+) -> Result<NotionPageDetail> {
+    op_diff_sync_page_markdown(client, storage, page, edited_markdown, None).await
+}
+
+/// Smart diff-based Markdown -> Notion block sync.
+///
+/// When `known_existing` contains the page's current top-level blocks with real Notion IDs,
+/// skips the initial `GET /v1/blocks/{id}/children` roundtrip. If a stale/archived block ID
+/// causes a 404/archived API error, automatically refetches top-level children once and retries.
+pub async fn op_diff_sync_page_markdown(
+    client: &NotionClient,
+    storage: &Storage,
+    page: &str,
+    edited_markdown: &str,
+    known_existing: Option<Vec<NotionBlock>>,
+) -> Result<NotionPageDetail> {
+    let ws_id = client.auth().active_workspace_id().await;
+    let id = resolver::resolve_page_id(storage, Some(client), &ws_id, page).await?;
+
+    let used_known = known_existing
+        .as_ref()
+        .is_some_and(|blocks| has_real_remote_ids(blocks));
+    let existing = match known_existing {
+        Some(blocks) if has_real_remote_ids(&blocks) => blocks,
+        _ => client.list_block_children(&id, &id, None).await?,
+    };
+
+    let mut final_blocks = match diff_sync_with_existing(client, &id, existing, edited_markdown).await {
+        Ok(blocks) => blocks,
+        Err(err) if used_known && is_stale_block_error(&err) => {
+            let fresh = client.list_block_children(&id, &id, None).await?;
+            diff_sync_with_existing(client, &id, fresh, edited_markdown).await?
+        }
+        Err(err) => return Err(err),
+    };
 
     // Only fetch children for blocks that actually report nested children not already in memory.
     for blk in &mut final_blocks {

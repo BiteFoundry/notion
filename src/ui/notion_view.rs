@@ -522,34 +522,43 @@ fn draw_inline_page_editor(
         bar_rect,
     );
 
-    let (status_text, status_kind) = ed.sync_status();
-    let status_fg = match status_kind {
-        InlineSyncStatus::Synced => theme.success,
-        InlineSyncStatus::Syncing => theme.accent_soft,
-        InlineSyncStatus::Edited => theme.warning,
-        InlineSyncStatus::Error => theme.error,
+    let (raw_status_text, status_kind) = ed.sync_status();
+    let status_text = if ed.confirm_discard {
+        "⚠ Unsaved — Ctrl+S Save · Esc again Discard"
+    } else {
+        raw_status_text
+    };
+    let status_fg = if ed.confirm_discard {
+        theme.warning
+    } else {
+        match status_kind {
+            InlineSyncStatus::Synced => theme.success,
+            InlineSyncStatus::Syncing => theme.accent_soft,
+            InlineSyncStatus::Edited => theme.warning,
+            InlineSyncStatus::Error => theme.error,
+        }
     };
 
     let (ln, col) = ed.cursor_line_col();
-    let done_pill = "[✓ Done]";
     let save_pill = "[Ctrl+S Save]";
+    let done_pill = "[✓ Done]";
     let ext_pill = "[Ext $EDITOR]";
     let pos_text = format!("Ln {ln}, Col {col}");
 
     let mut right_items: Vec<(String, Option<ButtonId>, Style)> = vec![
         (
-            done_pill.to_string(),
-            Some(ButtonId::FinishInlineEdit),
-            Style::default()
-                .fg(theme.success)
-                .bg(bar_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        (
             save_pill.to_string(),
             Some(ButtonId::SaveInlineEdit),
             Style::default()
                 .fg(theme.accent_soft)
+                .bg(bar_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        (
+            done_pill.to_string(),
+            Some(ButtonId::FinishInlineEdit),
+            Style::default()
+                .fg(theme.success)
                 .bg(bar_bg)
                 .add_modifier(Modifier::BOLD),
         ),

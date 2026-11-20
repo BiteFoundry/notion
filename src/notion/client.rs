@@ -404,6 +404,15 @@ impl NotionClient {
         Ok(parse_notion_block(&val, page_id, None))
     }
 
+    /// `GET /v1/blocks/{block_id}` returning the block's raw `(parent_type, parent_id)`.
+    pub async fn get_block_parent_raw(&self, block_id: &str) -> Result<(String, Option<String>)> {
+        let id = normalize_notion_id(block_id);
+        let val = self
+            .request_json(Method::GET, &format!("/blocks/{id}"), None)
+            .await?;
+        Ok(crate::parser::parse_parent(val.get("parent")))
+    }
+
     /// `GET /v1/blocks/{block_id}/children` (single level, full pagination)
     pub async fn list_block_children(
         &self,

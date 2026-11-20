@@ -1080,9 +1080,6 @@ pub async fn run(
                 if ui.toasts.len() != before {
                     dirty = true;
                 }
-                if app.tick_inline_autosync(&mut ui, now) {
-                    dirty = true;
-                }
                 if ui.poll_retrying
                     || app.syncing
                     || ui.tasks.first_running().is_some()

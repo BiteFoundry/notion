@@ -2,10 +2,7 @@
 //! sidebar tree builder, visible block flattener (with live toggle expansion),
 //! and database Table / Board (Kanban) / List query helpers.
 
-use std::{
-    collections::{HashMap, HashSet},
-    time::{Duration, Instant},
-};
+use std::collections::{HashMap, HashSet};
 
 use bitefoundry_html::NativeHtmlServer;
 use ratatui::layout::Rect;
@@ -37,9 +34,6 @@ use crate::{
     },
 };
 
-/// Real-time auto-save debounce interval for in-place inline page editing.
-pub const INLINE_AUTOSYNC_DEBOUNCE: Duration = Duration::from_millis(600);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InlineSyncStatus {
     Synced,
@@ -61,10 +55,11 @@ pub struct InlinePageEditor {
     pub last_visual_lines: Vec<(usize, usize)>,
     pub edit_generation: u64,
     pub synced_generation: u64,
-    pub dirty_since: Option<Instant>,
     pub sync_in_flight: bool,
     pub last_sync_error: Option<String>,
     pub last_synced_markdown: String,
+    pub last_synced_detail: Option<NotionPageDetail>,
+    pub confirm_discard: bool,
     pub remote_blocks: Vec<NotionBlock>,
 }
 
@@ -79,6 +74,7 @@ impl InlinePageEditor {
         synced_generation: u64,
         sync_in_flight: bool,
         remote_blocks: Vec<NotionBlock>,
+        last_synced_detail: Option<NotionPageDetail>,
     ) -> Self {
         let initial_markdown = normalize(markdown);
         let mut composer = MultiLineComposer::new();
@@ -94,10 +90,11 @@ impl InlinePageEditor {
             last_visual_lines: Vec::new(),
             edit_generation,
             synced_generation,
-            dirty_since: None,
             sync_in_flight,
             last_sync_error: None,
             last_synced_markdown: initial_markdown,
+            last_synced_detail,
+            confirm_discard: false,
             remote_blocks,
         }
     }
@@ -107,19 +104,18 @@ impl InlinePageEditor {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.edit_generation > self.synced_generation
-            || self.composer.text() != self.last_synced_markdown
+        self.composer.text() != self.last_synced_markdown
     }
 
     pub fn sync_status(&self) -> (&'static str, InlineSyncStatus) {
         if self.last_sync_error.is_some() {
-            ("⚠ Sync error", InlineSyncStatus::Error)
+            ("⚠ Save failed", InlineSyncStatus::Error)
         } else if self.sync_in_flight {
-            ("● Syncing...", InlineSyncStatus::Syncing)
-        } else if self.edit_generation > self.synced_generation {
-            ("● Edited", InlineSyncStatus::Edited)
+            ("● Saving...", InlineSyncStatus::Syncing)
+        } else if self.is_dirty() {
+            ("● Unsaved", InlineSyncStatus::Edited)
         } else {
-            ("✓ Synced", InlineSyncStatus::Synced)
+            ("✓ Saved", InlineSyncStatus::Synced)
         }
     }
 
@@ -240,6 +236,7 @@ pub enum UiMsg {
     PageEdited {
         page_id: String,
         generation: u64,
+        synced_markdown: String,
         detail: Box<NotionPageDetail>,
     },
     PageEditFailed {
@@ -441,6 +438,8 @@ pub struct AppState {
     pub current_user: Option<NotionUser>,
     pub pages: Vec<NotionPage>,
     pub databases: Vec<NotionDatabase>,
+    pub block_owner_pages: HashMap<String, String>,
+    pub child_page_positions: HashMap<String, i64>,
     pub active_view: CanvasView,
     pub active_page_id: Option<String>,
     pub active_page_detail: Option<NotionPageDetail>,
@@ -483,6 +482,8 @@ impl AppState {
             current_user: None,
             pages: Vec::new(),
             databases: Vec::new(),
+            block_owner_pages: HashMap::new(),
+            child_page_positions: HashMap::new(),
             active_view: CanvasView::Page,
             active_page_id: None,
             active_page_detail: None,
@@ -497,6 +498,13 @@ impl AppState {
         }
     }
 
+    pub fn reload_page_parent_hints(&mut self) {
+        if let Ok((owners, positions)) = self.storage.load_page_parent_hints(&self.workspace_id) {
+            self.block_owner_pages = owners;
+            self.child_page_positions = positions;
+        }
+    }
+
     pub fn load_cached_initial(&mut self) {
         if let Ok(pages) = self.storage.list_pages(&self.workspace_id, true) {
             self.pages = pages;
@@ -504,6 +512,7 @@ impl AppState {
         if let Ok(dbs) = self.storage.list_databases(&self.workspace_id) {
             self.databases = dbs;
         }
+        self.reload_page_parent_hints();
         if self.active_page_id.is_none() && self.active_database_id.is_none() {
             if let Some(first_page) = self.pages.iter().find(|p| !p.archived).cloned() {
                 self.active_view = CanvasView::Page;
@@ -620,6 +629,8 @@ impl AppState {
             Vec::new()
         };
 
+        let last_synced_detail = Some(detail.clone());
+
         ui.inline_editor = Some(InlinePageEditor::new(
             page_id,
             page_title,
@@ -629,21 +640,22 @@ impl AppState {
             synced_gen,
             in_flight,
             remote_blocks,
+            last_synced_detail,
         ));
         ui.focus = Focus::Canvas;
         ui.narrow_pane = NarrowPane::Canvas;
         true
     }
 
-    /// Records a text mutation on the active inline editor: bumps `edit_generation`,
-    /// arms the 600ms auto-sync debounce timer, and reflects edits into `active_page_detail` in 0ms.
+    /// Records a local text mutation on the active inline editor: resets discard confirmation,
+    /// bumps `edit_generation`, and reflects edits into `active_page_detail` in 0ms (0 API calls).
     pub fn record_inline_mutation(&mut self, ui: &mut UiState, persist_sqlite: bool) {
         let Some(ed) = ui.inline_editor.as_mut() else {
             return;
         };
         ed.edit_generation = ed.edit_generation.saturating_add(1);
-        ed.dirty_since = Some(Instant::now());
         ed.last_sync_error = None;
+        ed.confirm_discard = false;
         let page_id = ed.page_id.clone();
         let gen = ed.edit_generation;
         let snapshot = ed.composer.text().to_string();
@@ -675,79 +687,101 @@ impl AppState {
         }
     }
 
-    /// TUI tick hook: when `dirty_since` has elapsed `>= 600ms` and no sync is in flight,
-    /// automatically dispatches a coalesced diff-sync for the current inline editor buffer.
-    pub fn tick_inline_autosync(&mut self, ui: &mut UiState, now: Instant) -> bool {
-        let should_flush = ui.inline_editor.as_ref().is_some_and(|ed| {
-            !ed.sync_in_flight
-                && ed.edit_generation > ed.synced_generation
-                && ed
-                    .dirty_since
-                    .is_some_and(|since| now.saturating_duration_since(since) >= INLINE_AUTOSYNC_DEBOUNCE)
-        });
-        if should_flush {
-            return self.flush_inline_editor_sync(ui, false);
-        }
-        false
-    }
-
-    /// Immediately reflects the inline editor buffer locally + in SQLite and dispatches a
-    /// background diff-sync (or queues a coalesced follow-up if a sync is already in flight).
+    /// Explicitly reflects the inline editor buffer locally + in SQLite and dispatches a
+    /// background diff-sync to Notion (or queues a coalesced follow-up if a save is already in flight).
     pub fn flush_inline_editor_sync(&mut self, ui: &mut UiState, queue_if_in_flight: bool) -> bool {
         let Some(ed) = ui.inline_editor.as_mut() else {
             return false;
         };
+        ed.confirm_discard = false;
         let page_id = ed.page_id.clone();
         let snapshot = ed.composer.text().to_string();
-        let dirty = ed.edit_generation > ed.synced_generation
-            || snapshot.trim() != ed.last_synced_markdown.trim();
+        let dirty = snapshot != ed.last_synced_markdown;
 
-        if dirty && ed.edit_generation <= ed.synced_generation {
-            ed.edit_generation = ed.synced_generation.saturating_add(1);
-            ui.page_edit_generations
-                .insert(page_id.clone(), ed.edit_generation);
+        if !dirty {
+            return false;
         }
-        let gen = ed.edit_generation;
+
+        let next_gen = ed
+            .edit_generation
+            .max(ed.synced_generation)
+            .max(ui.page_edit_generations.get(&page_id).copied().unwrap_or(0))
+            .saturating_add(1);
+        ed.edit_generation = next_gen;
+        ui.page_edit_generations.insert(page_id.clone(), next_gen);
+
         let in_flight = ed.sync_in_flight || ui.page_sync_in_flight.contains(&page_id);
         let remote_blocks = ed.remote_blocks.clone();
 
-        // Always update local detail & SQLite cache right away (0ms).
-        if dirty {
-            self.apply_optimistic_local(&page_id, &snapshot, true);
-        }
-
-        if !dirty {
-            if let Some(ed) = ui.inline_editor.as_mut() {
-                ed.dirty_since = None;
-            }
-            return false;
-        }
+        // Update local detail & SQLite cache immediately on explicit save.
+        self.apply_optimistic_local(&page_id, &snapshot, true);
 
         if in_flight {
             if queue_if_in_flight {
                 ui.pending_page_sync
-                    .insert(page_id, (gen, snapshot, remote_blocks));
-                if let Some(ed) = ui.inline_editor.as_mut() {
-                    ed.dirty_since = None;
-                }
+                    .insert(page_id, (next_gen, snapshot, remote_blocks));
             }
             return false;
         }
 
         if let Some(ed) = ui.inline_editor.as_mut() {
             ed.sync_in_flight = true;
-            ed.dirty_since = None;
             ed.last_sync_error = None;
         }
         ui.page_sync_in_flight.insert(page_id.clone());
         ui.pending_page_sync.remove(&page_id);
 
         let known = (!remote_blocks.is_empty()).then_some(remote_blocks);
-        self.spawn_page_diff_sync(ui, page_id, gen, snapshot, known);
+        self.spawn_page_diff_sync(ui, page_id, next_gen, snapshot, known);
         true
     }
 
-    /// Exits inline edit mode cleanly, flushing any unsynced edits immediately while
+    /// Handles `Esc` inside the inline editor without firing unwanted Notion API syncs:
+    /// - Clean buffer: exits immediately to rendered Canvas at `ed.scroll_y`.
+    /// - Dirty buffer (1st `Esc`): arms `confirm_discard` and warns user (`Ctrl+S Save · Esc again Discard`).
+    /// - Dirty buffer (2nd `Esc`): discards unsaved edits, restores `active_page_detail` from
+    ///   `last_synced_detail`, and exits cleanly with 0 API calls.
+    pub fn handle_inline_editor_escape(&mut self, ui: &mut UiState) {
+        let Some(ed) = ui.inline_editor.as_mut() else {
+            return;
+        };
+        if !ed.is_dirty() {
+            let scroll = ed.scroll_y;
+            ui.inline_editor = None;
+            ui.canvas_scroll = scroll;
+            ui.canvas_follow_selected = false;
+            ui.cursor_pos = None;
+            return;
+        }
+        if !ed.confirm_discard {
+            ed.confirm_discard = true;
+            ui.warning("Unsaved changes — Ctrl+S Save · Esc again Discard");
+            return;
+        }
+        self.discard_inline_editor(ui);
+    }
+
+    /// Discards unsaved inline edits, restores `active_page_detail` to `last_synced_detail`,
+    /// and exits inline edit mode without calling Notion API.
+    pub fn discard_inline_editor(&mut self, ui: &mut UiState) {
+        let Some(ed) = ui.inline_editor.take() else {
+            return;
+        };
+        if let Some(saved_detail) = ed.last_synced_detail {
+            if self.active_page_id.as_deref() == Some(ed.page_id.as_str()) {
+                if let Some(p) = self.pages.iter_mut().find(|p| p.id == ed.page_id) {
+                    p.plain_text = saved_detail.page.plain_text.clone();
+                }
+                self.active_page_detail = Some(saved_detail);
+            }
+        }
+        ui.canvas_scroll = ed.scroll_y;
+        ui.canvas_follow_selected = false;
+        ui.cursor_pos = None;
+        ui.info("Discarded unsaved changes");
+    }
+
+    /// Exits inline edit mode cleanly, saving any unsynced edits immediately while
     /// preserving the user's current Canvas scroll position.
     pub fn close_inline_editor_and_flush(&mut self, ui: &mut UiState) {
         if ui.inline_editor.is_none() {
@@ -835,6 +869,7 @@ impl AppState {
                     let _ = ui_tx.send(UiMsg::PageEdited {
                         page_id,
                         generation,
+                        synced_markdown: edited_markdown,
                         detail: Box::new(detail),
                     });
                 }
@@ -915,6 +950,7 @@ impl AppState {
                 self.workspace_id = workspace_id;
                 self.pages = pages;
                 self.databases = databases;
+                self.reload_page_parent_hints();
                 if self.active_page_id.is_none() && self.active_database_id.is_none() {
                     if let Some(first) = self.pages.iter().find(|p| !p.archived).cloned() {
                         self.open_page(&first.id, ui, false);
@@ -924,6 +960,7 @@ impl AppState {
                 }
             }
             CoreEvent::PageDetailUpdated(detail) => {
+                self.reload_page_parent_hints();
                 let editing_or_syncing = ui
                     .inline_editor
                     .as_ref()
@@ -988,11 +1025,13 @@ impl AppState {
                 ui.tasks.finish("append", None);
                 ui.tasks.finish("todo", None);
                 self.active_page_detail = Some(*detail);
+                self.reload_page_parent_hints();
                 ui.success("Synced page");
             }
             UiMsg::PageEdited {
                 page_id,
                 generation,
+                synced_markdown,
                 detail,
             } => {
                 ui.tasks.finish("edit", None);
@@ -1017,45 +1056,56 @@ impl AppState {
                     }
                 }
 
+                let mut synced_detail = *detail;
+                synced_detail.markdown = synced_markdown.clone();
+
                 let active_inline_matches = ui
                     .inline_editor
                     .as_ref()
                     .is_some_and(|ed| ed.page_id == page_id);
 
                 if active_inline_matches {
-                    let mut needs_followup = false;
-                    let mut latest_md = String::new();
+                    let mut still_dirty = false;
                     if let Some(ed) = ui.inline_editor.as_mut() {
-                        ed.remote_blocks = detail.blocks.clone();
-                        ed.synced_generation = ed.synced_generation.max(generation);
                         ed.sync_in_flight = false;
                         ed.last_sync_error = None;
-                        if generation < ed.edit_generation || generation < current_gen {
-                            // User typed newer content while HTTP was in flight:
-                            // DO NOT overwrite local editor or optimistic detail buffer!
-                            needs_followup = true;
-                        } else {
-                            latest_md = ed.composer.text().to_string();
-                            ed.last_synced_markdown = latest_md.clone();
+                        if generation >= ed.synced_generation {
+                            ed.synced_generation = generation;
+                            ed.remote_blocks = synced_detail.blocks.clone();
+                            ed.last_synced_markdown = synced_markdown.clone();
+                            ed.last_synced_detail = Some(synced_detail.clone());
                         }
+                        still_dirty = ed.is_dirty();
                     }
 
-                    if needs_followup {
-                        let _ = self.flush_inline_editor_sync(ui, false);
-                    } else if self.active_page_id.as_deref() == Some(page_id.as_str()) {
-                        // Silently update stored block IDs & metadata without disrupting
-                        // the user's inline editor text, cursor, or scroll position.
-                        let mut updated = *detail;
-                        updated.markdown = latest_md;
-                        self.active_page_detail = Some(updated);
-                    }
-                } else if generation < current_gen {
-                    // Editor was closed or switched while older sync was in flight;
-                    // DO NOT overwrite newer optimistic buffer. Run coalesced follow-up if queued.
+                    // Only launch a follow-up sync if an explicit save was queued while in flight.
                     if let Some((pending_gen, pending_md, _)) = ui.pending_page_sync.remove(&page_id)
                     {
                         if pending_gen > generation {
-                            let known = (!detail.blocks.is_empty()).then_some(detail.blocks);
+                            let known = (!synced_detail.blocks.is_empty())
+                                .then_some(synced_detail.blocks);
+                            if let Some(ed) = ui.inline_editor.as_mut() {
+                                ed.sync_in_flight = true;
+                            }
+                            ui.page_sync_in_flight.insert(page_id.clone());
+                            self.spawn_page_diff_sync(ui, page_id, pending_gen, pending_md, known);
+                        }
+                    } else if !still_dirty {
+                        if self.active_page_id.as_deref() == Some(page_id.as_str()) {
+                            self.active_page_detail = Some(synced_detail);
+                        }
+                        ui.success("Saved to Notion");
+                    } else {
+                        // User typed newer unsaved edits while explicit save was in flight:
+                        // DO NOT overwrite local editor or optimistic detail, and do NOT auto-sync!
+                        ui.success("Saved to Notion");
+                    }
+                } else if generation < current_gen {
+                    if let Some((pending_gen, pending_md, _)) = ui.pending_page_sync.remove(&page_id)
+                    {
+                        if pending_gen > generation {
+                            let known = (!synced_detail.blocks.is_empty())
+                                .then_some(synced_detail.blocks);
                             ui.page_sync_in_flight.insert(page_id.clone());
                             self.spawn_page_diff_sync(ui, page_id, pending_gen, pending_md, known);
                         }
@@ -1063,9 +1113,9 @@ impl AppState {
                 } else {
                     ui.pending_page_sync.remove(&page_id);
                     if self.active_page_id.as_deref() == Some(page_id.as_str()) {
-                        self.active_page_detail = Some(*detail);
+                        self.active_page_detail = Some(synced_detail);
                     }
-                    ui.success("Saved changes to Notion");
+                    ui.success("Saved to Notion");
                 }
             }
             UiMsg::PageEditFailed {
@@ -1176,6 +1226,8 @@ impl AppState {
                 ui.cursor_pos = None;
                 self.active_database_id = None;
                 self.active_database_rows.clear();
+                self.block_owner_pages.clear();
+                self.child_page_positions.clear();
                 self.nav_stack.clear();
                 self.load_cached_initial();
                 self.sync_ctrl.request(SyncCommand::RefreshAll);
@@ -1296,36 +1348,110 @@ impl AppState {
         });
 
         let page_ids: HashSet<&str> = active_pages.iter().map(|p| p.id.as_str()).collect();
-        let db_ids: HashSet<&str> = self.databases.iter().map(|d| d.id.as_str()).collect();
+        let mut effective_parent: HashMap<&str, &str> = HashMap::new();
+        for p in &active_pages {
+            if p.parent_type == "database_id" {
+                continue;
+            }
+            let parent_page_id: Option<&str> = if p.parent_type == "page_id" {
+                p.parent_id.as_deref()
+            } else if p.parent_type == "block_id" {
+                p.parent_id
+                    .as_deref()
+                    .and_then(|bid| self.block_owner_pages.get(bid).map(String::as_str))
+                    .or_else(|| self.block_owner_pages.get(&p.id).map(String::as_str))
+            } else {
+                None
+            };
+            if let Some(pid) = parent_page_id {
+                if pid != p.id.as_str() && page_ids.contains(pid) {
+                    effective_parent.insert(p.id.as_str(), pid);
+                }
+            }
+        }
+
+        // Break any cycles in parent links by detaching cycle members to roots.
+        let mut cycle_nodes: HashSet<&str> = HashSet::new();
+        for &start in effective_parent.keys() {
+            let mut seen = HashSet::new();
+            let mut cur = start;
+            while let Some(&next) = effective_parent.get(cur) {
+                if !seen.insert(cur) {
+                    cycle_nodes.insert(start);
+                    break;
+                }
+                cur = next;
+            }
+        }
+
         let mut children_by_parent: HashMap<String, Vec<&NotionPage>> = HashMap::new();
         let mut roots: Vec<&NotionPage> = Vec::new();
         for p in &active_pages {
-            // Skip database rows in the top-level page tree (they live inside their database)
-            if p.parent_type == "database_id"
-                && p.parent_id
-                    .as_deref()
-                    .is_some_and(|pid| db_ids.contains(pid))
-            {
+            // Never dump database rows as top-level WORKSPACE pages (even if DB wasn't synced yet).
+            if p.parent_type == "database_id" {
                 continue;
             }
-            if p.parent_type == "page_id" {
-                if let Some(ref pid) = p.parent_id {
-                    if page_ids.contains(pid.as_str()) {
-                        children_by_parent.entry(pid.clone()).or_default().push(p);
-                        continue;
-                    }
+            if !cycle_nodes.contains(p.id.as_str()) {
+                if let Some(&pid) = effective_parent.get(p.id.as_str()) {
+                    children_by_parent
+                        .entry(pid.to_string())
+                        .or_default()
+                        .push(p);
+                    continue;
                 }
             }
             roots.push(p);
         }
 
-        fn push_tree(
-            node: &NotionPage,
+        let is_untitled = |p: &NotionPage| -> bool {
+            let t = p.display_title().trim();
+            t.is_empty() || t.eq_ignore_ascii_case("untitled")
+        };
+
+        for kids in children_by_parent.values_mut() {
+            kids.sort_by(|a, b| {
+                let pos_a = self
+                    .child_page_positions
+                    .get(&a.id)
+                    .copied()
+                    .unwrap_or(i64::MAX);
+                let pos_b = self
+                    .child_page_positions
+                    .get(&b.id)
+                    .copied()
+                    .unwrap_or(i64::MAX);
+                pos_a
+                    .cmp(&pos_b)
+                    .then_with(|| is_untitled(a).cmp(&is_untitled(b)))
+                    .then_with(|| {
+                        natural_sort_key(a.display_title())
+                            .cmp(&natural_sort_key(b.display_title()))
+                    })
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        }
+
+        roots.sort_by(|a, b| {
+            is_untitled(a)
+                .cmp(&is_untitled(b))
+                .then_with(|| b.is_favorite.cmp(&a.is_favorite))
+                .then_with(|| {
+                    natural_sort_key(a.display_title()).cmp(&natural_sort_key(b.display_title()))
+                })
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        fn push_tree<'a>(
+            node: &'a NotionPage,
             depth: usize,
-            children_map: &HashMap<String, Vec<&NotionPage>>,
+            children_map: &HashMap<String, Vec<&'a NotionPage>>,
             collapsed: &HashSet<String>,
+            visited: &mut HashSet<&'a str>,
             out: &mut Vec<SidebarItem>,
         ) {
+            if !visited.insert(node.id.as_str()) {
+                return;
+            }
             let has_kids = children_map
                 .get(&node.id)
                 .is_some_and(|kids| !kids.is_empty());
@@ -1345,14 +1471,23 @@ impl AppState {
             if has_kids && !is_collapsed && depth < 5 {
                 if let Some(kids) = children_map.get(&node.id) {
                     for kid in kids {
-                        push_tree(kid, depth + 1, children_map, collapsed, out);
+                        push_tree(kid, depth + 1, children_map, collapsed, visited, out);
                     }
                 }
             }
+            visited.remove(node.id.as_str());
         }
 
+        let mut visited = HashSet::new();
         for root in roots {
-            push_tree(root, 0, &children_by_parent, &ui.collapsed_nodes, &mut items);
+            push_tree(
+                root,
+                0,
+                &children_by_parent,
+                &ui.collapsed_nodes,
+                &mut visited,
+                &mut items,
+            );
         }
 
         // 3. Databases quick section
@@ -1556,6 +1691,46 @@ impl AppState {
         }
         crumbs
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum NatSortChunk {
+    Text(String),
+    Num(u128, usize),
+}
+
+fn natural_sort_key(s: &str) -> Vec<NatSortChunk> {
+    let mut chunks = Vec::new();
+    let mut chars = s.trim().chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        if ch.is_ascii_digit() {
+            let mut num = 0u128;
+            let mut len = 0usize;
+            while let Some(&d) = chars.peek() {
+                if let Some(digit) = d.to_digit(10) {
+                    num = num.saturating_mul(10).saturating_add(digit as u128);
+                    len += 1;
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            chunks.push(NatSortChunk::Num(num, len));
+        } else {
+            let mut text = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    break;
+                }
+                for lc in c.to_lowercase() {
+                    text.push(lc);
+                }
+                chars.next();
+            }
+            chunks.push(NatSortChunk::Text(text));
+        }
+    }
+    chunks
 }
 
 fn flatten_visible_blocks(

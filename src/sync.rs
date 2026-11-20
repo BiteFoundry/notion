@@ -135,13 +135,95 @@ where
 
     let st_read = storage.clone();
     let ws_read = workspace_id.clone();
-    let (pages, databases) = tokio::task::spawn_blocking(move || -> Result<_> {
-        Ok((
-            st_read.list_pages(&ws_read, true)?,
-            st_read.list_databases(&ws_read)?,
-        ))
+    let (pages, databases, existing_owners) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let pages = st_read.list_pages(&ws_read, true)?;
+        let databases = st_read.list_databases(&ws_read)?;
+        let (owners, _) = st_read
+            .load_page_parent_hints(&ws_read)
+            .unwrap_or_default();
+        Ok((pages, databases, owners))
     })
     .await??;
+
+    // Resolve `parent_type == "block_id"` container blocks up to their owning page (capped at 25/sync)
+    // so sub-pages nested inside toggleable headings/toggles/columns appear under their parent page.
+    let mut unresolved_blocks: Vec<String> = Vec::new();
+    let mut seen_blocks = std::collections::HashSet::new();
+    for p in &pages {
+        if p.archived || p.parent_type != "block_id" {
+            continue;
+        }
+        if existing_owners.contains_key(&p.id) {
+            continue;
+        }
+        if let Some(ref bid) = p.parent_id {
+            if !bid.trim().is_empty()
+                && !existing_owners.contains_key(bid)
+                && seen_blocks.insert(bid.clone())
+            {
+                unresolved_blocks.push(bid.clone());
+                if unresolved_blocks.len() >= 25 {
+                    break;
+                }
+            }
+        }
+    }
+
+    if !unresolved_blocks.is_empty() {
+        let mut resolved_map = existing_owners;
+        let mut newly_resolved: Vec<(String, String)> = Vec::new();
+
+        for orig_bid in unresolved_blocks {
+            if resolved_map.contains_key(&orig_bid) {
+                continue;
+            }
+            let mut cur_id = orig_bid.clone();
+            let mut visited_hops: Vec<String> = vec![cur_id.clone()];
+            let mut found_owner: Option<String> = None;
+
+            for _ in 0..6 {
+                let Ok((ptype, pid)) = client.get_block_parent_raw(&cur_id).await else {
+                    break;
+                };
+                match (ptype.as_str(), pid) {
+                    ("page_id", Some(owner_page_id)) if !owner_page_id.trim().is_empty() => {
+                        found_owner = Some(owner_page_id);
+                        break;
+                    }
+                    ("block_id", Some(next_bid))
+                        if !next_bid.trim().is_empty()
+                            && !visited_hops.iter().any(|h| h == &next_bid) =>
+                    {
+                        if let Some(cached_owner) = resolved_map.get(&next_bid).cloned() {
+                            found_owner = Some(cached_owner);
+                            break;
+                        }
+                        visited_hops.push(next_bid.clone());
+                        cur_id = next_bid;
+                    }
+                    _ => break,
+                }
+            }
+
+            if let Some(owner_page_id) = found_owner {
+                for hop_id in visited_hops {
+                    if !resolved_map.contains_key(&hop_id) {
+                        resolved_map.insert(hop_id.clone(), owner_page_id.clone());
+                        newly_resolved.push((hop_id, owner_page_id.clone()));
+                    }
+                }
+            }
+        }
+
+        if !newly_resolved.is_empty() {
+            let st_owners = storage.clone();
+            let ws_owners = workspace_id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                st_owners.upsert_block_owners(&ws_owners, &newly_resolved)
+            })
+            .await;
+        }
+    }
 
     Ok((workspace_id, pages, databases))
 }

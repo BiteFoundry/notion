@@ -101,7 +101,7 @@ pub fn key_to_action(
             return None;
         }
         return match key.code {
-            KeyCode::Esc => Some(Action::FinishInlineEdit),
+            KeyCode::Esc => Some(Action::CancelInlineEdit),
             KeyCode::Enter => Some(Action::Newline),
             KeyCode::Tab => Some(Action::Tab),
             KeyCode::Backspace => Some(Action::Backspace),

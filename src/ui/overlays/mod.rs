@@ -356,7 +356,7 @@ impl HelpOverlay {
             Line::from("  Space / x             Toggle to-do checkbox or expand/collapse toggle"),
             Line::from("  Enter                 Expand toggle, open child page/DB, or open DB card"),
             Line::from("  a                     Slash Quick Append (/h1, /h2, /todo, /callout, /code)"),
-            Line::from("  e / Ctrl+E / n / f    Edit Page · External $EDITOR · New Child Page · Favorite ★"),
+            Line::from("  e / Ctrl+E / n / f    Edit Page (Ctrl+S Save, Esc Done/Discard) · $EDITOR · New · Fav ★"),
             Line::from("  C / u / h             Comments Drawer · Link Extractor · Toggle [href]"),
             Line::from("  v / Alt+V / A         HD Image Preview · Media & Files tray"),
             Line::from(""),

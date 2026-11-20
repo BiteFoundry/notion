@@ -79,6 +79,7 @@ pub enum Action {
     OpenQuickAppend,
     OpenPageEditor,
     FinishInlineEdit,
+    CancelInlineEdit,
     SaveInlineEdit,
     OpenNewPageModal,
     OpenDbFilter,
@@ -933,7 +934,13 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::FinishInlineEdit => {
             app.close_inline_editor_and_flush(ui);
         }
+        Action::CancelInlineEdit => {
+            app.handle_inline_editor_escape(ui);
+        }
         Action::SaveInlineEdit => {
+            if let Some(ed) = ui.inline_editor.as_mut() {
+                ed.confirm_discard = false;
+            }
             if ui.inline_editor.is_some() {
                 let dispatched = app.flush_inline_editor_sync(ui, true);
                 if !dispatched
@@ -942,7 +949,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         .as_ref()
                         .is_some_and(|ed| ed.sync_in_flight)
                 {
-                    ui.info("Already synced");
+                    ui.info("No changes to save");
                 }
             }
         }
@@ -1868,8 +1875,8 @@ fn handle_inline_editor_action(action: &Action, app: &mut AppState, ui: &mut UiS
             }
             true
         }
-        Action::CloseOverlay => {
-            app.close_inline_editor_and_flush(ui);
+        Action::CloseOverlay | Action::CancelInlineEdit => {
+            app.handle_inline_editor_escape(ui);
             true
         }
         _ => false,
@@ -3515,7 +3522,7 @@ mod tests {
         assert!(ui.inline_editor.is_some(), "'e' must open inline Canvas editor");
         assert!(ui.overlays.is_empty(), "inline editor must NOT open a popup overlay");
 
-        // Pressing Esc exits inline editor cleanly
+        // Pressing Esc when clean exits inline editor cleanly
         let act_esc = crate::ui::event::key_to_action(
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             ui.focus(),
@@ -3525,7 +3532,7 @@ mod tests {
             ui.db_view_mode,
         )
         .unwrap();
-        assert_eq!(act_esc, Action::FinishInlineEdit);
+        assert_eq!(act_esc, Action::CancelInlineEdit);
         dispatch(act_esc, &mut app, &mut ui);
         assert!(ui.inline_editor.is_none());
 
@@ -3677,15 +3684,16 @@ mod tests {
             .await
             .expect("timed out waiting for PageEdited")
             .expect("ui_rx closed");
+        let expected_gen = ui.inline_editor.as_ref().unwrap().edit_generation;
         assert!(
-            matches!(msg, UiMsg::PageEdited { generation, .. } if generation == ed_gen),
+            matches!(msg, UiMsg::PageEdited { generation, .. } if generation == expected_gen),
             "expected UiMsg::PageEdited with matching generation"
         );
         app.handle_ui_msg(&mut ui, msg);
         assert!(!ui.inline_editor.as_ref().unwrap().sync_in_flight);
         assert_eq!(
             ui.inline_editor.as_ref().unwrap().sync_status().0,
-            "✓ Synced"
+            "✓ Saved"
         );
         // Unchanged first paragraph was NOT deleted! Only the new 2nd paragraph was appended with `after: blk-old-1`!
         assert!(deleted_ids.lock().unwrap().is_empty());
@@ -3740,9 +3748,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_inline_autosync_debounce_600ms_and_stale_generation_does_not_overwrite_newer_edits() {
+    async fn test_manual_save_only_sync_confirm_discard_and_undo_save_revert() {
         use std::sync::{Arc, Mutex};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         use axum::{
             extract::Path as AxumPath,
             routing::get,
@@ -3790,7 +3798,7 @@ mod tests {
         });
 
         let cfg = AppConfig::default();
-        let auth = AuthManager::from_token(cfg.clone(), "ntn_debounce_test");
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_manual_save_test");
         let client = NotionClient::new(&cfg, auth.clone())
             .unwrap()
             .with_base_url(format!("http://{addr}/v1"));
@@ -3806,7 +3814,7 @@ mod tests {
         let page = NotionPage {
             id: "33333333-2222-3333-4444-555555555555".into(),
             workspace_id: app.workspace_id.clone(),
-            title: "Debounce Page".into(),
+            title: "Manual Save Page".into(),
             ..Default::default()
         };
         app.storage.upsert_page(&page).unwrap();
@@ -3820,86 +3828,130 @@ mod tests {
                 page_id: page.id.clone(),
                 block_type: "paragraph".into(),
                 kind: NotionBlockKind::Paragraph {
-                    rich_text: vec![RichTextSpan::plain("Alpha")],
+                    rich_text: vec![RichTextSpan::plain("Hello")],
                     color: NotionColor::Default,
                 },
                 ..Default::default()
             }],
             comments: Vec::new(),
-            markdown: "Alpha".into(),
+            markdown: "Hello".into(),
             media: Vec::new(),
         });
 
+        // 1. Typing makes 0 API calls (manual save-only) and shows "● Unsaved"
+        assert!(app.open_inline_editor(&mut ui));
+        assert_eq!(ui.inline_editor.as_ref().unwrap().sync_status().0, "✓ Saved");
+        dispatch(Action::CursorEnd, &mut app, &mut ui);
+        dispatch(Action::Paste(" World".into()), &mut app, &mut ui);
+        assert!(ui.inline_editor.as_ref().unwrap().is_dirty());
+        assert!(!ui.inline_editor.as_ref().unwrap().sync_in_flight);
+        assert_eq!(ui.inline_editor.as_ref().unwrap().sync_status().0, "● Unsaved");
+        assert!(patch_texts.lock().unwrap().is_empty(), "typing must NEVER auto-sync");
+
+        // 2. Undo before saving reverts is_dirty() -> false and Ctrl+S makes 0 API calls
+        dispatch(Action::Undo, &mut app, &mut ui);
+        assert_eq!(ui.inline_editor.as_ref().unwrap().composer.text(), "Hello");
+        assert!(!ui.inline_editor.as_ref().unwrap().is_dirty());
+        dispatch(Action::SaveInlineEdit, &mut app, &mut ui);
+        assert!(!ui.inline_editor.as_ref().unwrap().sync_in_flight);
+        assert!(patch_texts.lock().unwrap().is_empty(), "saving unchanged buffer must make 0 API calls");
+        assert_eq!(
+            ui.toasts.latest().map(|t| t.message.as_str()),
+            Some("No changes to save")
+        );
+
+        // 3. First Esc with unsaved changes arms confirm_discard WITHOUT syncing; second Esc discards & restores active_page_detail
+        dispatch(Action::Paste(" Temp".into()), &mut app, &mut ui);
+        assert_eq!(app.active_page_detail.as_ref().unwrap().markdown, "Hello Temp");
+        dispatch(Action::CancelInlineEdit, &mut app, &mut ui);
+        assert!(ui.inline_editor.is_some(), "1st Esc with unsaved edits must keep editor open");
+        assert!(ui.inline_editor.as_ref().unwrap().confirm_discard);
+        assert!(!ui.inline_editor.as_ref().unwrap().sync_in_flight);
+        assert!(patch_texts.lock().unwrap().is_empty(), "1st Esc must NEVER fire Notion API sync");
+
+        // Typing resets confirm_discard
+        dispatch(Action::Input('!'), &mut app, &mut ui);
+        assert!(!ui.inline_editor.as_ref().unwrap().confirm_discard);
+
+        // First Esc again -> arm confirm_discard, Second Esc -> discard and restore last_synced_detail!
+        dispatch(Action::CancelInlineEdit, &mut app, &mut ui);
+        assert!(ui.inline_editor.as_ref().unwrap().confirm_discard);
+        dispatch(Action::CancelInlineEdit, &mut app, &mut ui);
+        assert!(ui.inline_editor.is_none(), "2nd Esc must exit inline edit mode");
+        assert!(patch_texts.lock().unwrap().is_empty(), "2nd Esc discard must make 0 API calls");
+        assert_eq!(
+            app.active_page_detail.as_ref().unwrap().markdown,
+            "Hello",
+            "discard must restore active_page_detail back to last_synced_detail"
+        );
+
+        // 4. Undo + Save revert: Edit "Hello" -> "Hello World" -> Ctrl+S -> Ctrl+Z -> Ctrl+S
         assert!(app.open_inline_editor(&mut ui));
         dispatch(Action::CursorEnd, &mut app, &mut ui);
-        dispatch(Action::Input('1'), &mut app, &mut ui);
+        dispatch(Action::Paste(" World".into()), &mut app, &mut ui);
+        assert_eq!(ui.inline_editor.as_ref().unwrap().composer.text(), "Hello World");
 
-        let gen1 = ui.inline_editor.as_ref().unwrap().edit_generation;
-        assert_eq!(gen1, 1);
-        let dirty_at = ui.inline_editor.as_ref().unwrap().dirty_since.unwrap();
-
-        // Before 600ms -> debounce must NOT fire yet
-        assert!(!app.tick_inline_autosync(&mut ui, dirty_at + Duration::from_millis(500)));
-        assert!(!ui.inline_editor.as_ref().unwrap().sync_in_flight);
-
-        // At 600ms -> debounce fires background sync for gen1
-        assert!(app.tick_inline_autosync(&mut ui, dirty_at + Duration::from_millis(600)));
+        // Save "Hello World"
+        dispatch(Action::SaveInlineEdit, &mut app, &mut ui);
         assert!(ui.inline_editor.as_ref().unwrap().sync_in_flight);
-
-        // While gen1 HTTP sync is in flight, user types '2' (advancing to gen2)
-        dispatch(Action::Input('2'), &mut app, &mut ui);
-        let gen2 = ui.inline_editor.as_ref().unwrap().edit_generation;
-        assert_eq!(gen2, 2);
-        assert_eq!(ui.inline_editor.as_ref().unwrap().composer.text(), "Alpha12");
-        assert_eq!(
-            app.active_page_detail.as_ref().unwrap().markdown,
-            "Alpha12"
-        );
-
-        // Receive gen1 completion -> must NOT overwrite gen2's local editor/detail buffer,
-        // and must automatically dispatch coalesced follow-up sync for gen2!
+        assert_eq!(ui.inline_editor.as_ref().unwrap().sync_status().0, "● Saving...");
         let msg1 = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
             .await
-            .expect("timed out waiting for gen1 PageEdited")
+            .expect("timed out waiting for save 1")
             .expect("ui_rx closed");
-        assert!(matches!(msg1, UiMsg::PageEdited { generation: 1, .. }));
         app.handle_ui_msg(&mut ui, msg1);
+        assert_eq!(ui.inline_editor.as_ref().unwrap().sync_status().0, "✓ Saved");
+        assert_eq!(ui.inline_editor.as_ref().unwrap().last_synced_markdown, "Hello World");
+        assert_eq!(app.active_page_detail.as_ref().unwrap().markdown, "Hello World");
 
-        assert_eq!(
-            ui.inline_editor.as_ref().unwrap().composer.text(),
-            "Alpha12",
-            "stale PageEdited(old_gen) must NEVER overwrite newer user keystrokes"
-        );
-        assert_eq!(
-            app.active_page_detail.as_ref().unwrap().markdown,
-            "Alpha12",
-            "stale PageEdited(old_gen) must NEVER overwrite optimistic local page detail"
-        );
+        // Ctrl+Z (Undo back to "Hello") -> must be dirty!
+        dispatch(Action::Undo, &mut app, &mut ui);
+        assert_eq!(ui.inline_editor.as_ref().unwrap().composer.text(), "Hello");
         assert!(
-            ui.inline_editor.as_ref().unwrap().sync_in_flight,
-            "coalesced follow-up sync for gen2 must launch automatically"
+            ui.inline_editor.as_ref().unwrap().is_dirty(),
+            "undoing after save must mark buffer dirty vs last_synced_markdown"
         );
+        assert_eq!(ui.inline_editor.as_ref().unwrap().sync_status().0, "● Unsaved");
 
-        // Receive gen2 completion -> status flips to ✓ Synced cleanly
+        // Ctrl+S (Save reverted "Hello") -> MUST PATCH Notion back to "Hello"!
+        dispatch(Action::SaveInlineEdit, &mut app, &mut ui);
+        assert!(ui.inline_editor.as_ref().unwrap().sync_in_flight);
         let msg2 = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
             .await
-            .expect("timed out waiting for gen2 PageEdited")
+            .expect("timed out waiting for revert save")
             .expect("ui_rx closed");
-        assert!(matches!(msg2, UiMsg::PageEdited { generation: 2, .. }));
         app.handle_ui_msg(&mut ui, msg2);
 
         let ed = ui.inline_editor.as_ref().unwrap();
         assert!(!ed.sync_in_flight);
-        assert_eq!(ed.synced_generation, 2);
-        assert_eq!(ed.sync_status().0, "✓ Synced");
-        assert_eq!(ed.composer.text(), "Alpha12");
+        assert!(!ed.is_dirty());
+        assert_eq!(ed.sync_status().0, "✓ Saved");
+        assert_eq!(ed.last_synced_markdown, "Hello");
+        assert_eq!(app.active_page_detail.as_ref().unwrap().markdown, "Hello");
         assert_eq!(
             *patch_texts.lock().unwrap(),
-            vec!["Alpha1".to_string(), "Alpha12".to_string()]
+            vec!["Hello World".to_string(), "Hello".to_string()],
+            "Notion API must receive the revert PATCH back to 'Hello'"
         );
 
-        // Idle tick after sync does nothing
-        assert!(!app.tick_inline_autosync(&mut ui, Instant::now() + Duration::from_secs(5)));
+        // 5. Typing while an explicit save is in flight must NOT overwrite newer keystrokes or auto-sync them
+        dispatch(Action::Paste(" A".into()), &mut app, &mut ui);
+        dispatch(Action::SaveInlineEdit, &mut app, &mut ui);
+        assert!(ui.inline_editor.as_ref().unwrap().sync_in_flight);
+        dispatch(Action::Input('B'), &mut app, &mut ui);
+        assert_eq!(ui.inline_editor.as_ref().unwrap().composer.text(), "Hello AB");
+
+        let msg3 = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+            .await
+            .expect("timed out waiting for in-flight save")
+            .expect("ui_rx closed");
+        app.handle_ui_msg(&mut ui, msg3);
+        let ed = ui.inline_editor.as_ref().unwrap();
+        assert_eq!(ed.composer.text(), "Hello AB");
+        assert_eq!(ed.last_synced_markdown, "Hello A");
+        assert!(!ed.sync_in_flight, "typing after Ctrl+S must NOT auto-sync");
+        assert!(ed.is_dirty());
+        assert_eq!(ed.sync_status().0, "● Unsaved");
 
         server_handle.abort();
     }
@@ -4123,6 +4175,457 @@ mod tests {
             assert_eq!(appends[0].1, 1);
         }
         assert!(detail2.markdown.contains("Brand new inserted line"));
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_diff_sync_preserves_hosted_image_and_recovers_from_stale_known_id() {
+        use std::sync::{Arc, Mutex};
+        use axum::{
+            extract::Path as AxumPath,
+            http::StatusCode,
+            response::IntoResponse,
+            routing::{delete, get},
+            Json, Router,
+        };
+        use tokio::net::TcpListener;
+
+        let deleted_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let patched_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let appended_payloads: Arc<Mutex<Vec<(Option<String>, Vec<serde_json::Value>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        let hosted_url = "https://prod-files-secure.s3.us-west-2.amazonaws.com/ws/blk/demo.png?X-Amz=sig";
+        let state_blocks = Arc::new(Mutex::new(vec![
+            serde_json::json!({
+                "id": "blk-top",
+                "type": "paragraph",
+                "has_children": false,
+                "paragraph": { "rich_text": [{ "plain_text": "Top" }] }
+            }),
+            serde_json::json!({
+                "id": "blk-hosted-img",
+                "type": "image",
+                "has_children": false,
+                "image": {
+                    "type": "file",
+                    "file": { "url": hosted_url },
+                    "caption": []
+                }
+            }),
+            serde_json::json!({
+                "id": "blk-bottom",
+                "type": "paragraph",
+                "has_children": false,
+                "paragraph": { "rich_text": [{ "plain_text": "Bottom" }] }
+            }),
+        ]));
+
+        let get_blocks = state_blocks.clone();
+        let del_blocks = state_blocks.clone();
+        let patch_blocks = state_blocks.clone();
+        let append_blocks = state_blocks.clone();
+        let del_log = deleted_ids.clone();
+        let patch_log = patched_ids.clone();
+        let app_log = appended_payloads.clone();
+
+        let router = Router::new()
+            .route(
+                "/v1/pages/{id}",
+                get(|AxumPath(id): AxumPath<String>| async move {
+                    Json(serde_json::json!({
+                        "object": "page",
+                        "id": id,
+                        "url": "https://www.notion.so/page-img",
+                        "parent": { "type": "workspace", "workspace": true },
+                        "archived": false,
+                        "properties": {
+                            "title": { "type": "title", "title": [{ "plain_text": "Hosted Image Page" }] }
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/v1/blocks/{id}/children",
+                get(move || {
+                    let b = get_blocks.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "object": "list",
+                            "results": b.lock().unwrap().clone(),
+                            "has_more": false
+                        }))
+                    }
+                })
+                .patch(move |Json(body): Json<serde_json::Value>| {
+                    let b = append_blocks.clone();
+                    let log = app_log.clone();
+                    async move {
+                        let after = body
+                            .get("after")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        let children = body
+                            .get("children")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        log.lock().unwrap().push((after.clone(), children.clone()));
+                        let mut guard = b.lock().unwrap();
+                        let mut created = Vec::new();
+                        let insert_pos = after
+                            .as_deref()
+                            .and_then(|aid| guard.iter().position(|x| x["id"] == aid))
+                            .map(|p| p + 1)
+                            .unwrap_or(guard.len());
+                        for (i, mut c) in children.into_iter().enumerate() {
+                            c["id"] = serde_json::json!(format!("blk-ins-{}-{}", guard.len(), i));
+                            c["has_children"] = serde_json::json!(false);
+                            guard.insert(insert_pos + i, c.clone());
+                            created.push(c);
+                        }
+                        Json(serde_json::json!({ "object": "list", "results": created }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/blocks/{id}",
+                delete(move |AxumPath(id): AxumPath<String>| {
+                    let d = del_log.clone();
+                    let b = del_blocks.clone();
+                    async move {
+                        d.lock().unwrap().push(id.clone());
+                        b.lock().unwrap().retain(|blk| blk["id"] != id);
+                        Json(serde_json::json!({ "id": id, "archived": true }))
+                    }
+                })
+                .patch(
+                    move |AxumPath(id): AxumPath<String>, Json(body): Json<serde_json::Value>| {
+                        let p = patch_log.clone();
+                        let b = patch_blocks.clone();
+                        async move {
+                            p.lock().unwrap().push(id.clone());
+                            let mut guard = b.lock().unwrap();
+                            if let Some(existing) = guard.iter_mut().find(|blk| blk["id"] == id) {
+                                let btype = existing["type"].as_str().unwrap().to_string();
+                                if let Some(inner) = body.get(&btype) {
+                                    existing[&btype] = inner.clone();
+                                }
+                                return (StatusCode::OK, Json(existing.clone())).into_response();
+                            }
+                            (
+                                StatusCode::NOT_FOUND,
+                                Json(serde_json::json!({
+                                    "code": "object_not_found",
+                                    "message": "Could not find block with ID"
+                                })),
+                            )
+                                .into_response()
+                        }
+                    },
+                ),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let cfg = AppConfig::default();
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_img_test");
+        let client = NotionClient::new(&cfg, auth)
+            .unwrap()
+            .with_base_url(format!("http://{addr}/v1"));
+        let storage = Storage::open_in_memory().unwrap();
+        let page_id = "55555555-2222-3333-4444-555555555555";
+
+        // 1. Edit "Top" -> "Top Updated": 0 deletes on hosted image, 1 PATCH on blk-top!
+        let edited_md = format!("Top Updated\n\n![]({hosted_url})\n\nBottom");
+        let detail = crate::cli::op_replace_page_markdown(&client, &storage, page_id, &edited_md)
+            .await
+            .unwrap();
+        assert!(
+            !deleted_ids.lock().unwrap().iter().any(|id| id == "blk-hosted-img"),
+            "hosted image must NEVER be deleted"
+        );
+        assert!(deleted_ids.lock().unwrap().is_empty());
+        assert_eq!(*patched_ids.lock().unwrap(), vec!["blk-top".to_string()]);
+        assert!(appended_payloads.lock().unwrap().is_empty());
+        assert!(detail.blocks.iter().any(|b| b.id == "blk-hosted-img"));
+        assert_eq!(detail.media.len(), 1);
+
+        // 2. Insert a new paragraph ABOVE the hosted image: 0 deletes on hosted image, exact order!
+        patched_ids.lock().unwrap().clear();
+        let inserted_above_md =
+            format!("Intro\n\nTop Updated\n\n![]({hosted_url})\n\nBottom");
+        let detail2 =
+            crate::cli::op_replace_page_markdown(&client, &storage, page_id, &inserted_above_md)
+                .await
+                .unwrap();
+        assert!(
+            !deleted_ids.lock().unwrap().iter().any(|id| id == "blk-hosted-img"),
+            "inserting above hosted image must make 0 DELETE calls on the hosted image"
+        );
+        assert!(
+            appended_payloads
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|(_, c)| c.iter())
+                .all(|c| c["type"] != "image"),
+            "hosted image must NEVER be re-appended as an external image payload"
+        );
+        let types: Vec<&str> = detail2.blocks.iter().map(|b| b.block_type.as_str()).collect();
+        assert_eq!(types, vec!["paragraph", "paragraph", "image", "paragraph"]);
+        assert_eq!(detail2.blocks[0].plain_text(), "Intro");
+        assert_eq!(detail2.blocks[1].plain_text(), "Top Updated");
+        assert_eq!(detail2.blocks[2].id, "blk-hosted-img");
+        assert_eq!(detail2.blocks[3].plain_text(), "Bottom");
+
+        // 3. Optimistic local preview preserves hosted image & media when editing text around it
+        let mut opt_detail = detail2.clone();
+        crate::parser::apply_optimistic_markdown_to_detail(
+            &mut opt_detail,
+            &format!("Intro Edited\n\nTop Updated\n\n![]({hosted_url})\n\nBottom"),
+        );
+        assert!(opt_detail.blocks.iter().any(|b| b.id == "blk-hosted-img"));
+        assert_eq!(opt_detail.media.len(), 1);
+
+        // 4. Stale known_existing ID -> 404 triggers clean fallback refetch + retry!
+        let stale_known = vec![
+            NotionBlock {
+                id: "blk-stale-gone".into(),
+                page_id: page_id.into(),
+                block_type: "paragraph".into(),
+                kind: NotionBlockKind::Paragraph {
+                    rich_text: vec![RichTextSpan::plain("Stale")],
+                    color: NotionColor::Default,
+                },
+                ..Default::default()
+            },
+            detail2.blocks[2].clone(),
+            detail2.blocks[3].clone(),
+        ];
+        let retry_md = format!("Intro Final\n\nTop Updated\n\n![]({hosted_url})\n\nBottom");
+        let detail3 = crate::cli::op_diff_sync_page_markdown(
+            &client,
+            &storage,
+            page_id,
+            &retry_md,
+            Some(stale_known),
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail3.blocks[0].plain_text(), "Intro Final");
+        assert!(detail3.blocks.iter().any(|b| b.id == "blk-hosted-img"));
+
+        // 5. Empty image URL must NEVER emit an `image` payload
+        assert!(
+            crate::parser::markdown_to_notion_blocks("![]()\n![caption]()")
+                .iter()
+                .all(|b| b["type"] != "image")
+        );
+        let empty_img_blk = NotionBlock {
+            id: "blk-empty-img".into(),
+            page_id: page_id.into(),
+            block_type: "image".into(),
+            kind: NotionBlockKind::Image {
+                url: String::new(),
+                caption: Vec::new(),
+                is_hosted: true,
+            },
+            ..Default::default()
+        };
+        assert!(crate::parser::is_preserved_anchor_block(&empty_img_blk));
+        assert!(!crate::parser::blocks_to_markdown(&[empty_img_blk]).contains("![]("));
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_sidebar_classification_block_id_nesting_db_exclusion_and_natural_sort() {
+        use axum::{
+            extract::Path as AxumPath,
+            routing::{get, post},
+            Json, Router,
+        };
+        use tokio::net::TcpListener;
+
+        let router = Router::new()
+            .route(
+                "/v1/search",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "object": "list",
+                        "results": [
+                            {
+                                "object": "page",
+                                "id": "page-parent-a",
+                                "url": "https://notion.so/page-parent-a",
+                                "parent": { "type": "workspace", "workspace": true },
+                                "archived": false,
+                                "last_edited_time": "2026-11-20T05:00:00Z",
+                                "properties": {
+                                    "title": { "type": "title", "title": [{ "plain_text": "Idea Pet" }] }
+                                }
+                            },
+                            {
+                                "object": "page",
+                                "id": "page-sub-via-api",
+                                "url": "https://notion.so/page-sub-via-api",
+                                "parent": { "type": "block_id", "block_id": "blk-nested-col" },
+                                "archived": false,
+                                "last_edited_time": "2026-11-20T06:00:00Z",
+                                "properties": {
+                                    "title": { "type": "title", "title": [{ "plain_text": "03. API Nested Subpage" }] }
+                                }
+                            }
+                        ],
+                        "has_more": false
+                    }))
+                }),
+            )
+            .route(
+                "/v1/blocks/{id}",
+                get(|AxumPath(id): AxumPath<String>| async move {
+                    let parent = match id.as_str() {
+                        "blk-nested-col" => serde_json::json!({ "type": "block_id", "block_id": "blk-heading-2" }),
+                        "blk-heading-2" => serde_json::json!({ "type": "page_id", "page_id": "page-parent-a" }),
+                        _ => serde_json::json!({ "type": "workspace", "workspace": true }),
+                    };
+                    Json(serde_json::json!({
+                        "object": "block",
+                        "id": id,
+                        "type": "heading_2",
+                        "parent": parent
+                    }))
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let cfg = AppConfig::default();
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_sidebar_test");
+        let client = NotionClient::new(&cfg, auth.clone())
+            .unwrap()
+            .with_base_url(format!("http://{addr}/v1"));
+        let storage = Storage::open_in_memory().unwrap();
+
+        // 1. Online sync resolves multi-hop block_id -> block_id -> page_id into SQLite block_owners!
+        let (ws_id, _, _) = crate::sync::sync_workspace_tree(&client, &storage)
+            .await
+            .unwrap();
+        let (owners, _) = storage.load_page_parent_hints(&ws_id).unwrap();
+        assert_eq!(
+            owners.get("blk-nested-col").map(String::as_str),
+            Some("page-parent-a")
+        );
+        assert_eq!(
+            owners.get("blk-heading-2").map(String::as_str),
+            Some("page-parent-a")
+        );
+
+        // 2. Add local blocks + numbered sub-pages (out of order by last_edited_time),
+        //    plus a database_id row (with NO matching database in app.databases!) and an Untitled root.
+        storage
+            .replace_page_blocks(
+                &ws_id,
+                "page-parent-a",
+                &[NotionBlock {
+                    id: "blk-local-toggle".into(),
+                    page_id: "page-parent-a".into(),
+                    block_type: "toggle".into(),
+                    kind: NotionBlockKind::Toggle {
+                        rich_text: vec![RichTextSpan::plain("Section")],
+                        color: NotionColor::Default,
+                    },
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+
+        let mk_page = |id: &str, title: &str, ptype: &str, pid: Option<&str>, edited: &str| NotionPage {
+            id: id.into(),
+            workspace_id: ws_id.clone(),
+            parent_type: ptype.into(),
+            parent_id: pid.map(str::to_string),
+            title: title.into(),
+            last_edited_time: Some(edited.into()),
+            ..Default::default()
+        };
+
+        storage
+            .upsert_pages(&[
+                mk_page("page-untitled", "Untitled", "workspace", None, "2026-11-20T09:00:00Z"),
+                mk_page("page-alpha", "Alpha Root", "workspace", None, "2026-11-20T01:00:00Z"),
+                mk_page("page-db-row", "Orphan DB Row", "database_id", Some("db-unloaded"), "2026-11-20T09:30:00Z"),
+                mk_page("sub-05", "05. Fifth", "page_id", Some("page-parent-a"), "2026-11-20T08:00:00Z"),
+                mk_page("sub-02", "02. Second", "block_id", Some("blk-local-toggle"), "2026-11-20T07:00:00Z"),
+                mk_page("sub-01", "01. First", "block_id", Some("blk-local-toggle"), "2026-11-20T02:00:00Z"),
+                mk_page("sub-04", "04. Fourth", "page_id", Some("page-parent-a"), "2026-11-20T06:00:00Z"),
+            ])
+            .unwrap();
+
+        let (focus_tx, _focus_rx) = tokio::sync::watch::channel(FocusTarget::default());
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+
+        let ui = UiState::from_config(&cfg);
+        let mut app = AppState::new(cfg, auth, client, storage, sync_ctrl, ui_tx);
+        app.workspace_id = ws_id.clone();
+        app.load_cached_initial();
+        assert!(app.databases.is_empty(), "databases intentionally empty for exclusion test");
+
+        let items = app.build_sidebar_items(&ui);
+        let ws_items: Vec<&crate::ui::app::SidebarItem> =
+            items.iter().filter(|i| !i.is_section_header).collect();
+
+        // database_id row MUST NOT appear in top-level WORKSPACE roots!
+        assert!(
+            !ws_items.iter().any(|i| i.id == "page-db-row"),
+            "database_id rows must NEVER be dumped into WORKSPACE roots"
+        );
+
+        // Top-level roots: Alpha Root, Idea Pet, Untitled (Untitled pushed to bottom!)
+        let root_ids: Vec<&str> = ws_items
+            .iter()
+            .filter(|i| i.depth == 0)
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(root_ids, vec!["page-alpha", "page-parent-a", "page-untitled"]);
+
+        // All 5 sub-pages (2 from local toggle block_id, 1 from API block_owners, 2 from page_id)
+        // must nest at depth 1 under Idea Pet in exact natural order: 01 -> 02 -> 03 -> 04 -> 05!
+        let parent_item = ws_items.iter().find(|i| i.id == "page-parent-a").unwrap();
+        assert!(parent_item.collapsible);
+        let child_ids: Vec<&str> = ws_items
+            .iter()
+            .filter(|i| i.depth == 1)
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(
+            child_ids,
+            vec!["sub-01", "sub-02", "page-sub-via-api", "sub-04", "sub-05"]
+        );
+
+        // When child_page block positions exist in `blocks`, exact Notion page order wins!
+        app.child_page_positions.insert("sub-05".into(), 0);
+        app.child_page_positions.insert("sub-01".into(), 1);
+        let reordered = app.build_sidebar_items(&ui);
+        let reordered_kids: Vec<&str> = reordered
+            .iter()
+            .filter(|i| !i.is_section_header && i.depth == 1)
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(reordered_kids[0], "sub-05");
+        assert_eq!(reordered_kids[1], "sub-01");
 
         server_handle.abort();
     }

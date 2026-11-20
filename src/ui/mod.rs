@@ -224,7 +224,7 @@ fn draw_status_bar(
             Focus::Overlay => "Overlay",
         };
         let hints = if ui.inline_editor.is_some() {
-            "Esc Done · Ctrl+S Save Now · Ctrl+Z/Y Undo/Redo · Ctrl+V Paste · Ctrl+E $EDITOR"
+            "Ctrl+S Save · Esc Done/Discard · Ctrl+Z/Y Undo/Redo · Ctrl+V Paste · Ctrl+E $EDITOR"
         } else {
             match app.active_view {
                 CanvasView::Page => {

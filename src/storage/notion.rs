@@ -493,6 +493,83 @@ impl Storage {
         )
         .ok()
     }
+
+    /// Persists resolved `block_id -> owner_page_id` mappings (for pages whose `parent_type == "block_id"`).
+    pub fn upsert_block_owners(
+        &self,
+        workspace_id: &str,
+        entries: &[(String, String)],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.writer();
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        for (block_id, owner_page_id) in entries {
+            if block_id.trim().is_empty() || owner_page_id.trim().is_empty() {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO block_owners (workspace_id, block_id, owner_page_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(workspace_id, block_id) DO UPDATE SET
+                    owner_page_id = excluded.owner_page_id,
+                    updated_at = excluded.updated_at",
+                params![workspace_id, block_id, owner_page_id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Loads local parent resolution hints for sidebar page classification and ordering:
+    /// - `block_owner_pages`: maps `block_id -> owner_page_id` (from both `block_owners` and `blocks`,
+    ///   including `child_page` block IDs -> their container page ID)
+    /// - `child_page_positions`: maps `child_page_id -> position` on its parent page.
+    pub fn load_page_parent_hints(
+        &self,
+        workspace_id: &str,
+    ) -> Result<(HashMap<String, String>, HashMap<String, i64>)> {
+        let conn = self.reader();
+        let mut block_owner_pages: HashMap<String, String> = HashMap::new();
+        let mut child_page_positions: HashMap<String, i64> = HashMap::new();
+
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT block_id, owner_page_id FROM block_owners WHERE workspace_id = ?1",
+        ) {
+            if let Ok(rows) = stmt.query_map(params![workspace_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            }) {
+                for (block_id, owner_page_id) in rows.flatten() {
+                    block_owner_pages.insert(block_id, owner_page_id);
+                }
+            }
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT id, page_id, block_type, position
+             FROM blocks
+             WHERE workspace_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![workspace_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, page_id, block_type, position) = row?;
+            block_owner_pages.insert(id.clone(), page_id);
+            if block_type == "child_page" {
+                child_page_positions.insert(id, position);
+            }
+        }
+
+        Ok((block_owner_pages, child_page_positions))
+    }
 }
 
 fn upsert_page_in_tx(tx: &Connection, page: &NotionPage) -> Result<()> {

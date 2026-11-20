@@ -144,7 +144,7 @@ fn parse_cover_url(val: Option<&Value>) -> Option<String> {
     }
 }
 
-fn parse_parent(val: Option<&Value>) -> (String, Option<String>) {
+pub fn parse_parent(val: Option<&Value>) -> (String, Option<String>) {
     let Some(parent) = val else {
         return ("workspace".to_string(), None);
     };
@@ -1161,9 +1161,15 @@ fn render_blocks_md(blocks: &[NotionBlock], depth: usize, out: &mut Vec<String>)
                 out.push(format!("{indent}| {} |", cols.join(" | ")));
             }
             NotionBlockKind::Image { url, caption, .. } => {
+                let trimmed_url = url.trim();
                 let alt = spans_plain_text(caption);
-                out.push(format!("{indent}![{alt}]({url})"));
-                out.push(String::new());
+                if !trimmed_url.is_empty() {
+                    out.push(format!("{indent}![{alt}]({trimmed_url})"));
+                    out.push(String::new());
+                } else if !alt.trim().is_empty() {
+                    out.push(format!("{indent}[🖼 {}]", alt.trim()));
+                    out.push(String::new());
+                }
             }
             NotionBlockKind::File { url, name, .. } => {
                 let label = name.as_deref().unwrap_or("File");
@@ -1531,11 +1537,14 @@ pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
             continue;
         }
 
-        // Image: ![alt](https://...)
+        // Image: ![alt](https://...) — never emit an image block with an empty or invalid external URL
         if trimmed.starts_with("![") && trimmed.ends_with(')') {
             if let Some(mid) = trimmed.find("](") {
-                let url = &trimmed[mid + 2..trimmed.len() - 1];
-                if url.starts_with("http://") || url.starts_with("https://") {
+                let url = trimmed[mid + 2..trimmed.len() - 1].trim();
+                if !url.is_empty()
+                    && (url.starts_with("http://") || url.starts_with("https://"))
+                    && url::Url::parse(url).is_ok()
+                {
                     let alt = &trimmed[2..mid];
                     let caption = if alt.is_empty() {
                         vec![]
@@ -1807,82 +1816,232 @@ pub fn block_comparison_key(blk: &NotionBlock) -> (String, String) {
     (blk.block_type.clone(), content)
 }
 
+/// Returns `true` for hosted media and structural Notion blocks that must NEVER
+/// be deleted or recreated during Markdown diff-sync or optimistic local preview updates.
+pub fn is_preserved_anchor_block(blk: &NotionBlock) -> bool {
+    match &blk.kind {
+        NotionBlockKind::ChildPage { .. }
+        | NotionBlockKind::ChildDatabase { .. }
+        | NotionBlockKind::File { .. }
+        | NotionBlockKind::Pdf { .. }
+        | NotionBlockKind::Video { .. }
+        | NotionBlockKind::Audio { .. }
+        | NotionBlockKind::Bookmark { .. }
+        | NotionBlockKind::Embed { .. }
+        | NotionBlockKind::Table { .. }
+        | NotionBlockKind::ColumnList
+        | NotionBlockKind::SyncedBlock { .. } => true,
+        NotionBlockKind::Image { url, is_hosted, .. } => *is_hosted || url.trim().is_empty(),
+        _ => false,
+    }
+}
+
+fn find_key_subslice(
+    haystack: &[(String, String)],
+    needle: &[(String, String)],
+    start: usize,
+) -> Option<usize> {
+    if needle.is_empty() || start + needle.len() > haystack.len() {
+        return None;
+    }
+    (start..=haystack.len() - needle.len())
+        .find(|&pos| haystack[pos..pos + needle.len()] == *needle)
+}
+
+fn image_url_base(url: &str) -> &str {
+    url.trim().split(['?', '#']).next().unwrap_or("")
+}
+
+/// Partitions `existing` around `is_preserved_anchor_block` blocks into `k + 1` editable segments
+/// and aligns `new_parsed` into `k + 1` corresponding index ranges, consuming any markdown
+/// representations of preserved anchors so they are neither duplicated nor deleted.
+pub fn partition_blocks_around_anchors(
+    existing: &[NotionBlock],
+    new_parsed: &[NotionBlock],
+) -> (
+    Vec<Vec<NotionBlock>>,
+    Vec<NotionBlock>,
+    Vec<std::ops::Range<usize>>,
+) {
+    let mut old_segments: Vec<Vec<NotionBlock>> = vec![Vec::new()];
+    let mut anchors: Vec<NotionBlock> = Vec::new();
+    for blk in existing {
+        if is_preserved_anchor_block(blk) {
+            anchors.push(blk.clone());
+            old_segments.push(Vec::new());
+        } else {
+            old_segments.last_mut().unwrap().push(blk.clone());
+        }
+    }
+
+    if anchors.is_empty() {
+        return (old_segments, anchors, vec![0..new_parsed.len()]);
+    }
+
+    let new_keys: Vec<(String, String)> = new_parsed.iter().map(block_comparison_key).collect();
+    let mut new_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(old_segments.len());
+    let mut cursor = 0usize;
+
+    for (j, anchor) in anchors.iter().enumerate() {
+        let anchor_md = blocks_to_markdown(std::slice::from_ref(anchor));
+        let anchor_keys: Vec<(String, String)> = markdown_to_notion_blocks(&anchor_md)
+            .iter()
+            .map(|val| parse_notion_block(val, &anchor.page_id, None))
+            .map(|blk| block_comparison_key(&blk))
+            .collect();
+
+        let matched = if !anchor_keys.is_empty() {
+            find_key_subslice(&new_keys, &anchor_keys, cursor)
+                .map(|pos| (pos, anchor_keys.len()))
+                .or_else(|| {
+                    if let NotionBlockKind::Image { url, .. } = &anchor.kind {
+                        let base = image_url_base(url);
+                        if !base.is_empty() {
+                            return (cursor..new_parsed.len()).find_map(|pos| {
+                                if let NotionBlockKind::Image { url: new_url, .. } =
+                                    &new_parsed[pos].kind
+                                {
+                                    (image_url_base(new_url) == base).then_some((pos, 1))
+                                } else {
+                                    None
+                                }
+                            });
+                        }
+                    }
+                    None
+                })
+        } else {
+            None
+        };
+
+        if let Some((match_pos, match_len)) = matched {
+            new_ranges.push(cursor..match_pos);
+            cursor = match_pos + match_len;
+        } else {
+            let split = if old_segments[j + 1..].iter().all(|seg| seg.is_empty()) {
+                new_keys.len()
+            } else {
+                let next_non_empty = old_segments[j + 1..].iter().find(|seg| !seg.is_empty());
+                let next_match = next_non_empty.and_then(|seg| {
+                    let next_keys: Vec<(String, String)> =
+                        seg.iter().map(block_comparison_key).collect();
+                    find_key_subslice(&new_keys, &next_keys, cursor).or_else(|| {
+                        next_keys
+                            .first()
+                            .and_then(|k| find_key_subslice(&new_keys, std::slice::from_ref(k), cursor))
+                    })
+                });
+                if let Some(pos) = next_match {
+                    pos
+                } else if !old_segments[j].is_empty() {
+                    let cur_keys: Vec<(String, String)> =
+                        old_segments[j].iter().map(block_comparison_key).collect();
+                    let mut p = 0usize;
+                    while p < cur_keys.len()
+                        && cursor + p < new_keys.len()
+                        && cur_keys[p] == new_keys[cursor + p]
+                    {
+                        p += 1;
+                    }
+                    if p > 0 {
+                        cursor + p
+                    } else {
+                        (cursor + old_segments[j].len()).min(new_keys.len())
+                    }
+                } else {
+                    cursor
+                }
+            };
+            new_ranges.push(cursor..split);
+            cursor = split;
+        }
+    }
+    new_ranges.push(cursor..new_keys.len());
+
+    (old_segments, anchors, new_ranges)
+}
+
 /// Immediately parses `edited_markdown` into typed `NotionBlock`s (preserving existing
-/// `ChildPage` and `ChildDatabase` blocks as well as real Notion IDs of matched blocks)
-/// and updates `detail.markdown`, `detail.blocks`, `detail.page.plain_text`, and `detail.media`
-/// in < 1 ms without waiting for any Notion API HTTP roundtrip.
+/// hosted media, `ChildPage`, `ChildDatabase`, and structural anchor blocks at their exact
+/// positions as well as real Notion IDs of matched blocks) and updates `detail.markdown`,
+/// `detail.blocks`, `detail.page.plain_text`, and `detail.media` in < 1 ms without waiting
+/// for any Notion API HTTP roundtrip.
 pub fn apply_optimistic_markdown_to_detail(detail: &mut NotionPageDetail, edited_markdown: &str) {
     let normalized = edited_markdown.replace("\r\n", "\n").replace('\r', "\n");
     let page_id = detail.page.id.clone();
 
-    let mut old_editable = Vec::new();
-    let mut preserved = Vec::new();
-    for blk in &detail.blocks {
-        if matches!(
-            blk.kind,
-            NotionBlockKind::ChildPage { .. } | NotionBlockKind::ChildDatabase { .. }
-        ) {
-            preserved.push(blk.clone());
-        } else {
-            old_editable.push(blk.clone());
-        }
-    }
-
     let payloads = markdown_to_notion_blocks(&normalized);
-    let mut new_blocks: Vec<NotionBlock> = payloads
+    let new_parsed: Vec<NotionBlock> = payloads
         .iter()
         .map(|val| parse_notion_block(val, &page_id, None))
         .collect();
 
-    let old_keys: Vec<(String, String)> = old_editable.iter().map(block_comparison_key).collect();
-    let new_keys: Vec<(String, String)> = new_blocks.iter().map(block_comparison_key).collect();
+    let (old_segments, anchors, new_ranges) =
+        partition_blocks_around_anchors(&detail.blocks, &new_parsed);
 
-    let mut prefix_len = 0usize;
-    while prefix_len < old_keys.len()
-        && prefix_len < new_keys.len()
-        && old_keys[prefix_len] == new_keys[prefix_len]
+    let mut final_blocks: Vec<NotionBlock> = Vec::with_capacity(new_parsed.len() + anchors.len());
+    let mut opt_counter = 0usize;
+
+    for (seg_idx, (old_editable, range)) in
+        old_segments.into_iter().zip(new_ranges.into_iter()).enumerate()
     {
-        new_blocks[prefix_len].id = old_editable[prefix_len].id.clone();
-        new_blocks[prefix_len].has_children = old_editable[prefix_len].has_children;
-        new_blocks[prefix_len].children = old_editable[prefix_len].children.clone();
-        prefix_len += 1;
-    }
+        let mut seg_new: Vec<NotionBlock> = new_parsed[range].to_vec();
+        let old_keys: Vec<(String, String)> = old_editable.iter().map(block_comparison_key).collect();
+        let new_keys: Vec<(String, String)> = seg_new.iter().map(block_comparison_key).collect();
 
-    let mut suffix_len = 0usize;
-    while suffix_len < (old_keys.len() - prefix_len)
-        && suffix_len < (new_keys.len() - prefix_len)
-        && old_keys[old_keys.len() - 1 - suffix_len] == new_keys[new_keys.len() - 1 - suffix_len]
-    {
-        let old_idx = old_editable.len() - 1 - suffix_len;
-        let new_idx = new_blocks.len() - 1 - suffix_len;
-        new_blocks[new_idx].id = old_editable[old_idx].id.clone();
-        new_blocks[new_idx].has_children = old_editable[old_idx].has_children;
-        new_blocks[new_idx].children = old_editable[old_idx].children.clone();
-        suffix_len += 1;
-    }
+        let mut prefix_len = 0usize;
+        while prefix_len < old_keys.len()
+            && prefix_len < new_keys.len()
+            && old_keys[prefix_len] == new_keys[prefix_len]
+        {
+            seg_new[prefix_len].id = old_editable[prefix_len].id.clone();
+            seg_new[prefix_len].has_children = old_editable[prefix_len].has_children;
+            seg_new[prefix_len].children = old_editable[prefix_len].children.clone();
+            prefix_len += 1;
+        }
 
-    let old_mid_end = old_editable.len() - suffix_len;
-    let new_mid_end = new_blocks.len() - suffix_len;
-    if old_mid_end - prefix_len == new_mid_end - prefix_len {
-        for offset in 0..(old_mid_end - prefix_len) {
-            let old_blk = &old_editable[prefix_len + offset];
-            let new_blk = &mut new_blocks[prefix_len + offset];
-            if old_blk.block_type == new_blk.block_type && !old_blk.id.is_empty() {
-                new_blk.id = old_blk.id.clone();
+        let mut suffix_len = 0usize;
+        while suffix_len < (old_keys.len() - prefix_len)
+            && suffix_len < (new_keys.len() - prefix_len)
+            && old_keys[old_keys.len() - 1 - suffix_len]
+                == new_keys[new_keys.len() - 1 - suffix_len]
+        {
+            let old_idx = old_editable.len() - 1 - suffix_len;
+            let new_idx = seg_new.len() - 1 - suffix_len;
+            seg_new[new_idx].id = old_editable[old_idx].id.clone();
+            seg_new[new_idx].has_children = old_editable[old_idx].has_children;
+            seg_new[new_idx].children = old_editable[old_idx].children.clone();
+            suffix_len += 1;
+        }
+
+        let old_mid_end = old_editable.len() - suffix_len;
+        let new_mid_end = seg_new.len() - suffix_len;
+        if old_mid_end - prefix_len == new_mid_end - prefix_len {
+            for offset in 0..(old_mid_end - prefix_len) {
+                let old_blk = &old_editable[prefix_len + offset];
+                let new_blk = &mut seg_new[prefix_len + offset];
+                if old_blk.block_type == new_blk.block_type && !old_blk.id.is_empty() {
+                    new_blk.id = old_blk.id.clone();
+                }
             }
         }
-    }
 
-    for (idx, blk) in new_blocks.iter_mut().enumerate() {
-        if blk.id.trim().is_empty() {
-            blk.id = format!("__optimistic_{}_{}", page_id, idx);
+        for blk in &mut seg_new {
+            if blk.id.trim().is_empty() {
+                blk.id = format!("__optimistic_{}_{}", page_id, opt_counter);
+                opt_counter += 1;
+            }
+        }
+
+        final_blocks.extend(seg_new);
+        if let Some(anchor) = anchors.get(seg_idx) {
+            final_blocks.push(anchor.clone());
         }
     }
 
-    new_blocks.extend(preserved);
-    detail.page.plain_text = blocks_to_plain_text(&new_blocks);
-    detail.media = collect_media_refs(&new_blocks);
-    detail.blocks = new_blocks;
+    detail.page.plain_text = blocks_to_plain_text(&final_blocks);
+    detail.media = collect_media_refs(&final_blocks);
+    detail.blocks = final_blocks;
     detail.markdown = normalized;
 }
 

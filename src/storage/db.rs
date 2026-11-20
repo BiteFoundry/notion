@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 10;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 11;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 12;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 13;
 
 /// Initializes SQLite WAL PRAGMAs, Notion workspace-scoped tables, indexes, and `pages_fts`.
 /// Returns `true` if `pages_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -43,7 +43,8 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pages')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='databases')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='blocks')
-                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='comments')",
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='comments')
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='block_owners')",
                     [],
                     |row| row.get(0),
                 )
@@ -146,6 +147,14 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             scope_key TEXT PRIMARY KEY,
             cursor TEXT,
             last_synced_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS block_owners (
+            workspace_id TEXT NOT NULL,
+            block_id TEXT NOT NULL,
+            owner_page_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, block_id)
         );
         ",
     )
