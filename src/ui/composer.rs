@@ -2,7 +2,7 @@
 //! cursor/selection/undo/redo, clipboard image staging (`cid:` inline images),
 //! and external `$EDITOR` editing.
 
-use std::{ops::Range, process::Command};
+use std::{collections::VecDeque, ops::Range, process::Command};
 
 use image::{codecs::png::PngEncoder, ExtendedColorType, ImageBuffer, ImageEncoder, Rgba};
 use ratatui::{
@@ -23,9 +23,12 @@ use crate::{
 const MAX_UNDO: usize = 200;
 
 #[derive(Debug, Clone, Default)]
-struct Snapshot {
-    text: String,
-    cursor: usize,
+struct EditDelta {
+    start: usize,
+    removed: String,
+    inserted: String,
+    cursor_before: usize,
+    cursor_after: usize,
 }
 
 /// Alias used by in-terminal Markdown editors (e.g. `InlinePageEditor`).
@@ -39,8 +42,8 @@ pub struct ComposerState {
     pub pending_preview: Option<RenderedTerminalImage>,
     pub last_inner_width: u16,
     anchor: Option<usize>,
-    undo: Vec<Snapshot>,
-    redo: Vec<Snapshot>,
+    undo: VecDeque<EditDelta>,
+    redo: Vec<EditDelta>,
 }
 
 impl PartialEq for ComposerState {
@@ -62,7 +65,7 @@ impl Default for ComposerState {
             pending_preview: None,
             last_inner_width: 72,
             anchor: None,
-            undo: Vec::new(),
+            undo: VecDeque::new(),
             redo: Vec::new(),
         }
     }
@@ -111,10 +114,7 @@ impl ComposerState {
 
     fn insert_replacing_selection(&mut self, value: &str) {
         if let Some((start, end)) = self.selection_range() {
-            self.record();
-            self.text.replace_range(start..end, value);
-            self.cursor = start + value.len();
-            self.anchor = None;
+            self.apply_edit(start..end, value);
         } else {
             self.insert_at(self.cursor, value);
         }
@@ -185,12 +185,24 @@ impl ComposerState {
         if self.text.is_empty() && self.pending_images.is_empty() {
             return;
         }
-        self.record();
-        self.text.clear();
+        let cursor_before = self.cursor;
+        let removed = if self.text.is_empty() {
+            String::new()
+        } else {
+            std::mem::take(&mut self.text)
+        };
         self.cursor = 0;
         self.anchor = None;
         self.pending_images.clear();
         self.pending_preview = None;
+        self.push_undo(EditDelta {
+            start: 0,
+            removed,
+            inserted: String::new(),
+            cursor_before,
+            cursor_after: 0,
+        });
+        self.redo.clear();
     }
 
     pub fn stage_inline_image(
@@ -249,20 +261,43 @@ impl ComposerState {
         if value.is_empty() || pos > self.text.len() || !self.text.is_char_boundary(pos) {
             return;
         }
-        self.record();
-        self.text.insert_str(pos, value);
-        self.cursor = pos + value.len();
-        self.anchor = None;
+        self.apply_edit(pos..pos, value);
     }
 
     fn delete_range(&mut self, range: Range<usize>) {
-        if range.start >= range.end {
+        if range.start >= range.end
+            || range.end > self.text.len()
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
             return;
         }
-        self.record();
-        self.text.replace_range(range.clone(), "");
-        self.cursor = range.start;
+        self.apply_edit(range, "");
+    }
+
+    fn apply_edit(&mut self, range: Range<usize>, inserted: &str) {
+        if range.start > range.end
+            || range.end > self.text.len()
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return;
+        }
+        let cursor_before = self.cursor;
+        let removed = self.text[range.start..range.end].to_string();
+        let inserted_owned = inserted.to_string();
+        let cursor_after = range.start + inserted_owned.len();
+        self.text.replace_range(range.clone(), inserted);
+        self.cursor = cursor_after;
         self.anchor = None;
+        self.push_undo(EditDelta {
+            start: range.start,
+            removed,
+            inserted: inserted_owned,
+            cursor_before,
+            cursor_after,
+        });
+        self.redo.clear();
     }
 
     // ------------------------------------------------------------------
@@ -406,42 +441,51 @@ impl ComposerState {
     // Undo / Redo
     // ------------------------------------------------------------------
 
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            text: self.text.clone(),
-            cursor: self.cursor,
+    fn push_undo(&mut self, delta: EditDelta) {
+        self.undo.push_back(delta);
+        while self.undo.len() > MAX_UNDO {
+            self.undo.pop_front();
         }
-    }
-
-    fn record(&mut self) {
-        self.undo.push(self.snapshot());
-        if self.undo.len() > MAX_UNDO {
-            self.undo.remove(0);
-        }
-        self.redo.clear();
     }
 
     pub fn undo(&mut self) -> bool {
-        let Some(prev) = self.undo.pop() else {
+        let Some(mut delta) = self.undo.pop_back() else {
             return false;
         };
-        self.redo.push(self.snapshot());
-        self.restore(prev);
+        let end = delta.start.saturating_add(delta.inserted.len());
+        debug_assert!(
+            end <= self.text.len()
+                && self.text.is_char_boundary(delta.start)
+                && self.text.is_char_boundary(end)
+                && &self.text[delta.start..end] == delta.inserted
+        );
+        delta.cursor_after = self.cursor;
+        self.text.replace_range(delta.start..end, &delta.removed);
+        self.restore_cursor(delta.cursor_before);
+        self.redo.push(delta);
         true
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(next) = self.redo.pop() else {
+        let Some(mut delta) = self.redo.pop() else {
             return false;
         };
-        self.undo.push(self.snapshot());
-        self.restore(next);
+        let end = delta.start.saturating_add(delta.removed.len());
+        debug_assert!(
+            end <= self.text.len()
+                && self.text.is_char_boundary(delta.start)
+                && self.text.is_char_boundary(end)
+                && &self.text[delta.start..end] == delta.removed
+        );
+        delta.cursor_before = self.cursor;
+        self.text.replace_range(delta.start..end, &delta.inserted);
+        self.restore_cursor(delta.cursor_after);
+        self.push_undo(delta);
         true
     }
 
-    fn restore(&mut self, snapshot: Snapshot) {
-        self.text = snapshot.text;
-        self.cursor = snapshot.cursor.min(self.text.len());
+    fn restore_cursor(&mut self, cursor: usize) {
+        self.cursor = cursor.min(self.text.len());
         while !self.text.is_char_boundary(self.cursor) {
             self.cursor = self.cursor.saturating_sub(1);
         }
@@ -981,5 +1025,192 @@ mod tests {
             parse_editor_command(r#""C:\Program Files\Sublime Text\subl.exe" -w"#),
             vec![r"C:\Program Files\Sublime Text\subl.exe", "-w"]
         );
+    }
+
+    fn history_bytes<'a>(deltas: impl IntoIterator<Item = &'a EditDelta>) -> usize {
+        deltas
+            .into_iter()
+            .map(|d| d.removed.len() + d.inserted.len())
+            .sum()
+    }
+
+    fn assert_state(composer: &ComposerState, text: &str, cursor: usize) {
+        assert_eq!((composer.text(), composer.cursor()), (text, cursor));
+    }
+
+    fn insert_ascii_chars(composer: &mut ComposerState, count: usize, base: u8) {
+        for i in 0..count {
+            composer.insert_char((base + (i % 26) as u8) as char);
+        }
+    }
+
+    #[test]
+    fn edit_delta_history_is_proportional_to_changes_on_large_doc() {
+        let initial = format!("{}\n", vec!["a".repeat(512); 1000].join("\n\n"));
+        assert_eq!(initial.len(), 513_999);
+
+        let mut composer = ComposerState::new();
+        composer.load_text_cursor_start(&initial);
+        assert_eq!((history_bytes(&composer.undo), history_bytes(&composer.redo)), (0, 0));
+
+        insert_ascii_chars(&mut composer, MAX_UNDO, b'A');
+        let after_200 = composer.text().to_string();
+        assert_eq!(after_200.len(), initial.len() + MAX_UNDO);
+        assert_eq!((composer.undo.len(), composer.redo.len()), (MAX_UNDO, 0));
+        assert_eq!(history_bytes(&composer.undo), MAX_UNDO);
+
+        for _ in 0..MAX_UNDO {
+            assert!(composer.undo());
+        }
+        assert!(!composer.undo());
+        assert_state(&composer, &initial, 0);
+        assert_eq!((composer.undo.len(), history_bytes(&composer.redo)), (0, MAX_UNDO));
+
+        for _ in 0..MAX_UNDO {
+            assert!(composer.redo());
+        }
+        assert!(!composer.redo());
+        assert_state(&composer, &after_200, MAX_UNDO);
+        assert_eq!(history_bytes(&composer.undo), MAX_UNDO);
+
+        composer.move_doc_end(false);
+        let end_before = composer.cursor();
+        composer.insert_str("!?");
+        assert_eq!((composer.undo.len(), history_bytes(&composer.undo)), (MAX_UNDO, MAX_UNDO + 1));
+        assert!(composer.text().ends_with("!?") && composer.cursor() == end_before + 2);
+        assert!(composer.undo());
+        assert_state(&composer, &after_200, end_before);
+        assert!(composer.redo());
+        assert!(composer.text().ends_with("!?") && composer.cursor() == end_before + 2);
+    }
+
+    #[test]
+    fn undo_history_caps_at_200_steps_and_evicts_oldest() {
+        let mut composer = ComposerState::new();
+        insert_ascii_chars(&mut composer, 250, b'a');
+        let full = composer.text().to_string();
+        assert_eq!((composer.undo.len(), history_bytes(&composer.undo)), (MAX_UNDO, MAX_UNDO));
+
+        let undone = std::iter::from_fn(|| composer.undo().then_some(())).count();
+        assert_eq!(undone, MAX_UNDO);
+        assert_state(&composer, &full[..50], 50);
+
+        let redone = std::iter::from_fn(|| composer.redo().then_some(())).count();
+        assert_eq!(redone, MAX_UNDO);
+        assert_state(&composer, &full, 250);
+    }
+
+    #[test]
+    fn undo_followed_by_new_edit_clears_redo_stack() {
+        let mut composer = ComposerState::new();
+        insert_ascii_chars(&mut composer, 3, b'a');
+        assert!(composer.undo() && composer.undo());
+        assert_state(&composer, "a", 1);
+
+        composer.insert_char('Z');
+        assert_state(&composer, "aZ", 2);
+        assert_eq!((composer.redo.len(), history_bytes(&composer.redo)), (0, 0));
+        assert!(!composer.redo());
+
+        assert!(composer.undo());
+        assert_state(&composer, "a", 1);
+        assert!(composer.redo());
+        assert_state(&composer, "aZ", 2);
+    }
+
+    #[test]
+    fn utf8_korean_emoji_selection_replace_delete_and_normalization() {
+        let mut composer = composer_with("안녕 🚀 세계\r\n다음줄\r끝");
+        assert_eq!((composer.text(), composer.undo.len()), ("안녕 🚀 세계\n다음줄\n끝", 1));
+
+        let (sel_start, sel_end) = ("안녕 ".len(), "안녕 🚀 세계".len());
+        composer.set_cursor(sel_start);
+        for _ in 0..4 {
+            composer.move_right(true);
+        }
+        assert_eq!(composer.selected_text(), Some("🚀 세계"));
+        composer.insert_str("🎉변경");
+        assert_state(&composer, "안녕 🎉변경\n다음줄\n끝", sel_start + "🎉변경".len());
+        assert!(!composer.has_selection() && composer.undo.len() == 2);
+        assert!(composer.undo());
+        assert_state(&composer, "안녕 🚀 세계\n다음줄\n끝", sel_end);
+        assert!(composer.redo());
+        assert_state(&composer, "안녕 🎉변경\n다음줄\n끝", sel_start + "🎉변경".len());
+
+        // Backward selection over "🎉변경"
+        for _ in 0..3 {
+            composer.move_left(true);
+        }
+        assert_eq!(composer.selected_text(), Some("🎉변경"));
+        composer.insert_str("한글");
+        assert_state(&composer, "안녕 한글\n다음줄\n끝", sel_start + "한글".len());
+        assert!(composer.undo());
+        assert_state(&composer, "안녕 🎉변경\n다음줄\n끝", sel_start);
+        assert!(composer.redo());
+        assert_state(&composer, "안녕 한글\n다음줄\n끝", sel_start + "한글".len());
+
+        composer.delete_forward();
+        composer.backspace();
+        composer.delete_word_backward();
+        assert_eq!(composer.text(), "안녕 다음줄\n끝");
+        for expected in ["안녕 한다음줄\n끝", "안녕 한글다음줄\n끝", "안녕 한글\n다음줄\n끝"] {
+            assert!(composer.undo());
+            assert_eq!(composer.text(), expected);
+        }
+        assert!(composer.redo() && composer.redo() && composer.redo());
+        assert_eq!(composer.text(), "안녕 다음줄\n끝");
+    }
+
+    #[test]
+    fn undo_redo_after_cursor_move_preserves_cursor_restoration_semantics() {
+        let mut composer = composer_with("hello");
+        composer.insert_char('!');
+
+        // Move cursor before undo -> redo must later restore this moved position (0)
+        composer.set_cursor(0);
+        assert!(composer.undo());
+        assert_state(&composer, "hello", 5);
+
+        // Move cursor before redo -> subsequent undo must restore this moved position (2)
+        composer.set_cursor(2);
+        assert!(composer.redo());
+        assert_state(&composer, "hello!", 0);
+
+        assert!(composer.undo());
+        assert_state(&composer, "hello", 2);
+    }
+
+    #[test]
+    fn clear_and_load_text_reset_semantics() {
+        let mut composer = ComposerState::new();
+        composer.load_text("alpha\r\nbeta");
+        assert_state(&composer, "alpha\nbeta", "alpha\nbeta".len());
+        assert_eq!((composer.undo.len(), composer.redo.len()), (0, 0));
+
+        composer.insert_char('!');
+        assert!(composer.undo());
+        composer.set_cursor(5);
+        composer.stage_inline_image_with_preview(vec![1, 2, 3], "image/png", None, None);
+
+        composer.clear();
+        assert_state(&composer, "", 0);
+        assert!(composer.pending_images.is_empty());
+        assert_eq!((composer.undo.len(), composer.redo.len()), (1, 0));
+        assert!(composer.undo());
+        assert_state(&composer, "alpha\nbeta", 5);
+        assert!(composer.redo());
+        assert_state(&composer, "", 0);
+
+        // Empty clear without pending images is a no-op; with pending images records 1 undo step
+        composer.clear();
+        assert_eq!(composer.undo.len(), 1);
+        composer.load_text_cursor_start("x\ry");
+        assert_state(&composer, "x\ny", 0);
+        assert_eq!((composer.undo.len(), composer.redo.len()), (0, 0));
+
+        composer.load_text_cursor_start("");
+        composer.stage_inline_image_with_preview(vec![9], "image/png", None, None);
+        composer.clear();
+        assert!(composer.pending_images.is_empty() && composer.undo.len() == 1 && composer.undo());
     }
 }
