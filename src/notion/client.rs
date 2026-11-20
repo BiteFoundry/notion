@@ -86,6 +86,13 @@ impl NotionClient {
         &self.auth
     }
 
+    /// Returns `true` only when a Notion API error is an authoritative HTTP 404 `object_not_found`.
+    /// Transient 5xx, 429, network, auth (401/403), or generic errors return `false`.
+    pub fn is_authoritative_not_found(err: &anyhow::Error) -> bool {
+        let msg = err.to_string();
+        msg.contains("HTTP 404") && msg.contains("object_not_found")
+    }
+
     /// Executes an authenticated Notion REST API request with HTTP 429 (`Retry-After`) and 5xx retry.
     async fn request_json(
         &self,
@@ -335,7 +342,7 @@ impl NotionClient {
                         }
                     }
                 }
-                oldest_in_batch.is_some_and(|oldest| oldest <= wm)
+                oldest_in_batch.is_some_and(|oldest| oldest < wm)
             } else {
                 false
             };
@@ -509,9 +516,7 @@ impl NotionClient {
                     })
                     .collect();
                 for (idx, res) in futures::future::join_all(futs).await {
-                    if let Ok(children) = res {
-                        blocks[idx].children = children;
-                    }
+                    blocks[idx].children = res?;
                 }
             }
             Ok(blocks)
@@ -716,9 +721,25 @@ impl NotionClient {
         sorts: Option<Value>,
         max_rows: usize,
     ) -> Result<Vec<NotionPage>> {
+        let (rows, _) = self
+            .query_database_all_with_meta(database_id, filter, sorts, max_rows)
+            .await?;
+        Ok(rows)
+    }
+
+    /// Paginated `POST /v1/databases/{database_id}/query` returning `(rows, has_more)`.
+    /// `has_more` is `true` if Notion reported more pages or results were truncated at `max_rows`.
+    pub async fn query_database_all_with_meta(
+        &self,
+        database_id: &str,
+        filter: Option<Value>,
+        sorts: Option<Value>,
+        max_rows: usize,
+    ) -> Result<(Vec<NotionPage>, bool)> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let limit = max_rows.max(1);
+        let more_remaining: bool;
         loop {
             let (rows, has_more, next_cursor) = self
                 .query_database(
@@ -730,13 +751,18 @@ impl NotionClient {
                 )
                 .await?;
             all.extend(rows);
-            if !has_more || next_cursor.is_none() || all.len() >= limit {
+            if !has_more || next_cursor.is_none() {
+                more_remaining = has_more || all.len() > limit;
+                break;
+            }
+            if all.len() >= limit {
+                more_remaining = true;
                 break;
             }
             cursor = next_cursor;
         }
         all.truncate(limit);
-        Ok(all)
+        Ok((all, more_remaining))
     }
 
     /// `POST /v1/databases`

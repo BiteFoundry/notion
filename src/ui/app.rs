@@ -61,6 +61,8 @@ pub struct InlinePageEditor {
     pub last_synced_detail: Option<NotionPageDetail>,
     pub confirm_discard: bool,
     pub remote_blocks: Vec<NotionBlock>,
+    pub remote_conflict: Option<NotionPageDetail>,
+    pub confirm_overwrite: bool,
 }
 
 impl InlinePageEditor {
@@ -96,6 +98,8 @@ impl InlinePageEditor {
             last_synced_detail,
             confirm_discard: false,
             remote_blocks,
+            remote_conflict: None,
+            confirm_overwrite: false,
         }
     }
 
@@ -233,6 +237,12 @@ pub enum UiMsg {
     },
     DaemonDetached,
     PageRefreshed(Box<NotionPageDetail>),
+    TodoToggleFailed {
+        page_id: String,
+        block_id: String,
+        revert_checked: bool,
+        error: String,
+    },
     PageEdited {
         page_id: String,
         generation: u64,
@@ -522,6 +532,10 @@ impl AppState {
                     .load_page_detail(&self.workspace_id, &first_page.id)
                     .ok()
                     .flatten();
+                self.sync_ctrl.set_focus(FocusTarget {
+                    page_id: Some(first_page.id),
+                    database_id: None,
+                });
             } else if let Some(first_db) = self.databases.first().cloned() {
                 self.active_view = CanvasView::Database;
                 self.active_database_id = Some(first_db.id.clone());
@@ -529,6 +543,10 @@ impl AppState {
                     .storage
                     .list_database_rows(&self.workspace_id, &first_db.id)
                     .unwrap_or_default();
+                self.sync_ctrl.set_focus(FocusTarget {
+                    page_id: None,
+                    database_id: Some(first_db.id),
+                });
             }
         }
     }
@@ -569,9 +587,6 @@ impl AppState {
             page_id: Some(page_id.to_string()),
             database_id: None,
         });
-        self.sync_ctrl.request(SyncCommand::RefreshPage {
-            page_id: page_id.to_string(),
-        });
     }
 
     pub fn open_database(&mut self, database_id: &str, ui: &mut UiState, push_history: bool) {
@@ -595,9 +610,6 @@ impl AppState {
         self.sync_ctrl.set_focus(FocusTarget {
             page_id: None,
             database_id: Some(database_id.to_string()),
-        });
-        self.sync_ctrl.request(SyncCommand::RefreshDatabase {
-            database_id: database_id.to_string(),
         });
     }
 
@@ -656,6 +668,7 @@ impl AppState {
         ed.edit_generation = ed.edit_generation.saturating_add(1);
         ed.last_sync_error = None;
         ed.confirm_discard = false;
+        ed.confirm_overwrite = false;
         let page_id = ed.page_id.clone();
         let gen = ed.edit_generation;
         let snapshot = ed.composer.text().to_string();
@@ -702,6 +715,17 @@ impl AppState {
             return false;
         }
 
+        if ed.remote_conflict.is_some() && !ed.confirm_overwrite {
+            ed.confirm_overwrite = true;
+            ui.warning(
+                "Remote page changed — press Ctrl+S again to save your draft, or Esc x2 to reload",
+            );
+            return false;
+        }
+
+        let overwrite_after_conflict = ed.remote_conflict.take().is_some();
+        ed.confirm_overwrite = false;
+
         let next_gen = ed
             .edit_generation
             .max(ed.synced_generation)
@@ -711,10 +735,15 @@ impl AppState {
         ui.page_edit_generations.insert(page_id.clone(), next_gen);
 
         let in_flight = ed.sync_in_flight || ui.page_sync_in_flight.contains(&page_id);
-        let remote_blocks = ed.remote_blocks.clone();
+        let remote_blocks = if overwrite_after_conflict {
+            Vec::new()
+        } else {
+            ed.remote_blocks.clone()
+        };
 
-        // Update local detail & SQLite cache immediately on explicit save.
-        self.apply_optimistic_local(&page_id, &snapshot, true);
+        // Update in-memory detail immediately on explicit save, but persist SQLite only after
+        // server confirmation so failed saves never leave `__optimistic_*` IDs in SQLite.
+        self.apply_optimistic_local(&page_id, &snapshot, false);
 
         if in_flight {
             if queue_if_in_flight {
@@ -827,7 +856,7 @@ impl AppState {
             .saturating_add(1);
         ui.page_edit_generations.insert(page_id.clone(), next_gen);
 
-        self.apply_optimistic_local(&page_id, &edited_markdown, true);
+        self.apply_optimistic_local(&page_id, &edited_markdown, false);
 
         if ui.page_sync_in_flight.contains(&page_id) {
             ui.pending_page_sync.insert(
@@ -903,17 +932,50 @@ impl AppState {
         // Optimistic local update for instant feedback
         if let Some(ref mut detail) = self.active_page_detail {
             set_todo_in_tree(&mut detail.blocks, block_id, next_checked);
+            detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
+            detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
         }
         let client = self.client.clone();
         let storage = self.storage.clone();
         let ui_tx = self.ui_tx.clone();
         let bid = block_id.to_string();
         let page_id = self.active_page_id.clone().unwrap_or_default();
+        let ws_id = self.workspace_id.clone();
         ui.tasks.begin("todo");
         tokio::spawn(async move {
             match client.set_todo_checked(&bid, &page_id, next_checked).await {
-                Ok(_) => {
-                    if let Ok(detail) = crate::sync::sync_page_detail(&client, &storage, &page_id).await {
+                Ok(updated_block) => {
+                    let st = storage.clone();
+                    let ws_apply = ws_id.clone();
+                    let blk_apply = updated_block.clone();
+                    let applied = tokio::task::spawn_blocking(move || {
+                        let res = st.apply_updated_block(&ws_apply, &blk_apply)?;
+                        let detail = match &res {
+                            Some((pid, false)) => st.load_page_detail(&ws_apply, pid)?,
+                            _ => None,
+                        };
+                        Ok::<_, anyhow::Error>((res, detail))
+                    })
+                    .await;
+
+                    if let Ok(Ok((Some((_, false)), Some(detail)))) = applied {
+                        let _ = ui_tx.send(UiMsg::PageRefreshed(Box::new(detail)));
+                        return;
+                    }
+
+                    // Server response alone could not restore the cached tree: invalidate only this
+                    // page's detail marker and re-fetch directly while open.
+                    let st_inv = storage.clone();
+                    let ws_inv = ws_id.clone();
+                    let pid_inv = page_id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        st_inv.invalidate_page_detail(&ws_inv, &pid_inv)
+                    })
+                    .await;
+
+                    if let Ok(detail) =
+                        crate::sync::sync_page_detail_force(&client, &storage, &page_id).await
+                    {
                         let _ = ui_tx.send(UiMsg::PageRefreshed(Box::new(detail)));
                     } else {
                         let _ = ui_tx.send(UiMsg::TaskDone {
@@ -923,8 +985,10 @@ impl AppState {
                     }
                 }
                 Err(err) => {
-                    let _ = ui_tx.send(UiMsg::TaskFailed {
-                        label: "todo".into(),
+                    let _ = ui_tx.send(UiMsg::TodoToggleFailed {
+                        page_id,
+                        block_id: bid,
+                        revert_checked: !next_checked,
                         error: err.to_string(),
                     });
                 }
@@ -961,15 +1025,50 @@ impl AppState {
             }
             CoreEvent::PageDetailUpdated(detail) => {
                 self.reload_page_parent_hints();
-                let editing_or_syncing = ui
+                let syncing_own_edit = ui.page_sync_in_flight.contains(&detail.page.id)
+                    || ui.pending_page_sync.contains_key(&detail.page.id);
+                if syncing_own_edit {
+                    return;
+                }
+                let active_editor_matches = ui
                     .inline_editor
                     .as_ref()
-                    .is_some_and(|ed| ed.page_id == detail.page.id)
-                    || ui.page_sync_in_flight.contains(&detail.page.id)
-                    || ui.pending_page_sync.contains_key(&detail.page.id);
-                if !editing_or_syncing
-                    && self.active_page_id.as_deref() == Some(detail.page.id.as_str())
-                {
+                    .is_some_and(|ed| ed.page_id == detail.page.id);
+                if active_editor_matches {
+                    let incoming_md = normalize(&detail.markdown);
+                    if let Some(ed) = ui.inline_editor.as_mut() {
+                        let prev_ts = ed
+                            .last_synced_detail
+                            .as_ref()
+                            .and_then(|d| d.page.last_edited_time.as_deref());
+                        let remote_changed = incoming_md != ed.last_synced_markdown
+                            || detail.page.last_edited_time.as_deref() != prev_ts;
+                        if !ed.is_dirty() {
+                            if remote_changed {
+                                ed.composer.load_text_cursor_start(&incoming_md);
+                                ed.last_synced_markdown = incoming_md;
+                            }
+                            ed.remote_blocks = detail.blocks.clone();
+                            ed.last_synced_detail = Some((*detail).clone());
+                            ed.remote_conflict = None;
+                            ed.confirm_overwrite = false;
+                            if self.active_page_id.as_deref() == Some(detail.page.id.as_str()) {
+                                self.active_page_detail = Some(*detail);
+                            }
+                        } else if remote_changed {
+                            // Preserve the user's active draft buffer; record conflict for Ctrl+S guard
+                            // and update `last_synced_detail` so discarding restores latest remote.
+                            ed.remote_conflict = Some((*detail).clone());
+                            ed.last_synced_detail = Some(*detail);
+                            ed.confirm_overwrite = false;
+                            ui.warning(
+                                "Remote page changed — draft preserved (Ctrl+S twice to overwrite, Esc x2 to reload)",
+                            );
+                        }
+                    }
+                    return;
+                }
+                if self.active_page_id.as_deref() == Some(detail.page.id.as_str()) {
                     self.active_page_detail = Some(*detail);
                 }
             }
@@ -1024,9 +1123,37 @@ impl AppState {
             UiMsg::PageRefreshed(detail) => {
                 ui.tasks.finish("append", None);
                 ui.tasks.finish("todo", None);
-                self.active_page_detail = Some(*detail);
+                let editing_this_page = ui
+                    .inline_editor
+                    .as_ref()
+                    .is_some_and(|ed| ed.page_id == detail.page.id);
+                if self.active_page_id.as_deref() == Some(detail.page.id.as_str())
+                    && !editing_this_page
+                {
+                    self.active_page_detail = Some(*detail);
+                }
                 self.reload_page_parent_hints();
                 ui.success("Synced page");
+            }
+            UiMsg::TodoToggleFailed {
+                page_id,
+                block_id,
+                revert_checked,
+                error,
+            } => {
+                ui.tasks.finish("todo", Some(error.clone()));
+                let editing_this_page = ui
+                    .inline_editor
+                    .as_ref()
+                    .is_some_and(|ed| ed.page_id == page_id);
+                if self.active_page_id.as_deref() == Some(page_id.as_str()) && !editing_this_page {
+                    if let Some(ref mut detail) = self.active_page_detail {
+                        set_todo_in_tree(&mut detail.blocks, &block_id, revert_checked);
+                        detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
+                        detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
+                    }
+                }
+                ui.error(format!("todo failed: {error}"));
             }
             UiMsg::PageEdited {
                 page_id,

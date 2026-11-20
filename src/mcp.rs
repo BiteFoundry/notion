@@ -183,6 +183,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["page"],
                 "properties": {
                     "page": { "type": "string", "description": "Page UUID, Notion URL, or title" },
+                    "refresh": { "type": "boolean", "description": "Force refetch of blocks and comments even if page timestamp did not change" },
                     "offline": { "type": "boolean" }
                 }
             }
@@ -405,8 +406,9 @@ async fn dispatch_tool(
         }
         "get_page" => {
             let page = req_str("page")?;
+            let refresh = opt_bool("refresh", false);
             let offline = opt_bool("offline", false);
-            let detail = cli::op_get_page(client, storage, &page, offline).await?;
+            let detail = cli::op_get_page_with_options(client, storage, &page, refresh, offline).await?;
             Ok(serde_json::to_value(detail)?)
         }
         "get_page_blocks" => {
@@ -445,9 +447,15 @@ async fn dispatch_tool(
             let text = req_str("text")?;
             let block_type = opt_str("block_type");
             let checked = args.get("checked").and_then(Value::as_bool);
-            let updated =
-                cli::op_update_block_text(client, &block_id, block_type.as_deref(), &text, checked)
-                    .await?;
+            let updated = cli::op_update_block_text(
+                client,
+                storage,
+                &block_id,
+                block_type.as_deref(),
+                &text,
+                checked,
+            )
+            .await?;
             Ok(serde_json::to_value(updated)?)
         }
         "toggle_todo" => {

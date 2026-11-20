@@ -2,6 +2,7 @@
 //! and shared domain operations used across CLI, HTTP API (`serve`), and MCP (`mcp`).
 
 use std::{
+    collections::HashSet,
     fs,
     io::{self, IsTerminal, Write},
     path::PathBuf,
@@ -24,7 +25,8 @@ use crate::{
     parser::{
         block_comparison_key, blocks_to_markdown, blocks_to_plain_text, collect_media_refs,
         is_preserved_anchor_block, markdown_to_notion_blocks, parse_inline_markdown_rich_text,
-        parse_notion_block, parse_slash_command_blocks, partition_blocks_around_anchors,
+        parse_notion_block, parse_parent, parse_slash_command_blocks,
+        partition_blocks_around_anchors,
     },
     resolver, serve,
     storage::Storage,
@@ -96,6 +98,8 @@ pub enum PagesCommand {
         page: String,
         #[arg(long, default_value = "md", value_parser = ["md", "plain", "blocks"])]
         format: String,
+        #[arg(long)]
+        refresh: bool,
         #[arg(long)]
         offline: bool,
         #[arg(long)]
@@ -874,10 +878,11 @@ async fn handle_pages_cmd(
         PagesCommand::Get {
             page,
             format,
+            refresh,
             offline,
             json: as_json,
         } => {
-            let detail = op_get_page(client, storage, &page, offline).await?;
+            let detail = op_get_page_with_options(client, storage, &page, refresh, offline).await?;
             if as_json {
                 print_json(&detail)?;
             } else {
@@ -957,7 +962,7 @@ async fn handle_pages_cmd(
                 op_update_page_meta(client, storage, &page_id, title.as_deref(), icon.as_deref())
                     .await?
             } else {
-                let d = sync::sync_page_detail(client, storage, &page_id).await?;
+                let d = sync::sync_page_detail_force(client, storage, &page_id).await?;
                 d.page
             };
             if as_json {
@@ -1073,7 +1078,7 @@ async fn handle_blocks_cmd(
             block_id,
             json: as_json,
         } => {
-            let resp = client.delete_block(&block_id).await?;
+            let resp = op_delete_block(client, storage, &block_id).await?;
             if as_json {
                 print_json(&json!({ "ok": true, "deleted": block_id, "response": resp }))?;
             } else {
@@ -1516,6 +1521,16 @@ pub async fn op_get_page(
     page: &str,
     offline: bool,
 ) -> Result<NotionPageDetail> {
+    op_get_page_with_options(client, storage, page, false, offline).await
+}
+
+pub async fn op_get_page_with_options(
+    client: &NotionClient,
+    storage: &Storage,
+    page: &str,
+    refresh: bool,
+    offline: bool,
+) -> Result<NotionPageDetail> {
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id(storage, (!offline).then_some(client), &ws_id, page).await?;
     if offline {
@@ -1523,7 +1538,11 @@ pub async fn op_get_page(
             .load_page_detail(&ws_id, &id)?
             .ok_or_else(|| anyhow::anyhow!("Page '{page}' not found in local cache"));
     }
-    sync::sync_page_detail(client, storage, &id).await
+    if refresh {
+        sync::sync_page_detail_force(client, storage, &id).await
+    } else {
+        sync::sync_page_detail(client, storage, &id).await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2037,40 +2056,57 @@ pub async fn op_diff_sync_page_markdown(
         }
     }
 
-    let mut page_meta = match storage.get_page(&ws_id, &id)? {
-        Some(p) => p,
-        None => {
-            let fetched = client.get_page(&id).await?;
-            let _ = storage.upsert_page(&fetched);
-            fetched
+    let mut fetched_fresh_page = false;
+    let mut page_meta = match client.get_page(&id).await {
+        Ok(fresh) => {
+            fetched_fresh_page = true;
+            fresh
         }
+        Err(_) => match storage.get_page(&ws_id, &id)? {
+            Some(p) => p,
+            None => NotionPage {
+                id: id.clone(),
+                workspace_id: ws_id.clone(),
+                ..Default::default()
+            },
+        },
     };
     let comments = storage.load_page_comments(&ws_id, &id).unwrap_or_default();
 
-    let _ = storage.replace_page_blocks(&ws_id, &id, &final_blocks);
     page_meta.plain_text = blocks_to_plain_text(&final_blocks);
     let markdown = blocks_to_markdown(&final_blocks);
     let media = collect_media_refs(&final_blocks);
-
-    Ok(NotionPageDetail {
+    let detail = NotionPageDetail {
         page: page_meta,
         blocks: final_blocks,
         comments,
         markdown,
         media,
-    })
+    };
+
+    if fetched_fresh_page {
+        let _ = storage.save_page_detail(&detail);
+    } else {
+        let _ = storage.replace_page_blocks(&ws_id, &id, &detail.blocks);
+        let _ = storage.invalidate_page_detail(&ws_id, &id);
+    }
+
+    Ok(detail)
 }
 
 pub async fn op_update_block_text(
     client: &NotionClient,
+    storage: &Storage,
     block_id: &str,
     block_type: Option<&str>,
     text: &str,
     checked: Option<bool>,
 ) -> Result<NotionBlock> {
+    let ws_id = client.auth().active_workspace_id().await;
+    let norm_id = normalize_notion_id(block_id);
     let btype = match block_type {
         Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-        _ => client.get_block(block_id, "").await?.block_type,
+        _ => client.get_block(&norm_id, "").await?.block_type,
     };
     let mut inner = serde_json::Map::new();
     inner.insert(
@@ -2084,28 +2120,62 @@ pub async fn op_update_block_text(
     }
     let mut payload = serde_json::Map::new();
     payload.insert(btype, Value::Object(inner));
-    client
-        .update_block(block_id, "", Value::Object(payload))
-        .await
+    let mut updated = client
+        .update_block(&norm_id, "", Value::Object(payload))
+        .await?;
+    if let Ok(Some((pid, _))) = storage.apply_updated_block(&ws_id, &updated) {
+        if updated.page_id.trim().is_empty() {
+            updated.page_id = pid;
+        }
+    }
+    Ok(updated)
 }
 
 pub async fn op_toggle_todo(
     client: &NotionClient,
-    _storage: &Storage,
+    storage: &Storage,
     block_id: &str,
     explicit_checked: Option<bool>,
 ) -> Result<NotionBlock> {
+    let ws_id = client.auth().active_workspace_id().await;
+    let norm_id = normalize_notion_id(block_id);
     let target_checked = match explicit_checked {
         Some(val) => val,
         None => {
-            let current = client.get_block(block_id, "").await?;
+            let current = client.get_block(&norm_id, "").await?;
             match current.kind {
                 NotionBlockKind::ToDo { checked, .. } => !checked,
                 _ => bail!("Block '{block_id}' is not a to_do block"),
             }
         }
     };
-    client.set_todo_checked(block_id, "", target_checked).await
+    let mut updated = client.set_todo_checked(&norm_id, "", target_checked).await?;
+    if let Ok(Some((pid, _))) = storage.apply_updated_block(&ws_id, &updated) {
+        if updated.page_id.trim().is_empty() {
+            updated.page_id = pid;
+        }
+    }
+    Ok(updated)
+}
+
+pub async fn op_delete_block(
+    client: &NotionClient,
+    storage: &Storage,
+    block_id: &str,
+) -> Result<Value> {
+    let ws_id = client.auth().active_workspace_id().await;
+    let norm_id = normalize_notion_id(block_id);
+    let resp = client.delete_block(&norm_id).await?;
+    let deleted_page = storage.delete_cached_block(&ws_id, &norm_id).ok().flatten();
+    if deleted_page.is_none() {
+        let (ptype, pid) = parse_parent(resp.get("parent"));
+        if ptype == "page_id" {
+            if let Some(page_id) = pid {
+                let _ = storage.invalidate_page_detail(&ws_id, &page_id);
+            }
+        }
+    }
+    Ok(resp)
 }
 
 pub async fn op_list_databases(
@@ -2141,7 +2211,15 @@ pub async fn op_get_database(
             .get_database(&ws_id, &id)?
             .ok_or_else(|| anyhow::anyhow!("Database '{database}' not found in local cache"));
     }
-    let db = client.get_database(&id).await?;
+    let db = match client.get_database(&id).await {
+        Ok(d) => d,
+        Err(err) => {
+            if NotionClient::is_authoritative_not_found(&err) {
+                let _ = storage.mark_database_archived(&ws_id, &id);
+            }
+            return Err(err);
+        }
+    };
     let _ = storage.upsert_database(&db);
     Ok(db)
 }
@@ -2164,8 +2242,15 @@ pub async fn op_query_database(
         rows.truncate(limit);
         return Ok(rows);
     }
-    let rows = client.query_database_all(&id, filter, sorts, limit).await?;
+    let unfiltered = filter.is_none();
+    let (rows, has_more) = client
+        .query_database_all_with_meta(&id, filter, sorts, limit)
+        .await?;
     let _ = storage.upsert_pages(&rows);
+    if unfiltered && !has_more {
+        let active_row_ids: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let _ = storage.reconcile_database_rows_archived(&ws_id, &id, &active_row_ids);
+    }
     Ok(rows)
 }
 

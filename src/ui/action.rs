@@ -947,7 +947,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     && !ui
                         .inline_editor
                         .as_ref()
-                        .is_some_and(|ed| ed.sync_in_flight)
+                        .is_some_and(|ed| ed.sync_in_flight || ed.confirm_overwrite)
                 {
                     ui.info("No changes to save");
                 }
@@ -986,7 +986,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 match res {
                     Ok(_) => {
                         if let Ok(detail) =
-                            crate::sync::sync_page_detail(&client, &storage, &page_id).await
+                            crate::sync::sync_page_detail_force(&client, &storage, &page_id).await
                         {
                             let _ = ui_tx.send(UiMsg::PageRefreshed(Box::new(detail)));
                         } else {
@@ -1087,7 +1087,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::RequestExternalEditor => {
             if let Some(ed) = ui.inline_editor.take() {
                 // Preserve unsaved inline buffer in active_page_detail before launching external $EDITOR
-                app.apply_optimistic_local(&ed.page_id, ed.composer.text(), true);
+                app.apply_optimistic_local(&ed.page_id, ed.composer.text(), false);
                 ui.canvas_scroll = ed.scroll_y;
                 ui.cursor_pos = None;
             }

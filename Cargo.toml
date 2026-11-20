@@ -1,6 +1,6 @@
 [package]
 name = "notion-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Notion terminal client & AI agent toolkit — Pages, Blocks, Databases (Table/Board/List), Comments & Multi-Workspace (CLI, TUI, HTTP API, MCP)"
 license = "MIT"

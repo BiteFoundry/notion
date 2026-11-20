@@ -345,7 +345,7 @@ async fn get_page_handler(
     AxumPath(id): AxumPath<String>,
     Query(q): Query<OfflineParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let detail = cli::op_get_page(&state.client, &state.storage, &id, q.offline)
+    let detail = cli::op_get_page_with_options(&state.client, &state.storage, &id, q.refresh, q.offline)
         .await
         .map_err(ApiError::from_anyhow)?;
     Ok(Json(json!({ "ok": true, "detail": detail })))
@@ -436,6 +436,7 @@ async fn patch_block_handler(
     let updated = if let Some(ref text) = body.text {
         cli::op_update_block_text(
             &state.client,
+            &state.storage,
             &id,
             body.block_type.as_deref(),
             text,

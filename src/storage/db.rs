@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 12;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 13;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 14;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 15;
 
 /// Initializes SQLite WAL PRAGMAs, Notion workspace-scoped tables, indexes, and `pages_fts`.
 /// Returns `true` if `pages_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -83,6 +83,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             plain_text TEXT NOT NULL DEFAULT '',
             created_time TEXT,
             last_edited_time TEXT,
+            detail_synced_edited_time TEXT,
             synced_at TEXT,
             PRIMARY KEY (workspace_id, id)
         );
@@ -160,6 +161,9 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
     )
     .context("Failed to create Notion SQLite schema")?;
 
+    // Additive migration for pre-v14 databases: preserves all cached pages, blocks, comments, and FTS rows.
+    ensure_column_exists(conn, "pages", "detail_synced_edited_time", "TEXT")?;
+
     let trigram = ensure_fts5_table(
         conn,
         "pages_fts",
@@ -220,12 +224,37 @@ pub fn shrink_connection_memory(conn: &Connection) {
     let _ = conn.execute_batch("PRAGMA shrink_memory;");
 }
 
+fn ensure_column_exists(conn: &Connection, table: &str, column: &str, col_type: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table});"))?;
+    let mut has_col = false;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in rows.flatten() {
+        if name == column {
+            has_col = true;
+            break;
+        }
+    }
+    if !has_col {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {col_type};"))
+            .with_context(|| format!("Failed to add column {table}.{column}"))?;
+    }
+    Ok(())
+}
+
 fn ensure_fts5_table(
     conn: &Connection,
     table_name: &str,
     trigram_sql: &str,
     unicode61_sql: &str,
 ) -> Result<bool> {
+    if let Ok(existing_sql) = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table_name],
+        |row| row.get::<_, String>(0),
+    ) {
+        return Ok(existing_sql.to_ascii_lowercase().contains("trigram"));
+    }
+
     if conn.execute_batch(trigram_sql).is_err() {
         conn.execute_batch(unicode61_sql).with_context(|| {
             format!("Failed to create FTS5 virtual table ({table_name}, unicode61)")

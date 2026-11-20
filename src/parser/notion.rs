@@ -384,9 +384,12 @@ pub fn parse_notion_page(val: &Value, workspace_id: &str) -> Result<NotionPage> 
             .to_string(),
         archived: val
             .get("archived")
-            .or_else(|| val.get("in_trash"))
             .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .unwrap_or(false)
+            || val
+                .get("in_trash")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         is_favorite: false,
         properties,
         plain_text: String::new(),
@@ -478,9 +481,12 @@ pub fn parse_notion_database(val: &Value, workspace_id: &str) -> Result<NotionDa
             .to_string(),
         archived: val
             .get("archived")
-            .or_else(|| val.get("in_trash"))
             .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .unwrap_or(false)
+            || val
+                .get("in_trash")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         is_favorite: false,
         last_edited_time: val
             .get("last_edited_time")
@@ -538,7 +544,11 @@ pub fn parse_notion_block(
     let archived = val
         .get("archived")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || val
+            .get("in_trash")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     let inner = val.get(&block_type);
     let color = NotionColor::from_notion_str(
         inner
@@ -761,20 +771,36 @@ pub fn parse_notion_block(
         },
     };
 
+    let (parsed_parent_type, parsed_parent_id) = parse_parent(val.get("parent"));
+    let resolved_page_id = if !page_id.trim().is_empty() {
+        page_id.to_string()
+    } else if parsed_parent_type == "page_id" {
+        parsed_parent_id.clone().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let resolved_parent_block_id = parent_block_id.map(str::to_string).or_else(|| {
+        if parsed_parent_type == "block_id" {
+            parsed_parent_id
+        } else {
+            None
+        }
+    });
+
     let children = val
         .get("children")
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
-                .map(|c| parse_notion_block(c, page_id, Some(&id)))
+                .map(|c| parse_notion_block(c, &resolved_page_id, Some(&id)))
                 .collect()
         })
         .unwrap_or_default();
 
     NotionBlock {
         id,
-        page_id: page_id.to_string(),
-        parent_block_id: parent_block_id.map(str::to_string),
+        page_id: resolved_page_id,
+        parent_block_id: resolved_parent_block_id,
         block_type,
         has_children,
         archived,
