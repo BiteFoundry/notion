@@ -17,6 +17,9 @@ pub const DEFAULT_NOTION_API_BASE_URL: &str = "https://api.notion.com/v1";
 pub const NOTION_API_VERSION: &str = "2022-06-28";
 pub const DEFAULT_GITHUB_REPO: &str = "BiteFoundry/notion";
 pub const DEFAULT_SERVE_PORT: u16 = 8791;
+pub const DEFAULT_ACTIVE_POLL_MS: u64 = 5_000;
+pub const LEGACY_DEFAULT_ACTIVE_POLL_MS: u64 = 15_000;
+pub const DEFAULT_SYNC_POLL_MS: u64 = 60_000;
 
 /// TUI page canvas horizontal width mode (`Centered` editorial measure vs `Full` width).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
@@ -278,8 +281,8 @@ impl Default for AppConfig {
                 .and_then(|s| ImageProtocolPreference::parse_str(&s))
                 .unwrap_or_default(),
             download_dir: String::new(),
-            active_poll_ms: 15_000,
-            sync_poll_ms: 60_000,
+            active_poll_ms: DEFAULT_ACTIVE_POLL_MS,
+            sync_poll_ms: DEFAULT_SYNC_POLL_MS,
             cli_cache_ttl_secs: std::env::var("NOTION_CLI_CACHE_SECS")
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
@@ -351,6 +354,17 @@ impl AppConfig {
             default_download_dir()
         } else {
             expand_tilde(self.download_dir.trim())
+        }
+    }
+
+    /// Resolves the effective active page/database poll interval in milliseconds.
+    /// Profiles saved with the legacy v0.1.1 default (`15_000` ms) automatically receive
+    /// the new `5_000` ms default; any other explicit user value is preserved.
+    pub fn effective_active_poll_ms(&self) -> u64 {
+        if self.active_poll_ms == LEGACY_DEFAULT_ACTIVE_POLL_MS {
+            DEFAULT_ACTIVE_POLL_MS
+        } else {
+            self.active_poll_ms
         }
     }
 
@@ -757,5 +771,36 @@ mod tests {
         assert_eq!(p, ThemePreset::Auto);
         assert_eq!(PageWidthMode::Centered.toggle(), PageWidthMode::Full);
         assert_eq!(PageWidthMode::Full.toggle(), PageWidthMode::Centered);
+    }
+
+    #[test]
+    fn test_active_poll_ms_default_legacy_15000_and_explicit_preferences() {
+        let def = AppConfig::default();
+        assert_eq!(def.active_poll_ms, DEFAULT_ACTIVE_POLL_MS);
+        assert_eq!(def.effective_active_poll_ms(), 5_000);
+        assert_eq!(def.sync_poll_ms, 60_000);
+
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.toml");
+        fs::write(&legacy_path, "active_poll_ms = 15000\nsync_poll_ms = 60000\n").unwrap();
+        let legacy = AppConfig::load_from(&legacy_path).unwrap();
+        assert_eq!(legacy.effective_active_poll_ms(), 5_000);
+        assert_eq!(legacy.sync_poll_ms, 60_000);
+
+        let custom_slow_path = dir.path().join("custom_slow.toml");
+        fs::write(&custom_slow_path, "active_poll_ms = 20000\nsync_poll_ms = 90000\n").unwrap();
+        let custom_slow = AppConfig::load_from(&custom_slow_path).unwrap();
+        assert_eq!(custom_slow.effective_active_poll_ms(), 20_000);
+        assert_eq!(custom_slow.sync_poll_ms, 90_000);
+
+        let custom_fast_path = dir.path().join("custom_fast.toml");
+        fs::write(&custom_fast_path, "active_poll_ms = 3000\n").unwrap();
+        let custom_fast = AppConfig::load_from(&custom_fast_path).unwrap();
+        assert_eq!(custom_fast.effective_active_poll_ms(), 3_000);
+
+        let omitted_path = dir.path().join("omitted.toml");
+        fs::write(&omitted_path, "notify = true\n").unwrap();
+        let omitted = AppConfig::load_from(&omitted_path).unwrap();
+        assert_eq!(omitted.effective_active_poll_ms(), 5_000);
     }
 }

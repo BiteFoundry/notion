@@ -9,9 +9,10 @@ use anyhow::Result;
 #[cfg(not(windows))]
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyCode,
-    KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+    Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -291,11 +292,17 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
+            EnableFocusChange,
             EnableBracketedPaste
         )?;
         #[cfg(windows)]
         {
-            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+            execute!(
+                stdout,
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableFocusChange
+            )?;
             write_vt_mouse_enable(&mut stdout)?;
         }
 
@@ -354,13 +361,19 @@ impl TerminalGuard {
         let _ = execute!(
             stdout,
             DisableBracketedPaste,
+            DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
         #[cfg(windows)]
         {
             let _ = write_vt_mouse_disable(&mut stdout);
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(
+                stdout,
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
         }
         let _ = disable_raw_mode();
         #[cfg(windows)]
@@ -393,13 +406,19 @@ fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
         let _ = execute!(
             stdout,
             DisableBracketedPaste,
+            DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
         #[cfg(windows)]
         {
             let _ = write_vt_mouse_disable(&mut stdout);
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(
+                stdout,
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
         }
         let _ = disable_raw_mode();
         #[cfg(windows)]
@@ -852,7 +871,10 @@ fn handle_terminal_event(
                 let _ = action::dispatch(Action::LoadPreviewImage, app, ui);
             }
         }
-        _ => {}
+        CrosstermEvent::FocusGained => {
+            app.refresh_active_item();
+        }
+        CrosstermEvent::FocusLost => {}
     }
     LoopStep::Continue
 }
@@ -888,7 +910,13 @@ fn spawn_sync_supervisor(
             });
             let init_focus = proxy_focus_rx.borrow_and_update().clone();
             if init_focus != FocusTarget::default() {
-                conn.sync_ctrl.set_focus(init_focus);
+                conn.sync_ctrl.set_focus(init_focus.clone());
+                if let Some(page_id) = init_focus.page_id {
+                    conn.sync_ctrl.request(SyncCommand::RefreshPage { page_id });
+                } else if let Some(database_id) = init_focus.database_id {
+                    conn.sync_ctrl
+                        .request(SyncCommand::RefreshDatabase { database_id });
+                }
             }
             loop {
                 tokio::select! {
@@ -934,7 +962,14 @@ fn spawn_sync_supervisor(
 
         let cur_focus = proxy_focus_rx.borrow_and_update().clone();
         if cur_focus != FocusTarget::default() {
-            local_ctrl.set_focus(cur_focus);
+            local_ctrl.set_focus(cur_focus.clone());
+            if fell_back {
+                if let Some(page_id) = cur_focus.page_id {
+                    local_ctrl.request(SyncCommand::RefreshPage { page_id });
+                } else if let Some(database_id) = cur_focus.database_id {
+                    local_ctrl.request(SyncCommand::RefreshDatabase { database_id });
+                }
+            }
         }
 
         loop {
@@ -1031,11 +1066,17 @@ pub async fn run(
                 stdout,
                 EnterAlternateScreen,
                 EnableMouseCapture,
+                EnableFocusChange,
                 EnableBracketedPaste
             )?;
             #[cfg(windows)]
             {
-                execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+                execute!(
+                    stdout,
+                    EnterAlternateScreen,
+                    EnableMouseCapture,
+                    EnableFocusChange
+                )?;
                 write_vt_mouse_enable(&mut stdout)?;
             }
             if guard.keyboard_enhanced {
@@ -1092,8 +1133,9 @@ pub async fn run(
             maybe_core = core_rx.recv() => {
                 match maybe_core {
                     Some(ev) => {
-                        app.handle_core_event(&mut ui, ev);
-                        dirty = true;
+                        if app.handle_core_event(&mut ui, ev) {
+                            dirty = true;
+                        }
                     }
                     None => should_quit = true,
                 }
@@ -1135,8 +1177,9 @@ pub async fn run(
             while drained < MAX_COALESCED_EVENTS {
                 match core_rx.try_recv() {
                     Ok(ev) => {
-                        app.handle_core_event(&mut ui, ev);
-                        dirty = true;
+                        if app.handle_core_event(&mut ui, ev) {
+                            dirty = true;
+                        }
                         drained += 1;
                         progressed = true;
                     }

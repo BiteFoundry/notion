@@ -7,7 +7,10 @@
 //! - Recursive block tree fetching with depth cap
 //! - Automatic 100-block batching on `PATCH /v1/blocks/{block_id}/children`
 
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{bail, Context, Result};
 use reqwest::{
@@ -15,6 +18,7 @@ use reqwest::{
     Method, StatusCode,
 };
 use serde_json::{json, Value};
+use tokio::time::Instant;
 
 use crate::{
     auth::{parse_notion_user, AuthManager},
@@ -32,6 +36,8 @@ use crate::{
 const MAX_RETRIES: usize = 4;
 const DEFAULT_BLOCK_TREE_DEPTH: usize = 4;
 const MAX_APPEND_BATCH_SIZE: usize = 100;
+const STATUS_SERVICE_OVERLOAD: u16 = 529;
+const MIN_RETRY_AFTER_SECS: f64 = 0.05;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchFilterObject {
@@ -53,6 +59,7 @@ pub struct NotionClient {
     http: reqwest::Client,
     auth: AuthManager,
     api_base_url: String,
+    rate_limit_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl NotionClient {
@@ -66,7 +73,89 @@ impl NotionClient {
             http,
             auth,
             api_base_url: config.effective_api_base_url().trim_end_matches('/').to_string(),
+            rate_limit_until: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Remaining cooldown recorded from the most recent HTTP 429/529 `Retry-After` response.
+    pub fn rate_limit_remaining(&self) -> Duration {
+        self.rate_limit_remaining_at(Instant::now())
+    }
+
+    fn rate_limit_remaining_at(&self, now: Instant) -> Duration {
+        let guard = self
+            .rate_limit_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .and_then(|until| until.checked_duration_since(now))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn record_rate_limit_wait(&self, wait: Duration) {
+        self.record_rate_limit_wait_at(Instant::now(), wait);
+    }
+
+    fn record_rate_limit_wait_at(&self, now: Instant, wait: Duration) {
+        let target = now + wait;
+        let mut guard = self
+            .rate_limit_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_none_or(|cur| target > cur) {
+            *guard = Some(target);
+        }
+    }
+
+    async fn wait_for_rate_limit_cooldown(&self) {
+        self.wait_for_rate_limit_cooldown_with(Instant::now, tokio::time::sleep)
+            .await;
+    }
+
+    async fn wait_for_rate_limit_cooldown_with<N, S, Fut>(&self, mut now_fn: N, mut sleep_fn: S)
+    where
+        N: FnMut() -> Instant,
+        S: FnMut(Duration) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        loop {
+            let remaining = self.rate_limit_remaining_at(now_fn());
+            if remaining.is_zero() {
+                return;
+            }
+            sleep_fn(remaining).await;
+        }
+    }
+
+    fn parse_retry_after_header(
+        raw: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Duration {
+        let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Duration::from_secs(1);
+        };
+        if let Ok(secs) = trimmed.parse::<f64>() {
+            if secs.is_finite() && secs >= 0.0 {
+                if let Ok(dur) = Duration::try_from_secs_f64(secs.max(MIN_RETRY_AFTER_SECS)) {
+                    return dur;
+                }
+            }
+        }
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(trimmed) {
+            let delta = dt.with_timezone(&chrono::Utc).signed_duration_since(now);
+            let secs = (delta.num_milliseconds() as f64) / 1000.0;
+            if secs.is_finite() {
+                if let Ok(dur) = Duration::try_from_secs_f64(secs.max(MIN_RETRY_AFTER_SECS)) {
+                    return dur;
+                }
+            }
+        }
+        Duration::from_secs(1)
+    }
+
+    fn parse_retry_after(resp: &reqwest::Response) -> Duration {
+        let raw = resp.headers().get(RETRY_AFTER).and_then(|v| v.to_str().ok());
+        Self::parse_retry_after_header(raw, chrono::Utc::now())
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -109,6 +198,8 @@ impl NotionClient {
 
         let mut attempt = 0usize;
         loop {
+            self.wait_for_rate_limit_cooldown().await;
+
             let mut req = self
                 .http
                 .request(method.clone(), &url)
@@ -133,17 +224,36 @@ impl NotionClient {
             };
 
             let status = resp.status();
-            if status == StatusCode::TOO_MANY_REQUESTS && attempt < MAX_RETRIES {
-                let wait_secs = resp
-                    .headers()
-                    .get(RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.trim().parse::<f64>().ok())
-                    .unwrap_or(1.0)
-                    .clamp(0.05, 30.0);
-                attempt += 1;
-                tokio::time::sleep(Duration::from_secs_f64(wait_secs)).await;
-                continue;
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                let wait = Self::parse_retry_after(&resp);
+                self.record_rate_limit_wait(wait);
+                if attempt < MAX_RETRIES {
+                    attempt += 1;
+                    continue;
+                }
+            }
+
+            if status.as_u16() == STATUS_SERVICE_OVERLOAD {
+                let wait = Self::parse_retry_after(&resp);
+                let text = resp.text().await.unwrap_or_default();
+                let parsed: Value =
+                    serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+                let code = parsed
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("service_overload");
+                if code != "public_api_request_blocked" {
+                    self.record_rate_limit_wait(wait);
+                    if attempt < MAX_RETRIES {
+                        attempt += 1;
+                        continue;
+                    }
+                }
+                let msg = parsed
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| text.trim());
+                bail!("Notion API error (HTTP {status}, {code}): {msg}");
             }
 
             if matches!(
@@ -837,5 +947,119 @@ impl NotionClient {
             .await?;
         let pid = page_id.map(normalize_notion_id).unwrap_or_default();
         Ok(parse_notion_comment(&val, &pid))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_retry_after_preserves_values_over_120s_and_http_date() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            NotionClient::parse_retry_after_header(Some("180"), now),
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            NotionClient::parse_retry_after_header(Some("360.5"), now),
+            Duration::from_secs_f64(360.5)
+        );
+        assert_eq!(
+            NotionClient::parse_retry_after_header(Some("0"), now),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            NotionClient::parse_retry_after_header(Some("Fri, 20 Nov 2026 10:04:00 GMT"), now),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            NotionClient::parse_retry_after_header(None, now),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_cooldown_honors_over_120s_and_extension_while_sleeping() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_test_cooldown");
+        let client = NotionClient::new(&cfg, auth).unwrap();
+
+        // Deterministic virtual clock anchored at an Instant (zero wall-clock sleep).
+        let origin = Instant::now();
+        let elapsed = Arc::new(Mutex::new(Duration::ZERO));
+        let recorded_sleeps = Arc::new(Mutex::new(Vec::<Duration>::new()));
+
+        // Initial 10s cooldown recorded at t=0.
+        client.record_rate_limit_wait_at(origin, Duration::from_secs(10));
+
+        let elapsed_now = Arc::clone(&elapsed);
+        let elapsed_sleep = Arc::clone(&elapsed);
+        let sleeps_cap = Arc::clone(&recorded_sleeps);
+        let client_ext = client.clone();
+
+        client
+            .wait_for_rate_limit_cooldown_with(
+                move || origin + *elapsed_now.lock().unwrap(),
+                move |dur| {
+                    let elapsed_sleep = Arc::clone(&elapsed_sleep);
+                    let sleeps_cap = Arc::clone(&sleeps_cap);
+                    let client_ext = client_ext.clone();
+                    async move {
+                        let call_idx = {
+                            let mut s = sleeps_cap.lock().unwrap();
+                            s.push(dur);
+                            s.len()
+                        };
+                        if call_idx == 1 {
+                            // Mid-sleep (t=5s), another request receives Retry-After: 240s (>120s!)
+                            // extending cooldown to t = 5s + 240s = 245s.
+                            client_ext.record_rate_limit_wait_at(
+                                origin + Duration::from_secs(5),
+                                Duration::from_secs(240),
+                            );
+                        }
+                        *elapsed_sleep.lock().unwrap() += dur;
+                    }
+                },
+            )
+            .await;
+
+        let sleeps = recorded_sleeps.lock().unwrap().clone();
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_secs(10), Duration::from_secs(235)],
+            "waiter must re-check cooldown after waking and honor full >120s extension"
+        );
+        assert_eq!(*elapsed.lock().unwrap(), Duration::from_secs(245));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_cooldown_real_concurrent_extension_while_sleeping() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_test_cooldown_live");
+        let client = NotionClient::new(&cfg, auth).unwrap();
+
+        let start = Instant::now();
+        client.record_rate_limit_wait(Duration::from_millis(80));
+        let waiter_client = client.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_client.wait_for_rate_limit_cooldown().await;
+            Instant::now()
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Extend cooldown while waiter is mid-sleep
+        client.record_rate_limit_wait(Duration::from_millis(160));
+
+        let finished = waiter.await.unwrap();
+        assert!(
+            finished.duration_since(start) >= Duration::from_millis(170),
+            "concurrent waiter must honor cooldown extended while sleeping (elapsed={:?})",
+            finished.duration_since(start)
+        );
     }
 }

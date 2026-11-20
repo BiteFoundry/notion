@@ -556,6 +556,51 @@ impl AppState {
         self.databases.iter().find(|d| d.id == id)
     }
 
+    /// Requests a direct refresh of the currently visible page or database.
+    pub fn refresh_active_item(&self) {
+        match self.active_view {
+            CanvasView::Page => {
+                if let Some(page_id) = self.active_page_id.clone() {
+                    self.sync_ctrl.request(SyncCommand::RefreshPage { page_id });
+                }
+            }
+            CanvasView::Database => {
+                if let Some(database_id) = self.active_database_id.clone() {
+                    self.sync_ctrl
+                        .request(SyncCommand::RefreshDatabase { database_id });
+                }
+            }
+        }
+    }
+
+    fn merge_page_summary(&mut self, page: &NotionPage) -> bool {
+        if let Some(existing) = self.pages.iter_mut().find(|p| p.id == page.id) {
+            let mut changed = existing.title != page.title
+                || existing.icon != page.icon
+                || existing.cover_url != page.cover_url
+                || existing.archived != page.archived
+                || existing.parent_type != page.parent_type
+                || existing.parent_id != page.parent_id
+                || existing.properties != page.properties
+                || existing.last_edited_time != page.last_edited_time;
+            existing.title = page.title.clone();
+            existing.icon = page.icon.clone();
+            existing.cover_url = page.cover_url.clone();
+            existing.archived = page.archived;
+            existing.parent_type = page.parent_type.clone();
+            existing.parent_id = page.parent_id.clone();
+            existing.properties = page.properties.clone();
+            existing.last_edited_time = page.last_edited_time.clone();
+            if !page.plain_text.is_empty() && existing.plain_text != page.plain_text {
+                existing.plain_text = page.plain_text.clone();
+                changed = true;
+            }
+            changed
+        } else {
+            false
+        }
+    }
+
     pub fn open_page(&mut self, page_id: &str, ui: &mut UiState, push_history: bool) {
         if ui
             .inline_editor
@@ -996,7 +1041,7 @@ impl AppState {
         });
     }
 
-    pub fn handle_core_event(&mut self, ui: &mut UiState, ev: CoreEvent) {
+    pub fn handle_core_event(&mut self, ui: &mut UiState, ev: CoreEvent) -> bool {
         match ev {
             CoreEvent::ProfileLoaded(user) => {
                 if let Some(ref ws_name) = user.workspace_name {
@@ -1005,6 +1050,7 @@ impl AppState {
                     }
                 }
                 self.current_user = Some(user);
+                true
             }
             CoreEvent::WorkspaceTreeUpdated {
                 workspace_id,
@@ -1022,21 +1068,28 @@ impl AppState {
                         self.open_database(&first_db.id, ui, false);
                     }
                 }
+                true
             }
             CoreEvent::PageDetailUpdated(detail) => {
-                self.reload_page_parent_hints();
                 let syncing_own_edit = ui.page_sync_in_flight.contains(&detail.page.id)
                     || ui.pending_page_sync.contains_key(&detail.page.id);
                 if syncing_own_edit {
-                    return;
+                    return false;
                 }
+                let summary_changed = self.merge_page_summary(&detail.page);
                 let active_editor_matches = ui
                     .inline_editor
                     .as_ref()
                     .is_some_and(|ed| ed.page_id == detail.page.id);
                 if active_editor_matches {
                     let incoming_md = normalize(&detail.markdown);
+                    let mut visual_changed = summary_changed;
                     if let Some(ed) = ui.inline_editor.as_mut() {
+                        let next_title = detail.page.display_title().to_string();
+                        if ed.page_title != next_title {
+                            ed.page_title = next_title;
+                            visual_changed = true;
+                        }
                         let prev_ts = ed
                             .last_synced_detail
                             .as_ref()
@@ -1047,61 +1100,124 @@ impl AppState {
                             if remote_changed {
                                 ed.composer.load_text_cursor_start(&incoming_md);
                                 ed.last_synced_markdown = incoming_md;
+                                visual_changed = true;
                             }
                             ed.remote_blocks = detail.blocks.clone();
                             ed.last_synced_detail = Some((*detail).clone());
                             ed.remote_conflict = None;
                             ed.confirm_overwrite = false;
                             if self.active_page_id.as_deref() == Some(detail.page.id.as_str()) {
-                                self.active_page_detail = Some(*detail);
+                                let detail_changed = self.active_page_detail.as_ref().map_or(true, |cur| {
+                                    !crate::sync::page_detail_semantically_equal(cur, &detail)
+                                });
+                                if detail_changed {
+                                    self.reload_page_parent_hints();
+                                    self.active_page_detail = Some(*detail);
+                                    visual_changed = true;
+                                }
                             }
                         } else if remote_changed {
-                            // Preserve the user's active draft buffer; record conflict for Ctrl+S guard
-                            // and update `last_synced_detail` so discarding restores latest remote.
-                            ed.remote_conflict = Some((*detail).clone());
-                            ed.last_synced_detail = Some(*detail);
-                            ed.confirm_overwrite = false;
-                            ui.warning(
-                                "Remote page changed — draft preserved (Ctrl+S twice to overwrite, Esc x2 to reload)",
-                            );
+                            let same_conflict = ed.remote_conflict.as_ref().is_some_and(|prev| {
+                                normalize(&prev.markdown) == incoming_md
+                                    && prev.page.last_edited_time == detail.page.last_edited_time
+                                    && prev.comments == detail.comments
+                            });
+                            if !same_conflict {
+                                // Preserve the user's active draft buffer; record conflict for Ctrl+S guard
+                                // and update `last_synced_detail` so discarding restores latest remote.
+                                ed.remote_conflict = Some((*detail).clone());
+                                ed.last_synced_detail = Some(*detail);
+                                ed.confirm_overwrite = false;
+                                ui.warning(
+                                    "Remote page changed — draft preserved (Ctrl+S twice to overwrite, Esc x2 to reload)",
+                                );
+                                visual_changed = true;
+                            }
+                        } else if self.active_page_id.as_deref() == Some(detail.page.id.as_str()) {
+                            if let Some(active) = self.active_page_detail.as_mut() {
+                                if active.page.title != detail.page.title
+                                    || active.page.icon != detail.page.icon
+                                    || active.comments != detail.comments
+                                {
+                                    active.page.title = detail.page.title;
+                                    active.page.icon = detail.page.icon;
+                                    active.comments = detail.comments;
+                                    visual_changed = true;
+                                }
+                            }
                         }
                     }
-                    return;
+                    return visual_changed;
                 }
                 if self.active_page_id.as_deref() == Some(detail.page.id.as_str()) {
+                    let detail_changed = self.active_page_detail.as_ref().map_or(true, |cur| {
+                        !crate::sync::page_detail_semantically_equal(cur, &detail)
+                    });
+                    if !detail_changed && !summary_changed {
+                        return false;
+                    }
+                    self.reload_page_parent_hints();
                     self.active_page_detail = Some(*detail);
+                    return true;
                 }
+                if summary_changed {
+                    self.reload_page_parent_hints();
+                }
+                summary_changed
             }
             CoreEvent::DatabaseRowsUpdated {
                 database_id,
                 database,
                 rows,
             } => {
+                let mut changed = false;
                 if let Some(db) = database {
                     if let Some(existing) = self.databases.iter_mut().find(|d| d.id == db.id) {
-                        *existing = db;
+                        if !crate::sync::database_semantically_equal(existing, &db) {
+                            *existing = db;
+                            changed = true;
+                        }
                     } else {
                         self.databases.push(db);
+                        changed = true;
                     }
                 }
                 if self.active_database_id.as_deref() == Some(database_id.as_str()) {
-                    self.active_database_rows = rows;
+                    let rows_same = self.active_database_rows.len() == rows.len()
+                        && self
+                            .active_database_rows
+                            .iter()
+                            .zip(rows.iter())
+                            .all(|(a, b)| crate::sync::page_semantically_equal(a, b));
+                    if !rows_same {
+                        self.active_database_rows = rows;
+                        changed = true;
+                    }
                 }
+                changed
             }
             CoreEvent::CommentsUpdated { page_id, comments } => {
                 if let Some(ref mut detail) = self.active_page_detail {
-                    if detail.page.id == page_id {
+                    if detail.page.id == page_id && detail.comments != comments {
                         detail.comments = comments;
+                        return true;
                     }
                 }
+                false
             }
             CoreEvent::SyncStateChanged { busy, summary } => {
+                let next_retry = summary == POLL_RETRY_SUMMARY;
+                let changed = self.syncing != busy
+                    || ui.poll_retrying != next_retry
+                    || self.sync_summary != summary;
                 self.syncing = busy;
-                ui.poll_retrying = summary == POLL_RETRY_SUMMARY;
+                ui.poll_retrying = next_retry;
                 self.sync_summary = summary;
+                changed
             }
             CoreEvent::SyncError(err) => {
                 ui.error(format!("Sync: {err}"));
+                true
             }
         }
     }
@@ -1123,6 +1239,7 @@ impl AppState {
             UiMsg::PageRefreshed(detail) => {
                 ui.tasks.finish("append", None);
                 ui.tasks.finish("todo", None);
+                self.merge_page_summary(&detail.page);
                 let editing_this_page = ui
                     .inline_editor
                     .as_ref()
