@@ -706,7 +706,13 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             OverlayKind::Settings => ui.overlays.push(Overlay::settings()),
             OverlayKind::Help => ui.overlays.push(Overlay::help()),
             OverlayKind::Search => ui.overlays.push(Overlay::search()),
-            OverlayKind::Attachments => ui.overlays.push(Overlay::attachments()),
+            OverlayKind::Attachments => {
+                let mut tray = super::overlays::attachments::AttachmentsState::default();
+                if let Some(std::borrow::Cow::Owned(draft)) = app.detail_for_block_action(ui) {
+                    tray.draft_media = Some(draft.media);
+                }
+                ui.overlays.push(Overlay::Attachments(tray));
+            }
             OverlayKind::FilePicker => ui.overlays.push(Overlay::file_picker()),
             OverlayKind::PathInput => ui.overlays.push(Overlay::path_input()),
             _ => {}
@@ -728,16 +734,16 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             ui.overlays.push(Overlay::context_menu(menu));
         }
         Action::OpenLinkExtractor => {
-            if let Some(detail) = app.active_page_detail.as_ref() {
+            if let Some(detail) = app.detail_for_block_action(ui) {
                 ui.overlays
-                    .push(Overlay::links(LinkExtractorOverlay::from_notion_page(detail)));
+                    .push(Overlay::links(LinkExtractorOverlay::from_notion_page(&detail)));
             } else {
                 ui.info("Open a Notion page to extract links");
             }
         }
         Action::OpenImagePreview => {
-            if let Some(detail) = app.active_page_detail.as_ref() {
-                let visible = app.visible_blocks(ui);
+            if let Some(detail) = app.detail_for_block_action(ui) {
+                let visible = AppState::visible_detail_blocks(&detail, ui);
                 if let Some(vblk) = visible.get(ui.selected_block) {
                     match &vblk.block.kind {
                         NotionBlockKind::Code {
@@ -747,6 +753,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         } if is_html_code_language(language) => {
                             let html = spans_plain_text(rich_text);
                             let title = format!("{} ({language})", detail.page.display_title());
+                            drop(detail);
                             return dispatch(Action::OpenHtmlPreview { title, html }, app, ui);
                         }
                         NotionBlockKind::File { url, name, .. }
@@ -759,6 +766,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                             let u = url.clone();
                             let bid = vblk.block.id.clone();
                             let pid = Some(detail.page.id.clone());
+                            drop(detail);
                             return dispatch(
                                 Action::FetchHtmlPreview {
                                     title,
@@ -782,6 +790,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                             let u = url.clone();
                             let bid = vblk.block.id.clone();
                             let pid = Some(detail.page.id.clone());
+                            drop(detail);
                             return dispatch(
                                 Action::FetchHtmlPreview {
                                     title,
@@ -798,12 +807,14 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 }
                 let preferred_media_idx = visible.get(ui.selected_block).and_then(|vblk| {
                     if let NotionBlockKind::Image { url, .. } = &vblk.block.kind {
-                        find_media_index_for_block(detail, &vblk.block.id, url)
+                        find_media_index_for_block(&detail, &vblk.block.id, url)
                     } else {
                         None
                     }
                 });
-                if let Some(ov) = ImagePreviewOverlay::from_notion_page(detail, preferred_media_idx)
+                let overlay = ImagePreviewOverlay::from_notion_page(&detail, preferred_media_idx);
+                drop(detail);
+                if let Some(ov) = overlay
                 {
                     ui.overlays.push(Overlay::ImagePreview(ov));
                     return dispatch(Action::LoadPreviewImage, app, ui);
@@ -1087,7 +1098,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::RequestExternalEditor => {
             if let Some(ed) = ui.inline_editor.take() {
                 // Preserve unsaved inline buffer in active_page_detail before launching external $EDITOR
-                app.apply_optimistic_local(&ed.page_id, ed.composer.text(), false);
+                app.apply_optimistic_local(&ed.page_id, ed.composer.text());
                 ui.canvas_scroll = ed.scroll_y;
                 ui.cursor_pos = None;
             }
@@ -1297,8 +1308,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::CopyUrlToClipboard(url) => copy_to_clipboard(&url, "Copied URL to clipboard", ui),
         Action::CopySelectionOrMarkdown => {
-            if let Some(detail) = app.active_page_detail.as_ref() {
-                let visible = app.visible_blocks(ui);
+            if let Some(detail) = app.detail_for_block_action(ui) {
+                let visible = AppState::visible_detail_blocks(&detail, ui);
                 if let Some(vblk) = visible.get(ui.selected_block) {
                     if let NotionBlockKind::Code { ref rich_text, .. } = vblk.block.kind {
                         let code = crate::models::spans_plain_text(rich_text);
@@ -1518,7 +1529,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
         }
         Action::DownloadMedia(media_idx) => {
-            if let Some(detail) = app.active_page_detail.as_ref() {
+            if let Some(detail) = app.detail_for_block_action(ui) {
                 if let Some(m) = detail.media.get(media_idx).cloned() {
                     let cfg = app.config.clone();
                     let client = app.client.clone();
@@ -1697,15 +1708,13 @@ fn handle_inline_editor_action(action: &Action, app: &mut AppState, ui: &mut UiS
     match action {
         Action::Input(ch) => {
             let changed = if let Some(ed) = ui.inline_editor.as_mut() {
-                let before = ed.composer.text().len();
-                ed.composer.insert_char(*ch);
                 ed.follow_cursor = true;
-                ed.composer.text().len() != before
+                ed.composer.insert_char(*ch)
             } else {
                 false
             };
             if changed {
-                app.record_inline_mutation(ui, false);
+                AppState::record_inline_mutation(ui);
             }
             true
         }
@@ -1714,7 +1723,7 @@ fn handle_inline_editor_action(action: &Action, app: &mut AppState, ui: &mut UiS
                 ed.composer.newline();
                 ed.follow_cursor = true;
             }
-            app.record_inline_mutation(ui, false);
+            AppState::record_inline_mutation(ui);
             true
         }
         Action::Tab => {
@@ -1722,7 +1731,7 @@ fn handle_inline_editor_action(action: &Action, app: &mut AppState, ui: &mut UiS
                 ed.composer.insert_str("  ");
                 ed.follow_cursor = true;
             }
-            app.record_inline_mutation(ui, false);
+            AppState::record_inline_mutation(ui);
             true
         }
         Action::Backspace => {
@@ -1735,7 +1744,7 @@ fn handle_inline_editor_action(action: &Action, app: &mut AppState, ui: &mut UiS
                 false
             };
             if changed {
-                app.record_inline_mutation(ui, false);
+                AppState::record_inline_mutation(ui);
             }
             true
         }
@@ -1749,21 +1758,19 @@ fn handle_inline_editor_action(action: &Action, app: &mut AppState, ui: &mut UiS
                 false
             };
             if changed {
-                app.record_inline_mutation(ui, false);
+                AppState::record_inline_mutation(ui);
             }
             true
         }
         Action::Paste(text) => {
             let changed = if let Some(ed) = ui.inline_editor.as_mut() {
-                let before = ed.composer.text().to_string();
-                ed.composer.insert_str(text);
                 ed.follow_cursor = true;
-                ed.composer.text() != before
+                ed.composer.insert_str(text)
             } else {
                 false
             };
             if changed {
-                app.record_inline_mutation(ui, false);
+                AppState::record_inline_mutation(ui);
             }
             true
         }
@@ -1772,15 +1779,13 @@ fn handle_inline_editor_action(action: &Action, app: &mut AppState, ui: &mut UiS
                 if let Ok(text) = cb.get_text() {
                     if !text.is_empty() {
                         let changed = if let Some(ed) = ui.inline_editor.as_mut() {
-                            let before = ed.composer.text().to_string();
-                            ed.composer.insert_str(&text);
                             ed.follow_cursor = true;
-                            ed.composer.text() != before
+                            ed.composer.insert_str(&text)
                         } else {
                             false
                         };
                         if changed {
-                            app.record_inline_mutation(ui, false);
+                            AppState::record_inline_mutation(ui);
                         }
                     }
                 }
@@ -1796,7 +1801,7 @@ fn handle_inline_editor_action(action: &Action, app: &mut AppState, ui: &mut UiS
                 false
             };
             if changed {
-                app.record_inline_mutation(ui, false);
+                AppState::record_inline_mutation(ui);
             }
             true
         }
@@ -1809,7 +1814,7 @@ fn handle_inline_editor_action(action: &Action, app: &mut AppState, ui: &mut UiS
                 false
             };
             if changed {
-                app.record_inline_mutation(ui, false);
+                AppState::record_inline_mutation(ui);
             }
             true
         }
@@ -2362,7 +2367,7 @@ mod tests {
             parent_type: "workspace".into(),
             ..Default::default()
         };
-        app.pages = vec![root_page.clone(), child_page, sibling_page];
+        app.pages = [&root_page, &child_page, &sibling_page].into_iter().map(Into::into).collect();
 
         let mut schema = BTreeMap::new();
         schema.insert(
@@ -3061,7 +3066,7 @@ mod tests {
 
         // 6. Pressing 'v' in Attachments overlay on `.html` item dispatches FetchHtmlPreview,
         //    and on `.svg` item does NOT open ImagePreview!
-        let mut att = crate::ui::overlays::attachments::AttachmentsState { selected: 0 };
+        let mut att = crate::ui::overlays::attachments::AttachmentsState::default();
         match att.handle(&Action::Input('v'), &app) {
             OverlayOutcome::CloseAndDispatch(Action::FetchHtmlPreview { title, url, .. }) => {
                 assert_eq!(title, "dashboard.html");
@@ -3475,7 +3480,7 @@ mod tests {
         };
         app.storage.upsert_page(&page).unwrap();
         app.storage.upsert_page(&other_page).unwrap();
-        app.pages = vec![page.clone(), other_page.clone()];
+        app.pages = [&page, &other_page].into_iter().map(Into::into).collect();
         app.active_view = CanvasView::Page;
         app.active_page_id = Some(page.id.clone());
         app.active_page_detail = Some(NotionPageDetail {
@@ -3647,11 +3652,13 @@ mod tests {
         assert_eq!(act_undo, Action::Undo);
         dispatch(act_undo, &mut app, &mut ui);
 
-        // 0ms optimistic reflection: active_page_detail already reflects new Markdown & blocks
-        // BEFORE any HTTP sync completes, and preserves ChildPage!
+        // Rendering the draft leaves the active block model intact until save or preview.
         let ed_gen = ui.inline_editor.as_ref().unwrap().edit_generation;
         assert!(ed_gen > 0);
-        let opt_detail = app.active_page_detail.as_ref().unwrap();
+        let active_detail = app.active_page_detail.as_ref().unwrap();
+        assert_eq!(active_detail.markdown, "Old content");
+        assert!(!active_detail.page.plain_text.contains("qje 새 문단"));
+        let opt_detail = app.detail_for_block_action(&ui).unwrap();
         assert_eq!(opt_detail.markdown, "Old content\nqje 새 문단");
         assert!(opt_detail.page.plain_text.contains("qje 새 문단"));
         assert!(
@@ -3661,6 +3668,7 @@ mod tests {
                 .any(|b| matches!(b.kind, NotionBlockKind::ChildPage { ref title } if title == "Keep Child Page")),
             "optimistic update must preserve ChildPage blocks"
         );
+        drop(opt_detail);
 
         // 4. Ctrl+S flushes immediately while STAYING in inline edit mode!
         let act_save = crate::ui::event::key_to_action(
@@ -3818,7 +3826,7 @@ mod tests {
             ..Default::default()
         };
         app.storage.upsert_page(&page).unwrap();
-        app.pages = vec![page.clone()];
+        app.pages = vec![(&page).into()];
         app.active_view = CanvasView::Page;
         app.active_page_id = Some(page.id.clone());
         app.active_page_detail = Some(NotionPageDetail {
@@ -3862,7 +3870,7 @@ mod tests {
 
         // 3. First Esc with unsaved changes arms confirm_discard WITHOUT syncing; second Esc discards & restores active_page_detail
         dispatch(Action::Paste(" Temp".into()), &mut app, &mut ui);
-        assert_eq!(app.active_page_detail.as_ref().unwrap().markdown, "Hello Temp");
+        assert_eq!(app.active_page_detail.as_ref().unwrap().markdown, "Hello");
         dispatch(Action::CancelInlineEdit, &mut app, &mut ui);
         assert!(ui.inline_editor.is_some(), "1st Esc with unsaved edits must keep editor open");
         assert!(ui.inline_editor.as_ref().unwrap().confirm_discard);

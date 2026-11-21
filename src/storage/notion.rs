@@ -3,13 +3,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{
     config::WorkspaceProfile,
     models::{
         NotionBlock, NotionComment, NotionDatabase, NotionPage, NotionPageDetail,
-        NotionPropertySchema, NotionPropertyValue, NotionSearchHit,
+        NotionPageSummary, NotionPropertySchema, NotionPropertyValue, NotionSearchHit,
     },
     parser::{blocks_to_markdown, blocks_to_plain_text, collect_media_refs},
     storage::Storage,
@@ -114,8 +114,30 @@ impl Storage {
     /// Saves a full `NotionPageDetail` atomically (page metadata + blocks + comments + FTS5)
     /// and records `detail_synced_edited_time` only after blocks and comments are stored.
     pub fn save_page_detail(&self, detail: &NotionPageDetail) -> Result<()> {
+        self.store_page_detail(detail, false)?;
+        Ok(())
+    }
+
+    /// Records a fresh poll and returns whether it replaced the cached detail.
+    pub(crate) fn save_page_detail_if_changed(&self, detail: &NotionPageDetail) -> Result<bool> {
+        self.store_page_detail(detail, true)
+    }
+
+    fn store_page_detail(&self, detail: &NotionPageDetail, check_current: bool) -> Result<bool> {
         let mut conn = self.writer();
-        let tx = conn.transaction()?;
+        let tx = if check_current {
+            conn.transaction_with_behavior(TransactionBehavior::Immediate)?
+        } else {
+            conn.transaction()?
+        };
+        if check_current && page_detail_matches(&tx, detail)? {
+            tx.execute(
+                "UPDATE pages SET synced_at = ?1 WHERE workspace_id = ?2 AND id = ?3",
+                params![chrono::Utc::now().to_rfc3339(), detail.page.workspace_id, detail.page.id],
+            )?;
+            tx.commit()?;
+            return Ok(false);
+        }
         upsert_page_in_tx(&tx, &detail.page)?;
         replace_page_blocks_in_tx(
             &tx,
@@ -139,7 +161,7 @@ impl Storage {
             params![synced_edited, detail.page.workspace_id, detail.page.id],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Returns the remote `last_edited_time` recorded when blocks and comments were last fetched.
@@ -150,16 +172,7 @@ impl Storage {
         page_id: &str,
     ) -> Result<Option<String>> {
         let conn = self.reader();
-        let ts: Option<String> = conn
-            .query_row(
-                "SELECT detail_synced_edited_time FROM pages WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, page_id],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten()
-            .filter(|s| !s.trim().is_empty());
-        Ok(ts)
+        detail_sync_marker(&conn, workspace_id, page_id)
     }
 
     /// Invalidates only the body sync marker for a single page so the next online read refetches
@@ -407,6 +420,32 @@ impl Storage {
         Ok(out)
     }
 
+    pub(crate) fn list_page_summaries(&self, workspace_id: &str) -> Result<Vec<NotionPageSummary>> {
+        let conn = self.reader();
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace_id, parent_type, parent_id, title, icon, url,
+                    archived, is_favorite, properties_summary, last_edited_time
+             FROM pages WHERE workspace_id = ?1
+             ORDER BY is_favorite DESC, last_edited_time DESC, title ASC",
+        )?;
+        let rows = stmt.query_map(params![workspace_id], |r| {
+            Ok(NotionPageSummary {
+                id: r.get(0)?,
+                workspace_id: r.get(1)?,
+                parent_type: r.get(2)?,
+                parent_id: r.get(3)?,
+                title: r.get(4)?,
+                icon: r.get(5)?,
+                url: r.get(6)?,
+                archived: r.get::<_, i64>(7)? != 0,
+                is_favorite: r.get::<_, i64>(8)? != 0,
+                properties_summary: r.get(9)?,
+                last_edited_time: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn list_database_rows(&self, workspace_id: &str, database_id: &str) -> Result<Vec<NotionPage>> {
         let conn = self.reader();
         let mut stmt = conn.prepare(
@@ -426,15 +465,7 @@ impl Storage {
 
     pub fn get_page(&self, workspace_id: &str, page_id: &str) -> Result<Option<NotionPage>> {
         let conn = self.reader();
-        conn.query_row(
-            "SELECT id, workspace_id, parent_type, parent_id, title, icon, cover_url, url,
-                    archived, is_favorite, properties_json, plain_text, created_time, last_edited_time, synced_at
-             FROM pages WHERE workspace_id = ?1 AND id = ?2",
-            params![workspace_id, page_id],
-            map_page_row,
-        )
-        .optional()
-        .map_err(Into::into)
+        get_page(&conn, workspace_id, page_id)
     }
 
     pub fn list_databases(&self, workspace_id: &str) -> Result<Vec<NotionDatabase>> {
@@ -468,28 +499,7 @@ impl Storage {
 
     pub fn load_page_blocks(&self, workspace_id: &str, page_id: &str) -> Result<Vec<NotionBlock>> {
         let conn = self.reader();
-        let mut stmt = conn.prepare(
-            "SELECT id, parent_block_id, content_json
-             FROM blocks
-             WHERE workspace_id = ?1 AND page_id = ?2
-             ORDER BY position ASC",
-        )?;
-        let flat: Vec<(String, Option<String>, NotionBlock)> = stmt
-            .query_map(params![workspace_id, page_id], |r| {
-                let id: String = r.get(0)?;
-                let parent_id: Option<String> = r.get(1)?;
-                let json_str: String = r.get(2)?;
-                Ok((id, parent_id, json_str))
-            })?
-            .filter_map(|res| res.ok())
-            .filter_map(|(id, parent_id, json_str)| {
-                let mut blk = serde_json::from_str::<NotionBlock>(&json_str).ok()?;
-                blk.children.clear();
-                Some((id, parent_id, blk))
-            })
-            .collect();
-
-        Ok(rebuild_block_tree(flat))
+        load_page_blocks(&conn, workspace_id, page_id)
     }
 
     pub fn load_page_comments(
@@ -498,30 +508,7 @@ impl Storage {
         page_id: &str,
     ) -> Result<Vec<NotionComment>> {
         let conn = self.reader();
-        let mut stmt = conn.prepare(
-            "SELECT id, page_id, discussion_id, author, body, rich_text_json, created_time
-             FROM comments
-             WHERE workspace_id = ?1 AND page_id = ?2
-             ORDER BY created_time ASC",
-        )?;
-        let rows = stmt.query_map(params![workspace_id, page_id], |r| {
-            let rt_json: String = r.get(5)?;
-            let rich_text = serde_json::from_str(&rt_json).unwrap_or_default();
-            Ok(NotionComment {
-                id: r.get(0)?,
-                page_id: r.get(1)?,
-                discussion_id: r.get(2)?,
-                author: r.get(3)?,
-                body: r.get(4)?,
-                rich_text,
-                created_time: r.get(6)?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        load_page_comments(&conn, workspace_id, page_id)
     }
 
     pub fn load_page_detail(
@@ -757,6 +744,116 @@ impl Storage {
     }
 }
 
+fn get_page(conn: &Connection, workspace_id: &str, page_id: &str) -> Result<Option<NotionPage>> {
+    conn.query_row(
+        "SELECT id, workspace_id, parent_type, parent_id, title, icon, cover_url, url,
+                archived, is_favorite, properties_json, plain_text, created_time, last_edited_time, synced_at
+         FROM pages WHERE workspace_id = ?1 AND id = ?2",
+        params![workspace_id, page_id],
+        map_page_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn detail_sync_marker(conn: &Connection, workspace_id: &str, page_id: &str) -> Result<Option<String>> {
+    let ts: Option<String> = conn
+        .query_row(
+            "SELECT detail_synced_edited_time FROM pages WHERE workspace_id = ?1 AND id = ?2",
+            params![workspace_id, page_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .filter(|s| !s.trim().is_empty());
+    Ok(ts)
+}
+
+fn page_detail_matches(conn: &Connection, detail: &NotionPageDetail) -> Result<bool> {
+    let page = &detail.page;
+    let workspace_id = &page.workspace_id;
+    let page_id = &page.id;
+    let marker = detail_sync_marker(conn, workspace_id, page_id)?;
+    if marker.is_none() || marker != page.last_edited_time {
+        return Ok(false);
+    }
+    let Some(cached) = get_page(conn, workspace_id, page_id)? else {
+        return Ok(false);
+    };
+    if !crate::sync::page_semantically_equal(&cached, page)
+        || (!cached.is_favorite && page.is_favorite)
+        || load_page_blocks(conn, workspace_id, page_id)? != detail.blocks
+        || load_page_comments(conn, workspace_id, page_id)? != detail.comments
+    {
+        return Ok(false);
+    }
+    if page.archived {
+        return Ok(true);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pages_fts
+         WHERE workspace_id = ?1 AND page_id = ?2 AND item_type = 'page')",
+        params![workspace_id, page_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn load_page_blocks(conn: &Connection, workspace_id: &str, page_id: &str) -> Result<Vec<NotionBlock>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, parent_block_id, content_json
+         FROM blocks
+         WHERE workspace_id = ?1 AND page_id = ?2
+         ORDER BY position ASC",
+    )?;
+    let flat: Vec<(String, Option<String>, NotionBlock)> = stmt
+        .query_map(params![workspace_id, page_id], |r| {
+            let id: String = r.get(0)?;
+            let parent_id: Option<String> = r.get(1)?;
+            let json_str: String = r.get(2)?;
+            Ok((id, parent_id, json_str))
+        })?
+        .filter_map(|res| res.ok())
+        .filter_map(|(id, parent_id, json_str)| {
+            let mut blk = serde_json::from_str::<NotionBlock>(&json_str).ok()?;
+            blk.children.clear();
+            Some((id, parent_id, blk))
+        })
+        .collect();
+
+    Ok(rebuild_block_tree(flat))
+}
+
+fn load_page_comments(
+    conn: &Connection,
+    workspace_id: &str,
+    page_id: &str,
+) -> Result<Vec<NotionComment>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, page_id, discussion_id, author, body, rich_text_json, created_time
+         FROM comments
+         WHERE workspace_id = ?1 AND page_id = ?2
+         ORDER BY created_time ASC",
+    )?;
+    let rows = stmt.query_map(params![workspace_id, page_id], |r| {
+        let rt_json: String = r.get(5)?;
+        let rich_text = serde_json::from_str(&rt_json).unwrap_or_default();
+        Ok(NotionComment {
+            id: r.get(0)?,
+            page_id: r.get(1)?,
+            discussion_id: r.get(2)?,
+            author: r.get(3)?,
+            body: r.get(4)?,
+            rich_text,
+            created_time: r.get(6)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 fn upsert_page_in_tx(tx: &Connection, page: &NotionPage) -> Result<()> {
     let props_json = serde_json::to_string(&page.properties).unwrap_or_else(|_| "{}".into());
     let props_summary = page.properties_summary();
@@ -985,40 +1082,12 @@ fn delete_block_subtree_in_tx(tx: &Connection, workspace_id: &str, block_id: &st
     Ok(())
 }
 
-fn load_page_blocks_in_tx(
-    tx: &Connection,
-    workspace_id: &str,
-    page_id: &str,
-) -> Result<Vec<NotionBlock>> {
-    let mut stmt = tx.prepare(
-        "SELECT id, parent_block_id, content_json
-         FROM blocks
-         WHERE workspace_id = ?1 AND page_id = ?2
-         ORDER BY position ASC",
-    )?;
-    let flat: Vec<(String, Option<String>, NotionBlock)> = stmt
-        .query_map(params![workspace_id, page_id], |r| {
-            let id: String = r.get(0)?;
-            let parent_id: Option<String> = r.get(1)?;
-            let json_str: String = r.get(2)?;
-            Ok((id, parent_id, json_str))
-        })?
-        .filter_map(|res| res.ok())
-        .filter_map(|(id, parent_id, json_str)| {
-            let mut blk = serde_json::from_str::<NotionBlock>(&json_str).ok()?;
-            blk.children.clear();
-            Some((id, parent_id, blk))
-        })
-        .collect();
-    Ok(rebuild_block_tree(flat))
-}
-
 fn recompute_page_plain_text_in_tx(
     tx: &Connection,
     workspace_id: &str,
     page_id: &str,
 ) -> Result<()> {
-    let blocks = load_page_blocks_in_tx(tx, workspace_id, page_id)?;
+    let blocks = load_page_blocks(tx, workspace_id, page_id)?;
     let plain = blocks_to_plain_text(&blocks);
     tx.execute(
         "UPDATE pages SET plain_text = ?1, synced_at = ?2 WHERE workspace_id = ?3 AND id = ?4",
@@ -1214,6 +1283,77 @@ fn escape_like(raw: &str) -> String {
 mod tests {
     use super::*;
     use crate::models::{NotionBlockKind, NotionColor, RichTextSpan, SelectOption};
+
+    #[test]
+    fn unchanged_detail_keeps_the_index_and_detects_missing_or_changed_rows() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut detail = NotionPageDetail {
+            page: NotionPage {
+                id: "poll".into(),
+                workspace_id: "ws".into(),
+                last_edited_time: Some("2026-11-21T00:00:00Z".into()),
+                ..Default::default()
+            },
+            blocks: vec![NotionBlock {
+                id: "parent".into(),
+                page_id: "poll".into(),
+                has_children: true,
+                children: vec![NotionBlock {
+                    id: "image".into(),
+                    page_id: "poll".into(),
+                    parent_block_id: Some("parent".into()),
+                    block_type: "image".into(),
+                    kind: NotionBlockKind::Image {
+                        url: "https://example.com/first.png".into(),
+                        caption: Vec::new(),
+                        is_hosted: true,
+                    },
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            comments: vec![NotionComment {
+                id: "comment".into(),
+                page_id: "poll".into(),
+                body: "Before".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        detail.page.plain_text = blocks_to_plain_text(&detail.blocks);
+        assert!(storage.save_page_detail_if_changed(&detail).unwrap());
+
+        storage.writer().execute(
+            "UPDATE pages SET synced_at = 'previous' WHERE id = 'poll'",
+            [],
+        ).unwrap();
+        assert!(!storage.save_page_detail_if_changed(&detail).unwrap());
+        let saved = storage.get_page("ws", "poll").unwrap().unwrap();
+        assert_ne!(saved.synced_at.as_deref(), Some("previous"));
+        assert_eq!(
+            storage.get_page_detail_synced_edited_time("ws", "poll").unwrap(),
+            detail.page.last_edited_time,
+        );
+
+        let NotionBlockKind::Image { url, .. } = &mut detail.blocks[0].children[0].kind else {
+            panic!("expected nested image");
+        };
+        *url = "https://example.com/renewed.png".into();
+        detail.page.plain_text = blocks_to_plain_text(&detail.blocks);
+        assert!(storage.save_page_detail_if_changed(&detail).unwrap());
+        detail.comments[0].body = "Edited comment".into();
+        assert!(storage.save_page_detail_if_changed(&detail).unwrap());
+        let saved = storage.load_page_detail("ws", "poll").unwrap().unwrap();
+        assert_eq!(saved.blocks, detail.blocks);
+        assert_eq!(saved.comments, detail.comments);
+
+        storage.writer().execute("DELETE FROM blocks WHERE id = 'image'", []).unwrap();
+        assert!(storage.save_page_detail_if_changed(&detail).unwrap());
+        storage.writer().execute("DELETE FROM pages_fts WHERE page_id = 'poll'", []).unwrap();
+        assert!(storage.save_page_detail_if_changed(&detail).unwrap());
+        storage.invalidate_page_detail("ws", "poll").unwrap();
+        assert!(storage.save_page_detail_if_changed(&detail).unwrap());
+    }
 
     #[test]
     fn test_sqlite_fts5_and_korean_short_like_fallback() {

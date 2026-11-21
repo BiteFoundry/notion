@@ -246,19 +246,11 @@ pub struct NotionPage {
 
 impl NotionPage {
     pub fn display_icon(&self) -> &str {
-        self.icon
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or("📄")
+        page_display_icon(self.icon.as_deref())
     }
 
     pub fn display_title(&self) -> &str {
-        let t = self.title.trim();
-        if t.is_empty() {
-            "Untitled"
-        } else {
-            t
-        }
+        page_display_title(&self.title)
     }
 
     /// Concatenates property names and values for FTS5 search indexing.
@@ -272,6 +264,64 @@ impl NotionPage {
         }
         parts.join(" · ")
     }
+}
+
+/// Page metadata used by the workspace tree and its recent-page search suggestions.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotionPageSummary {
+    pub id: String,
+    pub workspace_id: String,
+    pub parent_type: String,
+    pub parent_id: Option<String>,
+    pub title: String,
+    pub icon: Option<String>,
+    pub url: String,
+    pub archived: bool,
+    pub is_favorite: bool,
+    pub properties_summary: String,
+    pub last_edited_time: Option<String>,
+}
+
+impl NotionPageSummary {
+    pub fn display_title(&self) -> &str {
+        page_display_title(&self.title)
+    }
+
+    pub fn display_icon(&self) -> &str {
+        page_display_icon(self.icon.as_deref())
+    }
+}
+
+impl From<&NotionPage> for NotionPageSummary {
+    fn from(page: &NotionPage) -> Self {
+        Self {
+            id: page.id.clone(),
+            workspace_id: page.workspace_id.clone(),
+            parent_type: page.parent_type.clone(),
+            parent_id: page.parent_id.clone(),
+            title: page.title.clone(),
+            icon: page.icon.clone(),
+            url: page.url.clone(),
+            archived: page.archived,
+            is_favorite: page.is_favorite,
+            properties_summary: page.properties_summary(),
+            last_edited_time: page.last_edited_time.clone(),
+        }
+    }
+}
+
+fn page_display_title(title: &str) -> &str {
+    let title = title.trim();
+    if title.is_empty() {
+        "Untitled"
+    } else {
+        title
+    }
+}
+
+fn page_display_icon(icon: Option<&str>) -> &str {
+    icon.filter(|s| !s.trim().is_empty()).unwrap_or("📄")
 }
 
 /// Notion Database metadata + property schema.
@@ -686,7 +736,7 @@ pub enum CoreEvent {
     ProfileLoaded(NotionUser),
     WorkspaceTreeUpdated {
         workspace_id: String,
-        pages: Vec<NotionPage>,
+        pages: Vec<NotionPageSummary>,
         databases: Vec<NotionDatabase>,
     },
     PageDetailUpdated(Box<NotionPageDetail>),

@@ -2,7 +2,7 @@
 //! sidebar tree builder, visible block flattener (with live toggle expansion),
 //! and database Table / Board (Kanban) / List query helpers.
 
-use std::collections::{HashMap, HashSet};
+use std::{borrow::Cow, collections::{HashMap, HashSet}};
 
 use bitefoundry_html::NativeHtmlServer;
 use ratatui::layout::Rect;
@@ -17,7 +17,7 @@ use crate::{
     },
     models::{
         CoreEvent, DatabaseSortMode, DatabaseViewMode, NotionBlock, NotionBlockKind, NotionColor,
-        NotionComment, NotionDatabase, NotionPage, NotionPageDetail, NotionPropertyValue,
+        NotionComment, NotionDatabase, NotionPage, NotionPageDetail, NotionPageSummary, NotionPropertyValue,
         NotionUser, POLL_RETRY_SUMMARY,
     },
     notion::NotionClient,
@@ -446,7 +446,7 @@ pub struct AppState {
     pub workspace_id: String,
     pub workspace_name: String,
     pub current_user: Option<NotionUser>,
-    pub pages: Vec<NotionPage>,
+    pub pages: Vec<NotionPageSummary>,
     pub databases: Vec<NotionDatabase>,
     pub block_owner_pages: HashMap<String, String>,
     pub child_page_positions: HashMap<String, i64>,
@@ -516,7 +516,7 @@ impl AppState {
     }
 
     pub fn load_cached_initial(&mut self) {
-        if let Ok(pages) = self.storage.list_pages(&self.workspace_id, true) {
+        if let Ok(pages) = self.storage.list_page_summaries(&self.workspace_id) {
             self.pages = pages;
         }
         if let Ok(dbs) = self.storage.list_databases(&self.workspace_id) {
@@ -575,26 +575,10 @@ impl AppState {
 
     fn merge_page_summary(&mut self, page: &NotionPage) -> bool {
         if let Some(existing) = self.pages.iter_mut().find(|p| p.id == page.id) {
-            let mut changed = existing.title != page.title
-                || existing.icon != page.icon
-                || existing.cover_url != page.cover_url
-                || existing.archived != page.archived
-                || existing.parent_type != page.parent_type
-                || existing.parent_id != page.parent_id
-                || existing.properties != page.properties
-                || existing.last_edited_time != page.last_edited_time;
-            existing.title = page.title.clone();
-            existing.icon = page.icon.clone();
-            existing.cover_url = page.cover_url.clone();
-            existing.archived = page.archived;
-            existing.parent_type = page.parent_type.clone();
-            existing.parent_id = page.parent_id.clone();
-            existing.properties = page.properties.clone();
-            existing.last_edited_time = page.last_edited_time.clone();
-            if !page.plain_text.is_empty() && existing.plain_text != page.plain_text {
-                existing.plain_text = page.plain_text.clone();
-                changed = true;
-            }
+            let mut summary = NotionPageSummary::from(page);
+            summary.is_favorite |= existing.is_favorite;
+            let changed = *existing != summary;
+            *existing = summary;
             changed
         } else {
             false
@@ -622,9 +606,21 @@ impl AppState {
 
         if let Ok(Some(cached)) = self.storage.load_page_detail(&self.workspace_id, page_id) {
             self.active_page_detail = Some(cached);
-        } else if let Some(p) = self.pages.iter().find(|p| p.id == page_id).cloned() {
+        } else if let Some(p) = self.pages.iter().find(|p| p.id == page_id) {
             self.active_page_detail = Some(NotionPageDetail {
-                page: p,
+                page: NotionPage {
+                    id: p.id.clone(),
+                    workspace_id: p.workspace_id.clone(),
+                    parent_type: p.parent_type.clone(),
+                    parent_id: p.parent_id.clone(),
+                    title: p.title.clone(),
+                    icon: p.icon.clone(),
+                    url: p.url.clone(),
+                    archived: p.archived,
+                    is_favorite: p.is_favorite,
+                    last_edited_time: p.last_edited_time.clone(),
+                    ..Default::default()
+                },
                 ..Default::default()
             });
         }
@@ -704,9 +700,8 @@ impl AppState {
         true
     }
 
-    /// Records a local text mutation on the active inline editor: resets discard confirmation,
-    /// bumps `edit_generation`, and reflects edits into `active_page_detail` in 0ms (0 API calls).
-    pub fn record_inline_mutation(&mut self, ui: &mut UiState, persist_sqlite: bool) {
+    /// Tracks a buffer mutation while the composer owns the draft and its undo history.
+    pub fn record_inline_mutation(ui: &mut UiState) {
         let Some(ed) = ui.inline_editor.as_mut() else {
             return;
         };
@@ -714,49 +709,41 @@ impl AppState {
         ed.last_sync_error = None;
         ed.confirm_discard = false;
         ed.confirm_overwrite = false;
-        let page_id = ed.page_id.clone();
-        let gen = ed.edit_generation;
-        let snapshot = ed.composer.text().to_string();
-        ui.page_edit_generations.insert(page_id.clone(), gen);
-
-        self.apply_optimistic_local(&page_id, &snapshot, persist_sqlite);
+        ui.page_edit_generations.insert(ed.page_id.clone(), ed.edit_generation);
     }
 
-    /// Applies `edited_markdown` optimistically to `active_page_detail` (and optionally SQLite cache)
-    /// with 0ms latency so leaving or staying in edit mode never shows stale content.
-    pub fn apply_optimistic_local(
-        &mut self,
-        page_id: &str,
-        edited_markdown: &str,
-        persist_sqlite: bool,
-    ) {
+    /// Builds the optimistic canvas detail for a save or external editor handoff.
+    pub fn apply_optimistic_local(&mut self, page_id: &str, edited_markdown: &str) {
         if let Some(ref mut detail) = self.active_page_detail {
-            if detail.page.id == page_id {
+            if detail.page.id == page_id && detail.markdown != edited_markdown {
                 apply_optimistic_markdown_to_detail(detail, edited_markdown);
-                if let Some(p) = self.pages.iter_mut().find(|p| p.id == page_id) {
-                    p.plain_text = detail.page.plain_text.clone();
-                }
-                if persist_sqlite {
-                    let _ = self
-                        .storage
-                        .replace_page_blocks(&self.workspace_id, page_id, &detail.blocks);
-                }
             }
         }
     }
 
-    /// Explicitly reflects the inline editor buffer locally + in SQLite and dispatches a
-    /// background diff-sync to Notion (or queues a coalesced follow-up if a save is already in flight).
+    /// Materializes the draft on demand for actions that read the page's blocks.
+    pub fn detail_for_block_action(&self, ui: &UiState) -> Option<Cow<'_, NotionPageDetail>> {
+        let detail = self.active_page_detail.as_ref()?;
+        if let Some(ed) = ui.inline_editor.as_ref().filter(|ed| ed.page_id == detail.page.id) {
+            let markdown = ed.composer.text();
+            if markdown != detail.markdown {
+                let mut draft = detail.clone();
+                apply_optimistic_markdown_to_detail(&mut draft, markdown);
+                return Some(Cow::Owned(draft));
+            }
+        }
+        Some(Cow::Borrowed(detail))
+    }
+
+    /// Reflects the draft in the canvas and dispatches a background diff-sync, coalescing
+    /// explicit saves while a previous save is in flight.
     pub fn flush_inline_editor_sync(&mut self, ui: &mut UiState, queue_if_in_flight: bool) -> bool {
         let Some(ed) = ui.inline_editor.as_mut() else {
             return false;
         };
         ed.confirm_discard = false;
         let page_id = ed.page_id.clone();
-        let snapshot = ed.composer.text().to_string();
-        let dirty = snapshot != ed.last_synced_markdown;
-
-        if !dirty {
+        if !ed.is_dirty() {
             return false;
         }
 
@@ -770,6 +757,7 @@ impl AppState {
 
         let overwrite_after_conflict = ed.remote_conflict.take().is_some();
         ed.confirm_overwrite = false;
+        let snapshot = ed.composer.text().to_string();
 
         let next_gen = ed
             .edit_generation
@@ -788,7 +776,7 @@ impl AppState {
 
         // Update in-memory detail immediately on explicit save, but persist SQLite only after
         // server confirmation so failed saves never leave `__optimistic_*` IDs in SQLite.
-        self.apply_optimistic_local(&page_id, &snapshot, false);
+        self.apply_optimistic_local(&page_id, &snapshot);
 
         if in_flight {
             if queue_if_in_flight {
@@ -843,9 +831,6 @@ impl AppState {
         };
         if let Some(saved_detail) = ed.last_synced_detail {
             if self.active_page_id.as_deref() == Some(ed.page_id.as_str()) {
-                if let Some(p) = self.pages.iter_mut().find(|p| p.id == ed.page_id) {
-                    p.plain_text = saved_detail.page.plain_text.clone();
-                }
                 self.active_page_detail = Some(saved_detail);
             }
         }
@@ -901,7 +886,7 @@ impl AppState {
             .saturating_add(1);
         ui.page_edit_generations.insert(page_id.clone(), next_gen);
 
-        self.apply_optimistic_local(&page_id, &edited_markdown, false);
+        self.apply_optimistic_local(&page_id, &edited_markdown);
 
         if ui.page_sync_in_flight.contains(&page_id) {
             ui.pending_page_sync.insert(
@@ -1294,10 +1279,8 @@ impl AppState {
                     .copied()
                     .unwrap_or(0);
 
-                if let Some(existing) = self.pages.iter_mut().find(|p| p.id == detail.page.id) {
-                    if generation >= current_gen {
-                        *existing = detail.page.clone();
-                    }
+                if generation >= current_gen {
+                    self.merge_page_summary(&detail.page);
                 }
 
                 let mut synced_detail = *detail;
@@ -1410,7 +1393,7 @@ impl AppState {
                 ui.tasks.finish("create", None);
                 let id = page.id.clone();
                 let title = page.title.clone();
-                self.pages.insert(0, page);
+                self.pages.insert(0, NotionPageSummary::from(&page));
                 if self.active_view == CanvasView::Database {
                     if let Some(db_id) = self.active_database_id.clone() {
                         self.sync_ctrl
@@ -1528,11 +1511,11 @@ impl AppState {
     /// Builds the Notion left sidebar entries: Favorites, Workspace hierarchical tree, Databases, Recent / Trash.
     pub fn build_sidebar_items(&self, ui: &UiState) -> Vec<SidebarItem> {
         let mut items = Vec::new();
-        let active_pages: Vec<&NotionPage> = self.pages.iter().filter(|p| !p.archived).collect();
-        let trashed_pages: Vec<&NotionPage> = self.pages.iter().filter(|p| p.archived).collect();
+        let active_pages: Vec<_> = self.pages.iter().filter(|p| !p.archived).collect();
+        let trashed_pages: Vec<_> = self.pages.iter().filter(|p| p.archived).collect();
 
         // 1. Favorites
-        let fav_pages: Vec<&NotionPage> = active_pages.iter().copied().filter(|p| p.is_favorite).collect();
+        let fav_pages: Vec<_> = active_pages.iter().copied().filter(|p| p.is_favorite).collect();
         let fav_dbs: Vec<&NotionDatabase> = self.databases.iter().filter(|d| d.is_favorite).collect();
         if !fav_pages.is_empty() || !fav_dbs.is_empty() {
             items.push(SidebarItem {
@@ -1628,8 +1611,8 @@ impl AppState {
             }
         }
 
-        let mut children_by_parent: HashMap<String, Vec<&NotionPage>> = HashMap::new();
-        let mut roots: Vec<&NotionPage> = Vec::new();
+        let mut children_by_parent: HashMap<String, Vec<&NotionPageSummary>> = HashMap::new();
+        let mut roots = Vec::new();
         for p in &active_pages {
             // Never dump database rows as top-level WORKSPACE pages (even if DB wasn't synced yet).
             if p.parent_type == "database_id" {
@@ -1647,7 +1630,7 @@ impl AppState {
             roots.push(p);
         }
 
-        let is_untitled = |p: &NotionPage| -> bool {
+        let is_untitled = |p: &NotionPageSummary| -> bool {
             let t = p.display_title().trim();
             t.is_empty() || t.eq_ignore_ascii_case("untitled")
         };
@@ -1686,9 +1669,9 @@ impl AppState {
         });
 
         fn push_tree<'a>(
-            node: &'a NotionPage,
+            node: &'a NotionPageSummary,
             depth: usize,
-            children_map: &HashMap<String, Vec<&'a NotionPage>>,
+            children_map: &HashMap<String, Vec<&'a NotionPageSummary>>,
             collapsed: &HashSet<String>,
             visited: &mut HashSet<&'a str>,
             out: &mut Vec<SidebarItem>,
@@ -1802,6 +1785,10 @@ impl AppState {
         let Some(detail) = self.active_page_detail.as_ref() else {
             return Vec::new();
         };
+        Self::visible_detail_blocks(detail, ui)
+    }
+
+    pub fn visible_detail_blocks(detail: &NotionPageDetail, ui: &UiState) -> Vec<VisibleBlock> {
         let mut out = Vec::new();
         flatten_visible_blocks(&detail.blocks, 0, &ui.expanded_toggles, &mut out);
         out

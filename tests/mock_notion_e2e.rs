@@ -2009,8 +2009,9 @@ async fn e2e_bidirectional_sync_versions_forced_refresh_block_writes_and_section
 
 #[tokio::test]
 async fn e2e_realtime_sync_dedup_churn_sidebar_merge_and_rate_limit() {
-    use notion_cli::models::{CoreEvent, NotionPage};
+    use notion_cli::models::{CoreEvent, NotionPageSummary};
     use notion_cli::sync::{FocusTarget, SyncCommand, SyncController};
+    use tokio::sync::oneshot;
 
     #[derive(Default)]
     struct RtMock {
@@ -2024,6 +2025,7 @@ async fn e2e_realtime_sync_dedup_churn_sidebar_merge_and_rate_limit() {
         icon_alpha: String,
         comments_alpha: Vec<Value>,
         hits: Vec<String>,
+        block_response_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     }
 
     let state = Arc::new(Mutex::new(RtMock {
@@ -2050,6 +2052,7 @@ async fn e2e_realtime_sync_dedup_churn_sidebar_merge_and_rate_limit() {
             "rich_text": [{ "plain_text": "Comment 1" }]
         })],
         hits: Vec::new(),
+        block_response_gate: None,
     }));
 
     let app_router = Router::new()
@@ -2149,7 +2152,7 @@ async fn e2e_realtime_sync_dedup_churn_sidebar_merge_and_rate_limit() {
         .route(
             "/v1/blocks/{id}/children",
             get(|State(st): State<Arc<Mutex<RtMock>>>, AxumPath(id): AxumPath<String>| async move {
-                let (delay, results) = {
+                let (delay, results, gate) = {
                     let mut g = st.lock().unwrap();
                     g.hits.push(format!("GET /blocks/{id}/children"));
                     let d = g.slow_delay_ms;
@@ -2182,8 +2185,17 @@ async fn e2e_realtime_sync_dedup_churn_sidebar_merge_and_rate_limit() {
                         }
                         v
                     };
-                    (d, res)
+                    let gate = if id == "page-a" {
+                        g.block_response_gate.take()
+                    } else {
+                        None
+                    };
+                    (d, res, gate)
                 };
+                if let Some((received, resume)) = gate {
+                    let _ = received.send(());
+                    let _ = resume.await;
+                }
                 if delay > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
@@ -2223,7 +2235,9 @@ async fn e2e_realtime_sync_dedup_churn_sidebar_merge_and_rate_limit() {
     cfg.sync_poll_ms = 60_000;
     let auth = AuthManager::from_token(cfg.clone(), "ntn_mock_token_123");
     let client = NotionClient::new(&cfg, auth.clone()).unwrap();
-    let storage = Storage::open_in_memory().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("cache.db");
+    let storage = Storage::open(&cache_path).unwrap();
 
     // 1. 429 & 529 Retry-After handling (and 529 public_api_request_blocked does NOT retry)
     state.lock().unwrap().return_429_once = true;
@@ -2445,6 +2459,35 @@ async fn e2e_realtime_sync_dedup_churn_sidebar_merge_and_rate_limit() {
         "visible page refresh must execute 0 workspace searches"
     );
 
+    // A separate forced refresh can commit while the quiet poll is still awaiting its response.
+    let (received, request) = oneshot::channel();
+    let (resume, release_response) = oneshot::channel();
+    {
+        let mut g = state.lock().unwrap();
+        g.para_by_page.insert("page-a".into(), "Concurrent refresh".into());
+        g.block_response_gate = Some((received, release_response));
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), request)
+        .await
+        .expect("periodic poll must request page blocks")
+        .unwrap();
+    let other_storage = Storage::open(&cache_path).unwrap();
+    let written = sync::sync_page_detail_force(&client, &other_storage, "page-a")
+        .await
+        .unwrap();
+    assert_eq!(written.blocks[0].plain_text(), "Concurrent refresh");
+    resume.send(()).unwrap();
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(CoreEvent::PageDetailUpdated(detail)) = ev_rx.recv().await {
+                break detail;
+            }
+        }
+    })
+    .await
+    .expect("the periodic poll must deliver the edit already written by the other connection");
+    assert_eq!(delivered.blocks[0].plain_text(), "Concurrent refresh");
+
     // 4. Rapid focus churn A -> B -> C -> D cannot lose latest target D!
     state.lock().unwrap().slow_delay_ms = 120;
     while ev_rx.try_recv().is_ok() {}
@@ -2486,7 +2529,7 @@ async fn e2e_realtime_sync_dedup_churn_sidebar_merge_and_rate_limit() {
         ui_tx,
     );
     app.workspace_id = client.auth().active_workspace_id().await;
-    app.pages = vec![NotionPage {
+    app.pages = vec![NotionPageSummary {
         id: "page-a".into(),
         workspace_id: app.workspace_id.clone(),
         title: "Alpha Spec".into(),

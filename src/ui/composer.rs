@@ -96,27 +96,30 @@ impl ComposerState {
     // Editing
     // ------------------------------------------------------------------
 
-    pub fn insert_char(&mut self, ch: char) {
+    pub fn insert_char(&mut self, ch: char) -> bool {
         if ch == '\r' {
-            return;
+            return false;
         }
         let mut buf = [0u8; 4];
-        self.insert_replacing_selection(ch.encode_utf8(&mut buf));
+        self.insert_replacing_selection(ch.encode_utf8(&mut buf))
     }
 
-    pub fn insert_str(&mut self, value: &str) {
+    pub fn insert_str(&mut self, value: &str) -> bool {
         let value = normalize(value);
         if value.is_empty() {
-            return;
+            return false;
         }
-        self.insert_replacing_selection(&value);
+        self.insert_replacing_selection(&value)
     }
 
-    fn insert_replacing_selection(&mut self, value: &str) {
+    fn insert_replacing_selection(&mut self, value: &str) -> bool {
         if let Some((start, end)) = self.selection_range() {
+            let changed = &self.text[start..end] != value;
             self.apply_edit(start..end, value);
+            changed
         } else {
             self.insert_at(self.cursor, value);
+            true
         }
     }
 

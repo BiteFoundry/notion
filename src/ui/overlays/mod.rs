@@ -457,7 +457,7 @@ mod tests {
         let ui = UiState::from_config(&cfg);
         let mut app = AppState::new(cfg, auth, client, storage, sync_ctrl, ui_tx);
 
-        app.pages = (0..6)
+        let pages: Vec<_> = (0..6)
             .map(|i| NotionPage {
                 id: format!("page-{i}"),
                 workspace_id: app.workspace_id.clone(),
@@ -465,6 +465,8 @@ mod tests {
                 ..Default::default()
             })
             .collect();
+
+        app.pages = pages.iter().map(Into::into).collect();
 
         let media = (0..6)
             .map(|i| NotionMediaRef {
@@ -476,7 +478,7 @@ mod tests {
             })
             .collect();
         app.active_page_detail = Some(NotionPageDetail {
-            page: app.pages[0].clone(),
+            page: pages[0].clone(),
             blocks: Vec::new(),
             comments: Vec::new(),
             markdown: String::new(),

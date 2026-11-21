@@ -69,7 +69,7 @@ impl CommandPalette {
                 out.push(PaletteEntry {
                     badge: "PAGE".into(),
                     label: format!("{} {}", p.display_icon(), p.display_title()),
-                    detail: p.properties_summary(),
+                    detail: p.properties_summary.clone(),
                     action: Action::OpenPageById(p.id.clone()),
                 });
             }

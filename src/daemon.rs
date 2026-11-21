@@ -1177,7 +1177,7 @@ async fn run_initial_bootstrap(
         summary: "Initial sync...".to_string(),
     });
 
-    match sync::sync_workspace_tree(&client, &storage).await {
+    match sync::sync_workspace_tree_summaries(&client, &storage).await {
         Ok((workspace_id, pages, databases)) => {
             let _ = event_tx.send(CoreEvent::WorkspaceTreeUpdated {
                 workspace_id,
@@ -1446,7 +1446,7 @@ async fn handle_client_connection(
                                 let ws_ev = ws.clone();
                                 if let Ok(Ok((pages, databases))) = tokio::task::spawn_blocking(move || {
                                     Ok::<_, anyhow::Error>((
-                                        st.list_pages(&ws, true)?,
+                                        st.list_page_summaries(&ws)?,
                                         st.list_databases(&ws)?,
                                     ))
                                 }).await {
@@ -1672,7 +1672,7 @@ mod tests {
             .engine_event_tx
             .send(CoreEvent::WorkspaceTreeUpdated {
                 workspace_id: "ws-1".to_string(),
-                pages: vec![crate::models::NotionPage {
+                pages: vec![crate::models::NotionPageSummary {
                     id: "p-1".to_string(),
                     workspace_id: "ws-1".to_string(),
                     title: "Welcome".to_string(),

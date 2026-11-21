@@ -37,6 +37,7 @@ pub fn is_raster_image_media(item: &NotionMediaRef) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct AttachmentsState {
     pub selected: usize,
+    pub(crate) draft_media: Option<Vec<NotionMediaRef>>,
 }
 
 impl AttachmentsState {
@@ -44,12 +45,14 @@ impl AttachmentsState {
         self.selected = index;
     }
 
+    fn media<'a>(&'a self, app: &'a AppState) -> &'a [NotionMediaRef] {
+        self.draft_media.as_deref().or_else(|| {
+            app.active_page_detail.as_ref().map(|detail| detail.media.as_slice())
+        }).unwrap_or_default()
+    }
+
     pub fn handle(&mut self, action: &Action, app: &AppState) -> OverlayOutcome {
-        let len = app
-            .active_page_detail
-            .as_ref()
-            .map(|d| d.media.len())
-            .unwrap_or(0);
+        let len = self.media(app).len();
         match action {
             Action::CloseOverlay | Action::Input('q') => OverlayOutcome::Close,
             Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
@@ -98,7 +101,7 @@ impl AttachmentsState {
             }
             Action::Input('v') => {
                 if let Some(detail) = app.active_page_detail.as_ref() {
-                    if let Some(item) = detail.media.get(self.selected.min(len.saturating_sub(1))) {
+                    if let Some(item) = self.media(app).get(self.selected.min(len.saturating_sub(1))) {
                         if is_html_media(item) {
                             return OverlayOutcome::CloseAndDispatch(Action::FetchHtmlPreview {
                                 title: item.display_name.clone(),
@@ -151,11 +154,7 @@ impl AttachmentsState {
             return;
         }
 
-        let media = app
-            .active_page_detail
-            .as_ref()
-            .map(|d| d.media.as_slice())
-            .unwrap_or(&[]);
+        let media = self.media(app);
         if media.is_empty() {
             frame.render_widget(
                 Paragraph::new(Span::styled("No media or files on this page.", theme.muted_style())),

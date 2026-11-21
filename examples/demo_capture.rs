@@ -846,7 +846,7 @@ fn build_demo_state() -> (AppState, UiState) {
     let _ = app.storage.upsert_pages(&db_rows);
     let _ = app.storage.upsert_databases(&databases);
 
-    app.pages = pages;
+    app.pages = pages.iter().map(Into::into).collect();
     app.databases = databases;
     app.active_view = CanvasView::Page;
     app.active_page_id = Some(page_launch.id.clone());

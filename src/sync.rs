@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, watch};
 use crate::{
     config::AppConfig,
     models::{
-        CoreEvent, NotionBlock, NotionDatabase, NotionPage, NotionPageDetail,
+        CoreEvent, NotionBlock, NotionDatabase, NotionPage, NotionPageDetail, NotionPageSummary,
         NotionPropertyValue, POLL_RETRY_SUMMARY,
     },
     notion::{NotionClient, SearchFilterObject},
@@ -99,6 +99,30 @@ pub async fn sync_workspace_tree_with_options<F>(
 where
     F: FnMut(usize, usize, usize),
 {
+    let (workspace_id, _, databases) =
+        sync_workspace_tree_summaries_with_options(client, storage, full_rescan, on_batch).await?;
+    let st = storage.clone();
+    let ws = workspace_id.clone();
+    let pages = tokio::task::spawn_blocking(move || st.list_pages(&ws, true)).await??;
+    Ok((workspace_id, pages, databases))
+}
+
+pub(crate) async fn sync_workspace_tree_summaries(
+    client: &NotionClient,
+    storage: &Storage,
+) -> Result<WorkspaceTree> {
+    sync_workspace_tree_summaries_with_options(client, storage, false, |_, _, _| {}).await
+}
+
+async fn sync_workspace_tree_summaries_with_options<F>(
+    client: &NotionClient,
+    storage: &Storage,
+    full_rescan: bool,
+    on_batch: F,
+) -> Result<WorkspaceTree>
+where
+    F: FnMut(usize, usize, usize),
+{
     let workspace_id = client.auth().active_workspace_id().await;
     let scope_key = format!("workspace:{workspace_id}");
 
@@ -166,9 +190,9 @@ where
         let (missing_page_ids, missing_db_ids) =
             tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<String>)> {
                 let mut missing_pages: Vec<String> = st_cand
-                    .list_pages(&ws_cand, false)?
+                    .list_page_summaries(&ws_cand)?
                     .into_iter()
-                    .filter(|p| !seen_page_ids.contains(&p.id))
+                    .filter(|p| !p.archived && !seen_page_ids.contains(&p.id))
                     .map(|p| p.id)
                     .collect();
                 let mut missing_dbs: Vec<String> = st_cand
@@ -250,7 +274,7 @@ where
     let st_read = storage.clone();
     let ws_read = workspace_id.clone();
     let (pages, databases, existing_owners) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let pages = st_read.list_pages(&ws_read, true)?;
+        let pages = st_read.list_page_summaries(&ws_read)?;
         let databases = st_read.list_databases(&ws_read)?;
         let (owners, _) = st_read
             .load_page_parent_hints(&ws_read)
@@ -384,25 +408,9 @@ async fn sync_page_detail_with_mode_tracked(
     let norm_id = crate::models::normalize_notion_id(page_id);
 
     if mode == DetailSyncMode::Force {
-        let detail = match client.fetch_page_detail(&norm_id).await {
-            Ok(d) => d,
-            Err(err) => {
-                if NotionClient::is_authoritative_not_found(&err) {
-                    let st_nf = storage.clone();
-                    let ws_nf = ws_id.clone();
-                    let id_nf = norm_id.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        st_nf.mark_page_archived(&ws_nf, &id_nf)
-                    })
-                    .await;
-                }
-                return Err(err);
-            }
-        };
-        let st = storage.clone();
-        let detail_clone = detail.clone();
-        tokio::task::spawn_blocking(move || st.save_page_detail(&detail_clone)).await??;
-        return Ok((detail, true));
+        return fetch_and_save_forced_page_detail(client, storage, &norm_id, false)
+            .await
+            .map(|detail| (detail, true));
     }
 
     let st_check = storage.clone();
@@ -469,6 +477,37 @@ async fn sync_page_detail_with_mode_tracked(
     tokio::task::spawn_blocking(move || st.save_page_detail(&detail_clone)).await??;
     Ok((detail, true))
 }
+
+async fn fetch_and_save_forced_page_detail(
+    client: &NotionClient,
+    storage: &Storage,
+    page_id: &str,
+    check_current: bool,
+) -> Result<NotionPageDetail> {
+    let detail = match client.fetch_page_detail(page_id).await {
+        Ok(detail) => detail,
+        Err(err) => {
+            if NotionClient::is_authoritative_not_found(&err) {
+                let st = storage.clone();
+                let ws_id = client.auth().active_workspace_id().await;
+                let id = page_id.to_owned();
+                let _ = tokio::task::spawn_blocking(move || st.mark_page_archived(&ws_id, &id)).await;
+            }
+            return Err(err);
+        }
+    };
+    let st = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        if check_current {
+            st.save_page_detail_if_changed(&detail)?;
+        } else {
+            st.save_page_detail(&detail)?;
+        }
+        Ok(detail)
+    })
+    .await?
+}
+
 
 /// Syncs a database schema and all its rows into SQLite (in parallel).
 pub async fn sync_database_rows(
@@ -555,7 +594,7 @@ struct ActiveDone {
     outcome: ActiveOutcome,
 }
 
-type WorkspaceTree = (String, Vec<NotionPage>, Vec<NotionDatabase>);
+type WorkspaceTree = (String, Vec<NotionPageSummary>, Vec<NotionDatabase>);
 type TreeDigest = [u8; 32];
 
 struct TreeDone {
@@ -695,17 +734,20 @@ pub(crate) fn page_detail_semantically_equal(a: &NotionPageDetail, b: &NotionPag
 
 fn tree_digest(
     workspace_id: &str,
-    pages: &[NotionPage],
+    pages: &[NotionPageSummary],
     databases: &[NotionDatabase],
 ) -> Result<TreeDigest> {
     let mut writer = BufWriter::new(Sha256::new());
     // Frame ordered page and database sequences without building another tree or JSON payload.
     serde_json::to_writer(&mut writer, &(workspace_id, pages.len(), databases.len()))?;
     for page in pages {
-        serde_json::to_writer(&mut writer, &page_semantic_fields(page))?;
+        serde_json::to_writer(&mut writer, page)?;
     }
     for database in databases {
-        serde_json::to_writer(&mut writer, &database_semantic_fields(database))?;
+        serde_json::to_writer(
+            &mut writer,
+            &(database_semantic_fields(database), database.is_favorite),
+        )?;
     }
     let hasher = writer.into_inner().map_err(|err| err.into_error())?;
     Ok(hasher.finalize().into())
@@ -1291,7 +1333,7 @@ async fn run_tree_refresh(
         let workspace_id = client.auth().active_workspace_id().await;
         let st = storage.clone();
         tokio::task::spawn_blocking(move || {
-            let pages = st.list_pages(&workspace_id, true).ok()?;
+            let pages = st.list_page_summaries(&workspace_id).ok()?;
             let databases = st.list_databases(&workspace_id).ok()?;
             tree_digest(&workspace_id, &pages, &databases).ok()
         })
@@ -1310,7 +1352,7 @@ async fn run_tree_refresh(
         }
     }
     let result: Result<_> = async {
-        let snapshot = sync_workspace_tree(client, storage).await?;
+        let snapshot = sync_workspace_tree_summaries(client, storage).await?;
         tokio::task::spawn_blocking(move || {
             let digest = tree_digest(&snapshot.0, &snapshot.1, &snapshot.2)?;
             let update = (loud || Some(digest) != previous_digest).then_some(snapshot);
@@ -1348,11 +1390,14 @@ async fn run_page_refresh(
     mode: DetailSyncMode,
     emit_unchanged: bool,
 ) -> ActiveOutcome {
+    let id = crate::models::normalize_notion_id(page_id);
+    // Compare against the pre-fetch detail for delivery. Another process can save
+    // the same payload while this request is in flight.
     let prev_cached = if !emit_unchanged {
         let ws_id = client.auth().active_workspace_id().await;
-        let norm_id = crate::models::normalize_notion_id(page_id);
         let st = storage.clone();
-        tokio::task::spawn_blocking(move || st.load_page_detail(&ws_id, &norm_id).ok().flatten())
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || st.load_page_detail(&ws_id, &id).ok().flatten())
             .await
             .ok()
             .flatten()
@@ -1360,7 +1405,15 @@ async fn run_page_refresh(
         None
     };
 
-    match sync_page_detail_with_mode_tracked(client, storage, page_id, mode).await {
+    let result = if mode == DetailSyncMode::Force && !emit_unchanged {
+        fetch_and_save_forced_page_detail(client, storage, &id, true)
+            .await
+            .map(|detail| (detail, true))
+    } else {
+        sync_page_detail_with_mode_tracked(client, storage, page_id, mode).await
+    };
+
+    match result {
         Ok((detail, fetched_body)) => {
             let http_requests = estimate_page_detail_http_requests(&detail.blocks);
             let changed = prev_cached
@@ -1450,34 +1503,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tree_digest_uses_remote_semantics_even_at_the_same_edit_time() {
-        let mut pages = vec![NotionPage {
+    fn tree_digest_tracks_displayed_metadata_at_the_same_edit_time() {
+        let mut page = NotionPage {
             id: "page".into(),
-            properties: BTreeMap::from([("count".into(), NotionPropertyValue::Number(Some(0.0)))]),
             last_edited_time: Some("2026-11-20T06:00:00Z".into()),
             ..Default::default()
-        }];
+        };
         let mut databases = vec![NotionDatabase {
             id: "db".into(),
-            last_edited_time: pages[0].last_edited_time.clone(),
+            last_edited_time: page.last_edited_time.clone(),
             ..Default::default()
         }];
-        let original = tree_digest("workspace", &pages, &databases).unwrap();
-
-        pages[0].is_favorite = true;
-        pages[0].synced_at = Some("local page sync".into());
-        pages[0]
-            .properties
-            .insert("count".into(), NotionPropertyValue::Number(Some(-0.0)));
-        databases[0].is_favorite = true;
+        let digest = |page: &NotionPage, dbs: &[NotionDatabase]| {
+            tree_digest("workspace", &[NotionPageSummary::from(page)], dbs).unwrap()
+        };
+        let original = digest(&page, &databases);
+        page.plain_text = "Changed body".into();
+        page.synced_at = Some("local page sync".into());
         databases[0].synced_at = Some("local database sync".into());
-        assert_eq!(tree_digest("workspace", &pages, &databases).unwrap(), original);
+        assert_eq!(digest(&page, &databases), original);
 
-        pages[0].title = "Updated title".into();
-        assert_ne!(tree_digest("workspace", &pages, &databases).unwrap(), original);
-        pages[0].title.clear();
+        page.title = "Updated title".into();
+        assert_ne!(digest(&page, &databases), original);
+        page.title.clear();
+        page.icon = Some("🔔".into());
+        assert_ne!(digest(&page, &databases), original);
+        page.icon = None;
+        page.is_favorite = true;
+        assert_ne!(digest(&page, &databases), original);
+        page.is_favorite = false;
         databases[0].description = "Updated description".into();
-        assert_ne!(tree_digest("workspace", &pages, &databases).unwrap(), original);
+        assert_ne!(digest(&page, &databases), original);
     }
 
     #[test]

@@ -43,7 +43,7 @@ impl SearchOverlay {
                     item_type: "page".into(),
                     title: p.display_title().to_string(),
                     icon: p.icon.clone(),
-                    snippet: p.properties_summary(),
+                    snippet: p.properties_summary.clone(),
                     url: p.url.clone(),
                     last_edited_time: p.last_edited_time.clone(),
                 })
