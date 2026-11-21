@@ -1097,14 +1097,14 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::RequestExternalEditor => {
             if let Some(ed) = ui.inline_editor.take() {
-                // Preserve unsaved inline buffer in active_page_detail before launching external $EDITOR
-                app.apply_optimistic_local(&ed.page_id, ed.composer.text());
+                ui.external_editor_seed = Some(ed.composer.text().to_string());
                 ui.canvas_scroll = ed.scroll_y;
                 ui.cursor_pos = None;
             }
             if app.active_page_id.is_some() {
                 ui.editor_requested = true;
             } else {
+                ui.external_editor_seed = None;
                 ui.warning("Open a page to edit in $EDITOR");
             }
         }

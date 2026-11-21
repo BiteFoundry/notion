@@ -1,13 +1,14 @@
-use std::{borrow::Cow, collections::HashSet, ops::Range};
+use std::{borrow::Cow, collections::HashSet, ops::Range, path::PathBuf};
 
 use anyhow::{bail, ensure, Result};
 use serde_json::{json, Value};
 
 use crate::{
-    models::{NotionBlock, NotionBlockKind, RichTextKind, RichTextSpan},
+    models::{normalize_notion_id, NotionBlock, NotionBlockKind, NotionPageDetail, RichTextKind, RichTextSpan},
     notion::NotionClient,
     parser::{
-        is_preserved_anchor_block, markdown_to_notion_blocks,
+        blocks_to_editor_markdown, has_column_blocks, is_preserved_anchor_block,
+        markdown_to_notion_blocks,
         notion::{
             block_inline_markdown, inline_markdown_spans, markdown_edit_ranges,
             rich_text_to_markdown,
@@ -40,7 +41,8 @@ struct Insertion {
 struct Draft {
     source: String,
     payload: Value,
-    children: Vec<Draft>,
+    children: Option<Vec<Draft>>,
+    children_markdown: String,
 }
 
 impl Draft {
@@ -48,14 +50,247 @@ impl Draft {
         self.payload["type"].as_str().expect("Markdown block type")
     }
 
-    fn into_payload(mut self) -> Value {
-        if !self.children.is_empty() {
-            let kind = self.kind().to_owned();
-            self.payload[&kind]["children"] =
-                Value::Array(self.children.into_iter().map(Self::into_payload).collect());
+    fn into_payload(mut self) -> Result<Value> {
+        let kind = self.kind().to_owned();
+        let children = match self.children.take() {
+            Some(children) => children,
+            None => {
+                let child_lines: Vec<&str> = self.children_markdown.lines().collect();
+                parse_drafts(&child_lines)?
+            }
+        };
+        if !children.is_empty() {
+            let mut child_payloads = Vec::with_capacity(children.len());
+            for child in children {
+                child_payloads.push(child.into_payload()?);
+            }
+            self.payload[&kind]["children"] = Value::Array(child_payloads);
         }
-        self.payload
+        Ok(self.payload)
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ColumnMarker<'a> {
+    ColumnListStart(&'a str),
+    ColumnStart(&'a str),
+    ColumnListEnd,
+    Malformed,
+}
+
+struct ParsedColumnList {
+    id: String,
+    columns: Vec<(String, String)>,
+}
+
+fn classify_column_marker(line: &str) -> Option<ColumnMarker<'_>> {
+    let trimmed = line.trim();
+    let after_open = trimmed.strip_prefix("<!--")?.trim_start();
+    if !after_open.starts_with("notion:column") && !after_open.starts_with("/notion:column") {
+        return None;
+    }
+    let Some(inner) = after_open.strip_suffix("-->") else {
+        return Some(ColumnMarker::Malformed);
+    };
+    let inner = inner.trim();
+    if inner == "/notion:column-list" {
+        return Some(ColumnMarker::ColumnListEnd);
+    }
+    if let Some(rest) = inner.strip_prefix("notion:column-list") {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            if let Some(id) = rest.trim().strip_prefix("id=") {
+                let id = id.trim();
+                if !id.is_empty() && !id.chars().any(char::is_whitespace) {
+                    return Some(ColumnMarker::ColumnListStart(id));
+                }
+            }
+        }
+        return Some(ColumnMarker::Malformed);
+    }
+    if let Some(rest) = inner.strip_prefix("notion:column") {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            if let Some(id) = rest.trim().strip_prefix("id=") {
+                let id = id.trim();
+                if !id.is_empty() && !id.chars().any(char::is_whitespace) {
+                    return Some(ColumnMarker::ColumnStart(id));
+                }
+            }
+        }
+        return Some(ColumnMarker::Malformed);
+    }
+    Some(ColumnMarker::Malformed)
+}
+
+pub(crate) fn contains_column_marker(markdown: &str) -> bool {
+    let mut fenced = false;
+    for line in markdown.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if !fenced && classify_column_marker(line).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn editor_markdown_for_detail(detail: &NotionPageDetail) -> String {
+    if has_column_blocks(&detail.blocks) {
+        blocks_to_editor_markdown(&detail.blocks)
+    } else {
+        detail.markdown.clone()
+    }
+}
+
+pub(crate) fn save_edit_recovery(page_id: &str, edited: &str) -> Result<PathBuf> {
+    let safe_id: String = page_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let file_name = format!(
+        "page-edit-{}-{}-{}.md",
+        if safe_id.is_empty() { "page" } else { &safe_id },
+        std::process::id(),
+        ts
+    );
+    let preferred = crate::config::data_dir().join("recovery").join(&file_name);
+    if crate::config::ensure_parent(&preferred).is_ok()
+        && std::fs::write(&preferred, edited.as_bytes()).is_ok()
+    {
+        return Ok(preferred);
+    }
+    let fallback = std::env::temp_dir().join(file_name);
+    std::fs::write(&fallback, edited.as_bytes())?;
+    Ok(fallback)
+}
+
+fn split_column_lists(markdown: &str) -> Result<(Vec<String>, Vec<ParsedColumnList>)> {
+    let mut segments = Vec::new();
+    let mut column_lists = Vec::new();
+    let mut cur_segment: Vec<&str> = Vec::new();
+    let mut active_list_id = String::new();
+    let mut active_columns: Vec<(String, String)> = Vec::new();
+    let mut cur_col: Option<(String, Vec<&str>)> = None;
+    let mut depth = 0usize;
+    let mut fenced = false;
+
+    for line in markdown.lines() {
+        let is_fence = line.trim_start().starts_with("```");
+        if is_fence {
+            fenced = !fenced;
+            if depth == 0 {
+                cur_segment.push(line);
+            } else if let Some((_, ref mut col_lines)) = cur_col {
+                col_lines.push(line);
+            } else {
+                bail!(
+                    "Content inside column list {} must appear under a column marker",
+                    active_list_id
+                );
+            }
+            continue;
+        }
+        let marker = if fenced {
+            None
+        } else {
+            classify_column_marker(line)
+        };
+        match (depth, marker) {
+            (0, None) => cur_segment.push(line),
+            (0, Some(ColumnMarker::ColumnListStart(id))) => {
+                segments.push(cur_segment.join("\n"));
+                cur_segment.clear();
+                active_list_id = id.to_owned();
+                active_columns.clear();
+                cur_col = None;
+                depth = 1;
+            }
+            (0, Some(ColumnMarker::ColumnStart(id))) => {
+                bail!(
+                    "Column marker for {} appeared outside a column list",
+                    id
+                );
+            }
+            (0, Some(ColumnMarker::ColumnListEnd)) => {
+                bail!("Closing column-list marker appeared without a matching start marker");
+            }
+            (_, Some(ColumnMarker::Malformed)) => {
+                bail!("Malformed column layout marker: {}", line.trim());
+            }
+            (1, Some(ColumnMarker::ColumnStart(id))) => {
+                if let Some((prev_id, prev_lines)) = cur_col.take() {
+                    active_columns.push((prev_id, prev_lines.join("\n")));
+                }
+                cur_col = Some((id.to_owned(), Vec::new()));
+            }
+            (1, Some(ColumnMarker::ColumnListEnd)) => {
+                if let Some((prev_id, prev_lines)) = cur_col.take() {
+                    active_columns.push((prev_id, prev_lines.join("\n")));
+                }
+                column_lists.push(ParsedColumnList {
+                    id: std::mem::take(&mut active_list_id),
+                    columns: std::mem::take(&mut active_columns),
+                });
+                depth = 0;
+            }
+            (1, Some(ColumnMarker::ColumnListStart(_))) => {
+                let Some((_, ref mut col_lines)) = cur_col else {
+                    bail!(
+                        "Nested column list inside {} must appear under a column marker",
+                        active_list_id
+                    );
+                };
+                col_lines.push(line);
+                depth += 1;
+            }
+            (1, None) => {
+                if let Some((_, ref mut col_lines)) = cur_col {
+                    col_lines.push(line);
+                } else if !line.trim().is_empty() {
+                    bail!(
+                        "Content inside column list {} must appear under a column marker",
+                        active_list_id
+                    );
+                }
+            }
+            (d, Some(ColumnMarker::ColumnListStart(_))) => {
+                if let Some((_, ref mut col_lines)) = cur_col {
+                    col_lines.push(line);
+                }
+                depth = d + 1;
+            }
+            (d, Some(ColumnMarker::ColumnListEnd)) => {
+                if let Some((_, ref mut col_lines)) = cur_col {
+                    col_lines.push(line);
+                }
+                depth = d - 1;
+            }
+            (_, _) => {
+                if let Some((_, ref mut col_lines)) = cur_col {
+                    col_lines.push(line);
+                }
+            }
+        }
+    }
+
+    ensure!(
+        depth == 0,
+        "Unclosed column list marker for {}",
+        active_list_id
+    );
+    segments.push(cur_segment.join("\n"));
+    Ok((segments, column_lists))
 }
 
 impl PageEdit {
@@ -117,6 +352,110 @@ impl PageEdit {
     }
 
     fn siblings(&mut self, parent: &str, old: &[NotionBlock], markdown: &str) -> Result<()> {
+        self.siblings_with_after(parent, old, markdown, None)
+    }
+
+    fn siblings_with_after(
+        &mut self,
+        parent: &str,
+        old: &[NotionBlock],
+        markdown: &str,
+        initial_after: Option<String>,
+    ) -> Result<()> {
+        let old_cl_indices: Vec<usize> = old
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| matches!(b.kind, NotionBlockKind::ColumnList).then_some(i))
+            .collect();
+
+        if contains_column_marker(markdown) {
+            let (segments, parsed_lists) = split_column_lists(markdown)?;
+            ensure!(
+                !old_cl_indices.is_empty(),
+                "Unexpected column layout markers: this container has no column lists"
+            );
+            ensure!(
+                old_cl_indices.len() == parsed_lists.len(),
+                "Column layout mismatch: expected {} column list(s), found {}",
+                old_cl_indices.len(),
+                parsed_lists.len()
+            );
+
+            let mut prev_old_end = 0usize;
+            let mut seg_after = initial_after;
+            for (idx, (&old_idx, parsed_cl)) in
+                old_cl_indices.iter().zip(parsed_lists.iter()).enumerate()
+            {
+                let old_cl = &old[old_idx];
+                ensure!(
+                    normalize_notion_id(&old_cl.id) == normalize_notion_id(&parsed_cl.id),
+                    "Column list marker id {} does not match existing block {}",
+                    parsed_cl.id,
+                    old_cl.id
+                );
+                ensure!(
+                    !old_cl.has_children || !old_cl.children.is_empty(),
+                    "Columns of block {} were not loaded",
+                    old_cl.id
+                );
+                ensure!(
+                    old_cl
+                        .children
+                        .iter()
+                        .all(|c| matches!(c.kind, NotionBlockKind::Column)),
+                    "Column list {} contains unexpected non-column child blocks",
+                    old_cl.id
+                );
+                ensure!(
+                    old_cl.children.len() == parsed_cl.columns.len(),
+                    "Column boundary mismatch in column list {}: expected {} column(s), found {}",
+                    old_cl.id,
+                    old_cl.children.len(),
+                    parsed_cl.columns.len()
+                );
+
+                self.siblings_plain(parent, &old[prev_old_end..old_idx], &segments[idx], seg_after)?;
+
+                for (old_col, (parsed_col_id, col_md)) in
+                    old_cl.children.iter().zip(parsed_cl.columns.iter())
+                {
+                    ensure!(
+                        normalize_notion_id(&old_col.id) == normalize_notion_id(parsed_col_id),
+                        "Column marker id {} does not match existing column {} in column list {}",
+                        parsed_col_id,
+                        old_col.id,
+                        old_cl.id
+                    );
+                    ensure!(
+                        !old_col.has_children || !old_col.children.is_empty(),
+                        "Children of column {} were not loaded",
+                        old_col.id
+                    );
+                    self.siblings_with_after(&old_col.id, &old_col.children, col_md, None)?;
+                }
+
+                seg_after = Some(old_cl.id.clone());
+                prev_old_end = old_idx + 1;
+            }
+
+            return self.siblings_plain(
+                parent,
+                &old[prev_old_end..],
+                &segments[old_cl_indices.len()],
+                seg_after,
+            );
+        }
+
+        self.siblings_plain(parent, old, markdown, initial_after)
+    }
+
+    fn siblings_plain(
+        &mut self,
+        parent: &str,
+        old: &[NotionBlock],
+        markdown: &str,
+        initial_after: Option<String>,
+    ) -> Result<()> {
         let (original, ranges) = markdown_edit_ranges(old);
         let old_lines: Vec<_> = original.lines().collect();
         let new_lines: Vec<_> = markdown.lines().collect();
@@ -139,7 +478,7 @@ impl PageEdit {
 
         let mut old_start = 0;
         let mut new_start = 0;
-        let mut after = None;
+        let mut after = initial_after;
         for (index, range) in ranges.into_iter().enumerate() {
             let start = old_visible.partition_point(|&line| line < range.start);
             let end = old_visible.partition_point(|&line| line < range.end);
@@ -206,6 +545,15 @@ impl PageEdit {
         let mut new_blocks = Vec::new();
         for (index, block) in old.iter().enumerate() {
             if opaque(block) {
+                if matches!(
+                    block.kind,
+                    NotionBlockKind::ColumnList | NotionBlockKind::Column
+                ) {
+                    bail!(
+                        "Cannot edit column layout {} without intact column markers. Reopen the page and keep the <!-- notion:column ... --> markers.",
+                        block.id,
+                    );
+                }
                 let original = crate::parser::blocks_to_markdown(std::slice::from_ref(block));
                 let partly_matched = original
                     .lines()
@@ -219,7 +567,9 @@ impl PageEdit {
                 // A draft that omits the trailing protected block still places new
                 // siblings before it, as it did when that block was visible.
                 if last_editable.is_none_or(|last| index > last) {
-                    new_blocks.extend(drafts.by_ref().map(Draft::into_payload));
+                    for draft in drafts.by_ref() {
+                        new_blocks.push(draft.into_payload()?);
+                    }
                 }
                 self.queue_insertion(parent, after, &mut new_blocks);
                 *after = Some(block.id.clone());
@@ -239,7 +589,7 @@ impl PageEdit {
                     block.id,
                 );
                 if same_count {
-                    new_blocks.push(drafts.next().unwrap().into_payload());
+                    new_blocks.push(drafts.next().unwrap().into_payload()?);
                 }
             }
             // Hidden children (e.g. depth-capped reads) and structural blocks keep their IDs.
@@ -249,7 +599,9 @@ impl PageEdit {
                 *after = Some(block.id.clone());
             }
         }
-        new_blocks.extend(drafts.map(Draft::into_payload));
+        for draft in drafts {
+            new_blocks.push(draft.into_payload()?);
+        }
         self.queue_insertion(parent, after, &mut new_blocks);
         Ok(())
     }
@@ -312,19 +664,14 @@ impl PageEdit {
             kind,
             "bulleted_list_item" | "numbered_list_item" | "to_do" | "toggle" | "callout"
         );
-        if !draft.children.is_empty() || (renders_children && !block.children.is_empty()) {
+        let has_draft_children = !draft.children_markdown.trim().is_empty();
+        if has_draft_children || (renders_children && !block.children.is_empty()) {
             ensure!(
                 !block.has_children || !block.children.is_empty(),
                 "Children of block {} were not loaded",
                 block.id
             );
-            let markdown = draft
-                .children
-                .iter()
-                .map(|draft| draft.source.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            self.siblings(&block.id, &block.children, &markdown)?;
+            self.siblings(&block.id, &block.children, &draft.children_markdown)?;
         }
         Ok(())
     }
@@ -412,7 +759,7 @@ pub(crate) fn same_edit_baseline(original: &[NotionBlock], current: &[NotionBloc
                 && a.block_type == b.block_type
                 && a.has_children == b.has_children
                 && a.archived == b.archived
-                && (opaque(a) || a.kind == b.kind)
+                && ((opaque(a) && opaque(b)) || a.kind == b.kind)
                 && same_edit_baseline(&a.children, &b.children)
         })
 }
@@ -446,6 +793,10 @@ fn parse_drafts(lines: &[&str]) -> Result<Vec<Draft>> {
         ensure!(
             !line.starts_with("  "),
             "Indented Markdown has no editable parent"
+        );
+        ensure!(
+            classify_column_marker(line).is_none(),
+            "Column layout markers cannot be inserted as plain Markdown blocks"
         );
         ensure!(
             ![
@@ -485,11 +836,17 @@ fn parse_drafts(lines: &[&str]) -> Result<Vec<Draft>> {
             .iter()
             .map(|s| s.strip_prefix("  ").unwrap_or(s))
             .collect();
-        let children = parse_drafts(&child_lines)?;
+        let children_markdown = child_lines.join("\n");
+        let children = if contains_column_marker(&children_markdown) {
+            None
+        } else {
+            Some(parse_drafts(&child_lines)?)
+        };
         out.push(Draft {
             source: lines[start..i].join("\n"),
             payload: payloads.pop().unwrap(),
             children,
+            children_markdown,
         });
     }
     Ok(out)
@@ -897,5 +1254,129 @@ mod tests {
             matches[1000..1500],
             (2000..2500).map(Some).collect::<Vec<_>>()
         );
+    }
+
+    fn two_column_blocks() -> Vec<NotionBlock> {
+        let mut left_col = parse_notion_block(
+            &json!({ "id": "col-left", "type": "column", "has_children": true, "column": {} }),
+            "page",
+            Some("col-list"),
+        );
+        left_col.children.push(block("para-left", "paragraph", "LEFT OLD"));
+
+        let mut right_col = parse_notion_block(
+            &json!({ "id": "col-right", "type": "column", "has_children": true, "column": {} }),
+            "page",
+            Some("col-list"),
+        );
+        right_col.children.push(block("para-right", "paragraph", "RIGHT OLD"));
+
+        let mut col_list = parse_notion_block(
+            &json!({ "id": "col-list", "type": "column_list", "has_children": true, "column_list": {} }),
+            "page",
+            None,
+        );
+        col_list.children = vec![left_col, right_col];
+        vec![col_list]
+    }
+
+    #[test]
+    fn column_layout_edits_patch_column_paragraphs_in_place() {
+        let blocks = two_column_blocks();
+        let plain = blocks_to_markdown(&blocks);
+        assert!(!plain.contains("<!-- notion:column"));
+        let editor_md = blocks_to_editor_markdown(&blocks);
+        assert!(editor_md.contains("<!-- notion:column-list id=col-list -->"));
+        assert!(editor_md.contains("<!-- notion:column id=col-left -->"));
+        assert!(editor_md.contains("<!-- notion:column id=col-right -->"));
+        assert!(editor_md.contains("<!-- /notion:column-list -->"));
+
+        assert!(PageEdit::plan("page", &blocks, &editor_md).unwrap().is_empty());
+        assert!(PageEdit::plan("page", &blocks, &plain).unwrap().is_empty());
+
+        // 1. Edit only the left column -> 1 PATCH on para-left, 0 inserts, 0 archives
+        let left_only = PageEdit::plan(
+            "page",
+            &blocks,
+            &editor_md.replace("LEFT OLD", "LEFT NEW"),
+        )
+        .unwrap();
+        assert!(left_only.inserts.is_empty());
+        assert!(left_only.archives.is_empty());
+        assert_eq!(left_only.patches.len(), 1);
+        assert_eq!(left_only.patches[0].id, "para-left");
+
+        // 2. Edit both columns -> 2 PATCHes (para-left, para-right), 0 inserts, 0 archives
+        let both = PageEdit::plan(
+            "page",
+            &blocks,
+            &editor_md
+                .replace("LEFT OLD", "LEFT NEW")
+                .replace("RIGHT OLD", "RIGHT NEW"),
+        )
+        .unwrap();
+        assert!(both.inserts.is_empty());
+        assert!(both.archives.is_empty());
+        assert_eq!(both.patches.len(), 2);
+        assert_eq!(both.patches[0].id, "para-left");
+        assert_eq!(both.patches[1].id, "para-right");
+    }
+
+    #[test]
+    fn column_layout_rejects_missing_or_corrupted_markers_without_root_insert() {
+        let blocks = two_column_blocks();
+        let editor_md = blocks_to_editor_markdown(&blocks);
+
+        // Plain markerless edits to both columns must NEVER fall back to root insertion
+        assert!(PageEdit::plan("page", &blocks, "LEFT NEW\n\nRIGHT NEW").is_err());
+        assert!(PageEdit::plan("page", &blocks, "LEFT NEW\n\nRIGHT OLD").is_err());
+
+        // Broken / missing / swapped / malformed markers all fail cleanly
+        assert!(PageEdit::plan(
+            "page",
+            &blocks,
+            &editor_md.replace("<!-- notion:column id=col-right -->\n", ""),
+        )
+        .is_err());
+        assert!(PageEdit::plan(
+            "page",
+            &blocks,
+            &editor_md.replace("<!-- /notion:column-list -->", ""),
+        )
+        .is_err());
+        assert!(PageEdit::plan(
+            "page",
+            &blocks,
+            &editor_md.replace("col-right", "col-wrong"),
+        )
+        .is_err());
+        assert!(PageEdit::plan(
+            "page",
+            &blocks,
+            &editor_md.replace("<!-- notion:column id=col-left -->", "<!-- notion:column id=col-left"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn column_layout_preserves_surrounding_root_anchors_and_in_column_inserts() {
+        let mut blocks = vec![block("top", "paragraph", "Top")];
+        blocks.extend(two_column_blocks());
+        blocks.push(block("bottom", "paragraph", "Bottom"));
+
+        let editor_md = blocks_to_editor_markdown(&blocks);
+        let edited = editor_md
+            .replace("Top", "Top revised")
+            .replace("LEFT OLD", "LEFT OLD\n\nLEFT SECOND")
+            .replace("Bottom", "Bottom revised");
+        let plan = PageEdit::plan("page", &blocks, &edited).unwrap();
+        assert!(plan.archives.is_empty());
+        assert_eq!(plan.patches.len(), 2);
+        assert_eq!(plan.patches[0].id, "top");
+        assert_eq!(plan.patches[1].id, "bottom");
+        assert_eq!(plan.inserts.len(), 1);
+        assert_eq!(plan.inserts[0].parent, "col-left");
+        assert_eq!(plan.inserts[0].after.as_deref(), Some("para-left"));
+        assert!(!plan.inserts[0].at_start);
     }
 }

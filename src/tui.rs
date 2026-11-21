@@ -1053,10 +1053,14 @@ pub async fn run(
         if ui.editor_requested {
             ui.editor_requested = false;
             guard.restore();
-            let initial_md = app
-                .active_page_detail
-                .as_ref()
-                .map(|d| d.markdown.clone())
+            let initial_md = ui
+                .external_editor_seed
+                .take()
+                .or_else(|| {
+                    app.active_page_detail
+                        .as_ref()
+                        .map(crate::page_edit::editor_markdown_for_detail)
+                })
                 .unwrap_or_default();
             let result = composer::external_edit(&initial_md);
             let mut stdout = io::stdout();
@@ -1099,8 +1103,9 @@ pub async fn run(
             match result {
                 Ok(edited) => {
                     if edited.trim() != initial_md.trim() && !edited.trim().is_empty() {
-                        let _ = action::dispatch(Action::SubmitPageEdit(edited), &mut app, &mut ui);
-                        ui.info("Syncing edited Markdown to Notion...");
+                        if app.submit_page_edit_markdown(&mut ui, edited) {
+                            ui.info("Syncing edited Markdown to Notion...");
+                        }
                     }
                 }
                 Err(err) => ui.error(format!("External editor error: {err}")),

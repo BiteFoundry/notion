@@ -1063,17 +1063,35 @@ pub fn rich_text_to_markdown(spans: &[RichTextSpan]) -> String {
     out
 }
 
+/// Returns `true` if any block in the tree is a `column_list` or `column` container.
+pub fn has_column_blocks(blocks: &[NotionBlock]) -> bool {
+    blocks.iter().any(|blk| {
+        matches!(
+            blk.kind,
+            NotionBlockKind::ColumnList | NotionBlockKind::Column
+        ) || has_column_blocks(&blk.children)
+    })
+}
+
 /// Exports a Notion block tree to clean, editable Markdown.
 pub fn blocks_to_markdown(blocks: &[NotionBlock]) -> String {
     let mut lines = Vec::new();
-    render_blocks_md(blocks, 0, &mut lines, None);
+    render_blocks_md_with_options(blocks, 0, &mut lines, None, false);
+    lines.join("\n")
+}
+
+/// Exports a Notion block tree to editor Markdown, adding column-ID boundary
+/// comments only when the tree contains column layouts so edits stay in place.
+pub fn blocks_to_editor_markdown(blocks: &[NotionBlock]) -> String {
+    let mut lines = Vec::new();
+    render_blocks_md_with_options(blocks, 0, &mut lines, None, has_column_blocks(blocks));
     lines.join("\n")
 }
 
 pub(crate) fn markdown_edit_ranges(blocks: &[NotionBlock]) -> (String, Vec<std::ops::Range<usize>>) {
     let mut lines = Vec::new();
     let mut ranges = Vec::new();
-    render_blocks_md(blocks, 0, &mut lines, Some(&mut ranges));
+    render_blocks_md_with_options(blocks, 0, &mut lines, Some(&mut ranges), false);
     // A rendered item (such as a code block's content) can contain multiple lines.
     let mut offsets = vec![0];
     for line in &lines {
@@ -1083,11 +1101,12 @@ pub(crate) fn markdown_edit_ranges(blocks: &[NotionBlock]) -> (String, Vec<std::
     (lines.join("\n"), ranges)
 }
 
-fn render_blocks_md(
+fn render_blocks_md_with_options(
     blocks: &[NotionBlock],
     depth: usize,
     out: &mut Vec<String>,
     mut ranges: Option<&mut Vec<std::ops::Range<usize>>>,
+    include_column_markers: bool,
 ) {
     let indent = "  ".repeat(depth);
     let mut num_counter = 0usize;
@@ -1122,7 +1141,13 @@ fn render_blocks_md(
             NotionBlockKind::BulletedListItem { rich_text, .. } => {
                 out.push(format!("{indent}- {}", rich_text_to_markdown(rich_text)));
                 if !blk.children.is_empty() {
-                    render_blocks_md(&blk.children, depth + 1, out, None);
+                    render_blocks_md_with_options(
+                        &blk.children,
+                        depth + 1,
+                        out,
+                        None,
+                        include_column_markers,
+                    );
                 }
             }
             NotionBlockKind::NumberedListItem { rich_text, .. } => {
@@ -1132,7 +1157,13 @@ fn render_blocks_md(
                     rich_text_to_markdown(rich_text)
                 ));
                 if !blk.children.is_empty() {
-                    render_blocks_md(&blk.children, depth + 1, out, None);
+                    render_blocks_md_with_options(
+                        &blk.children,
+                        depth + 1,
+                        out,
+                        None,
+                        include_column_markers,
+                    );
                 }
             }
             NotionBlockKind::ToDo {
@@ -1144,13 +1175,25 @@ fn render_blocks_md(
                     rich_text_to_markdown(rich_text)
                 ));
                 if !blk.children.is_empty() {
-                    render_blocks_md(&blk.children, depth + 1, out, None);
+                    render_blocks_md_with_options(
+                        &blk.children,
+                        depth + 1,
+                        out,
+                        None,
+                        include_column_markers,
+                    );
                 }
             }
             NotionBlockKind::Toggle { rich_text, .. } => {
                 out.push(format!("{indent}> ▸ {}", rich_text_to_markdown(rich_text)));
                 if !blk.children.is_empty() {
-                    render_blocks_md(&blk.children, depth + 1, out, None);
+                    render_blocks_md_with_options(
+                        &blk.children,
+                        depth + 1,
+                        out,
+                        None,
+                        include_column_markers,
+                    );
                 }
                 out.push(String::new());
             }
@@ -1160,7 +1203,13 @@ fn render_blocks_md(
                 let ic = icon.as_deref().unwrap_or("💡");
                 out.push(format!("{indent}> {ic} {}", rich_text_to_markdown(rich_text)));
                 if !blk.children.is_empty() {
-                    render_blocks_md(&blk.children, depth + 1, out, None);
+                    render_blocks_md_with_options(
+                        &blk.children,
+                        depth + 1,
+                        out,
+                        None,
+                        include_column_markers,
+                    );
                 }
                 out.push(String::new());
             }
@@ -1265,10 +1314,47 @@ fn render_blocks_md(
                 out.push(format!("{indent}$$\n{expression}\n$$"));
                 out.push(String::new());
             }
-            NotionBlockKind::ColumnList
-            | NotionBlockKind::Column
-            | NotionBlockKind::SyncedBlock { .. } => {
-                render_blocks_md(&blk.children, depth, out, None);
+            NotionBlockKind::ColumnList => {
+                if include_column_markers {
+                    out.push(format!("{indent}<!-- notion:column-list id={} -->", blk.id));
+                    for col in &blk.children {
+                        if matches!(col.kind, NotionBlockKind::Column) {
+                            out.push(format!("{indent}<!-- notion:column id={} -->", col.id));
+                            if col.children.is_empty() {
+                                out.push(String::new());
+                            } else {
+                                render_blocks_md_with_options(
+                                    &col.children,
+                                    depth,
+                                    out,
+                                    None,
+                                    include_column_markers,
+                                );
+                            }
+                        } else {
+                            render_blocks_md_with_options(
+                                std::slice::from_ref(col),
+                                depth,
+                                out,
+                                None,
+                                include_column_markers,
+                            );
+                        }
+                    }
+                    out.push(format!("{indent}<!-- /notion:column-list -->"));
+                    out.push(String::new());
+                } else {
+                    render_blocks_md_with_options(&blk.children, depth, out, None, false);
+                }
+            }
+            NotionBlockKind::Column | NotionBlockKind::SyncedBlock { .. } => {
+                render_blocks_md_with_options(
+                    &blk.children,
+                    depth,
+                    out,
+                    None,
+                    include_column_markers,
+                );
             }
             NotionBlockKind::TableOfContents { .. } => {
                 out.push(format!("{indent}[Table of Contents]"));

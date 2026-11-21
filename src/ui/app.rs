@@ -253,6 +253,7 @@ pub enum UiMsg {
         page_id: String,
         generation: u64,
         error: String,
+        edited_markdown: String,
     },
     PageCreated(NotionPage),
     PageArchived(String),
@@ -334,6 +335,7 @@ pub struct UiState {
     pub spinner_tick: usize,
     pub poll_retrying: bool,
     pub editor_requested: bool,
+    pub external_editor_seed: Option<String>,
     pub term_width: u16,
     pub term_height: u16,
     pub graphics_caps: TerminalGraphicsCaps,
@@ -392,6 +394,7 @@ impl UiState {
             spinner_tick: 0,
             poll_retrying: false,
             editor_requested: false,
+            external_editor_seed: None,
             term_width: 120,
             term_height: 36,
             graphics_caps: TerminalGraphicsCaps::default(),
@@ -683,11 +686,12 @@ impl AppState {
         };
 
         let last_synced_detail = Some(detail.clone());
+        let initial_markdown = crate::page_edit::editor_markdown_for_detail(detail);
 
         ui.inline_editor = Some(InlinePageEditor::new(
             page_id,
             page_title,
-            &detail.markdown,
+            &initial_markdown,
             ui.canvas_scroll,
             current_gen,
             synced_gen,
@@ -715,7 +719,11 @@ impl AppState {
     /// Builds the optimistic canvas detail for a save or external editor handoff.
     pub fn apply_optimistic_local(&mut self, page_id: &str, edited_markdown: &str) {
         if let Some(ref mut detail) = self.active_page_detail {
-            if detail.page.id == page_id && detail.markdown != edited_markdown {
+            if detail.page.id == page_id
+                && detail.markdown != edited_markdown
+                && !crate::parser::has_column_blocks(&detail.blocks)
+                && !crate::page_edit::contains_column_marker(edited_markdown)
+            {
                 apply_optimistic_markdown_to_detail(detail, edited_markdown);
             }
         }
@@ -726,7 +734,10 @@ impl AppState {
         let detail = self.active_page_detail.as_ref()?;
         if let Some(ed) = ui.inline_editor.as_ref().filter(|ed| ed.page_id == detail.page.id) {
             let markdown = ed.composer.text();
-            if markdown != detail.markdown {
+            if markdown != detail.markdown
+                && !crate::parser::has_column_blocks(&detail.blocks)
+                && !crate::page_edit::contains_column_marker(markdown)
+            {
                 let mut draft = detail.clone();
                 apply_optimistic_markdown_to_detail(&mut draft, markdown);
                 return Some(Cow::Owned(draft));
@@ -755,9 +766,25 @@ impl AppState {
             return false;
         }
 
+        let snapshot = ed.composer.text().to_string();
+        let baseline_blocks = if ed.remote_conflict.is_some() {
+            ed.remote_conflict
+                .as_ref()
+                .map(|d| d.blocks.clone())
+                .unwrap_or_default()
+        } else {
+            ed.remote_blocks.clone()
+        };
+        if !baseline_blocks.is_empty() {
+            if let Err(err) = crate::page_edit::PageEdit::plan(&page_id, &baseline_blocks, &snapshot) {
+                ed.last_sync_error = Some(err.to_string());
+                ui.error(format!("Cannot save: {err}"));
+                return false;
+            }
+        }
+
         let overwrite_after_conflict = ed.remote_conflict.take().is_some();
         ed.confirm_overwrite = false;
-        let snapshot = ed.composer.text().to_string();
 
         let next_gen = ed
             .edit_generation
@@ -847,6 +874,13 @@ impl AppState {
             return;
         }
         let _ = self.flush_inline_editor_sync(ui, true);
+        if ui
+            .inline_editor
+            .as_ref()
+            .is_some_and(|ed| ed.last_sync_error.is_some() || ed.confirm_overwrite)
+        {
+            return;
+        }
         if let Some(ed) = ui.inline_editor.take() {
             ui.canvas_scroll = ed.scroll_y;
             ui.canvas_follow_selected = false;
@@ -864,8 +898,8 @@ impl AppState {
         let current_md = self
             .active_page_detail
             .as_ref()
-            .map(|d| d.markdown.as_str())
-            .unwrap_or("");
+            .map(crate::page_edit::editor_markdown_for_detail)
+            .unwrap_or_default();
         if edited_markdown.trim() == current_md.trim() {
             ui.info("No changes to save");
             return false;
@@ -877,6 +911,12 @@ impl AppState {
                     .all(|b| !b.id.trim().is_empty() && !b.id.starts_with("__optimistic_"));
             valid.then(|| d.blocks.clone())
         });
+        if let Some(ref blocks) = known_blocks {
+            if let Err(err) = crate::page_edit::PageEdit::plan(&page_id, blocks, &edited_markdown) {
+                self.preserve_failed_page_edit(ui, &page_id, &edited_markdown, &err.to_string());
+                return false;
+            }
+        }
 
         let next_gen = ui
             .page_edit_generations
@@ -900,6 +940,47 @@ impl AppState {
         ui.pending_page_sync.remove(&page_id);
         self.spawn_page_diff_sync(ui, page_id, next_gen, edited_markdown, known_blocks);
         true
+    }
+
+    fn preserve_failed_page_edit(
+        &mut self,
+        ui: &mut UiState,
+        page_id: &str,
+        edited_markdown: &str,
+        error: &str,
+    ) {
+        let recovery_note = match crate::page_edit::save_edit_recovery(page_id, edited_markdown) {
+            Ok(path) => format!(" (draft saved to {})", path.display()),
+            Err(_) => String::new(),
+        };
+        if self.active_page_id.as_deref() == Some(page_id) && self.active_view == CanvasView::Page {
+            if let Some(detail) = self.active_page_detail.as_ref() {
+                let current_gen = ui.page_edit_generations.get(page_id).copied().unwrap_or(0);
+                let synced_gen = ui
+                    .page_synced_generations
+                    .get(page_id)
+                    .copied()
+                    .unwrap_or(current_gen);
+                let initial_md = crate::page_edit::editor_markdown_for_detail(detail);
+                let mut editor = InlinePageEditor::new(
+                    page_id,
+                    detail.page.display_title(),
+                    &initial_md,
+                    ui.canvas_scroll,
+                    current_gen.saturating_add(1),
+                    synced_gen,
+                    false,
+                    detail.blocks.clone(),
+                    Some(detail.clone()),
+                );
+                editor.composer.load_text_cursor_start(edited_markdown);
+                editor.last_sync_error = Some(error.to_string());
+                ui.inline_editor = Some(editor);
+                ui.focus = Focus::Canvas;
+                ui.narrow_pane = NarrowPane::Canvas;
+            }
+        }
+        ui.error(format!("Cannot save: {error}{recovery_note}"));
     }
 
     fn spawn_page_diff_sync(
@@ -937,6 +1018,7 @@ impl AppState {
                         page_id,
                         generation,
                         error: err.to_string(),
+                        edited_markdown,
                     });
                 }
             }
@@ -1067,7 +1149,8 @@ impl AppState {
                     .as_ref()
                     .is_some_and(|ed| ed.page_id == detail.page.id);
                 if active_editor_matches {
-                    let incoming_md = normalize(&detail.markdown);
+                    let incoming_md =
+                        normalize(&crate::page_edit::editor_markdown_for_detail(&detail));
                     let mut visual_changed = summary_changed;
                     if let Some(ed) = ui.inline_editor.as_mut() {
                         let next_title = detail.page.display_title().to_string();
@@ -1103,7 +1186,8 @@ impl AppState {
                             }
                         } else if remote_changed {
                             let same_conflict = ed.remote_conflict.as_ref().is_some_and(|prev| {
-                                normalize(&prev.markdown) == incoming_md
+                                normalize(&crate::page_edit::editor_markdown_for_detail(prev))
+                                    == incoming_md
                                     && prev.page.last_edited_time == detail.page.last_edited_time
                                     && prev.comments == detail.comments
                             });
@@ -1284,7 +1368,11 @@ impl AppState {
                 }
 
                 let mut synced_detail = *detail;
-                synced_detail.markdown = synced_markdown.clone();
+                if !crate::parser::has_column_blocks(&synced_detail.blocks)
+                    && !crate::page_edit::contains_column_marker(&synced_markdown)
+                {
+                    synced_detail.markdown = synced_markdown.clone();
+                }
 
                 let active_inline_matches = ui
                     .inline_editor
@@ -1349,22 +1437,33 @@ impl AppState {
                 page_id,
                 generation: _,
                 error,
+                edited_markdown,
             } => {
                 ui.tasks.finish("edit", Some(error.clone()));
                 ui.page_sync_in_flight.remove(&page_id);
-                if let Some(ed) = ui.inline_editor.as_mut() {
-                    if ed.page_id == page_id {
-                        ed.sync_in_flight = false;
-                        ed.last_sync_error = Some(error.clone());
-                        if let Ok(Some(actual)) = self.storage.load_page_detail(&self.workspace_id, &page_id) {
-                            ed.remote_blocks = actual.blocks.clone();
-                            ed.last_synced_detail = Some(actual);
-                        } else {
-                            ed.remote_blocks.clear();
-                        }
+                let cached = self
+                    .storage
+                    .load_page_detail(&self.workspace_id, &page_id)
+                    .ok()
+                    .flatten();
+                if let Some(ref actual) = cached {
+                    if self.active_page_id.as_deref() == Some(page_id.as_str()) {
+                        self.active_page_detail = Some(actual.clone());
                     }
                 }
-                ui.error(format!("Sync failed: {error}"));
+                if let Some(ed) = ui.inline_editor.as_mut().filter(|ed| ed.page_id == page_id) {
+                    ed.sync_in_flight = false;
+                    ed.last_sync_error = Some(error.clone());
+                    if let Some(actual) = cached {
+                        ed.remote_blocks = actual.blocks.clone();
+                        ed.last_synced_detail = Some(actual);
+                    } else {
+                        ed.remote_blocks.clear();
+                    }
+                    ui.error(format!("Sync failed: {error}"));
+                } else {
+                    self.preserve_failed_page_edit(ui, &page_id, &edited_markdown, &error);
+                }
             }
             UiMsg::MediaUrlRefreshed {
                 page_id,

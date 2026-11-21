@@ -3,13 +3,14 @@
 
 use std::{
     collections::HashSet,
+    ffi::OsString,
     fs,
     io::{self, IsTerminal, Write},
     path::PathBuf,
 };
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::{json, Value};
 
 use crate::{
@@ -454,8 +455,312 @@ pub fn try_fast_help_or_version() -> Option<Result<()>> {
     None
 }
 
+pub fn parse_cli_from<I, T>(args: I) -> std::result::Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let raw: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let normalized = normalize_cli_args(raw);
+    Cli::try_parse_from(normalized)
+}
+
+fn affected_text_spec(path: &[String]) -> Option<(&'static [&'static str], Option<usize>)> {
+    match path {
+        [a, b] if a == "pages" && b == "create" => Some((&["title", "body"], None)),
+        [a, b] if a == "pages" && b == "append" => Some((&[], Some(1))),
+        [a, b] if a == "pages" && b == "edit" => Some((&["title"], None)),
+        [a, b] if a == "blocks" && b == "append" => Some((&[], Some(1))),
+        [a, b] if a == "blocks" && b == "edit" => Some((&["text"], None)),
+        [a, b] if a == "db" && b == "create-item" => Some((&["title", "body"], None)),
+        [a, b] if a == "db" && b == "update-item" => Some((&["title"], None)),
+        [a, b] if a == "comments" && b == "add" => Some((&[], Some(1))),
+        [a] if a == "search" => Some((&[], Some(0))),
+        _ => None,
+    }
+}
+
+fn find_long_option<'a>(cmd: &'a clap::Command, name: &str) -> Option<&'a clap::Arg> {
+    cmd.get_arguments().find(|arg| arg.get_long() == Some(name))
+}
+
+fn find_short_option<'a>(cmd: &'a clap::Command, ch: char) -> Option<&'a clap::Arg> {
+    cmd.get_arguments().find(|arg| arg.get_short() == Some(ch))
+}
+
+fn could_be_hyphen_literal(s: &str) -> bool {
+    if !s.starts_with('-') || s == "--" {
+        return false;
+    }
+    if s == "-" {
+        return true;
+    }
+    if let Some(rest) = s.strip_prefix("--") {
+        // `--dry-run`, `--json`, `--help`, etc. start with ASCII alphanumeric after `--`.
+        // Markdown dividers (`---`) or `-- ` / non-ASCII text are treated as literals.
+        return !rest
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric);
+    }
+    let rest = &s[1..];
+    // Preserve single-letter ASCII short flags (`-h`, `-V`, `-w`, `-x`, ...).
+    !(rest.len() == 1 && rest.as_bytes()[0].is_ascii_alphabetic())
+}
+
+fn is_separate_hyphen_literal(s: &str, cmd: &clap::Command) -> bool {
+    if !could_be_hyphen_literal(s) {
+        return false;
+    }
+    if s == "-" || s.starts_with("--") {
+        return true;
+    }
+    let rest = &s[1..];
+    if let Some(first) = rest.chars().next() {
+        if find_short_option(cmd, first)
+            .is_some_and(|arg| arg.get_action().takes_values())
+        {
+            return false;
+        }
+        if rest.chars().all(|c| {
+            find_short_option(cmd, c).is_some_and(|arg| !arg.get_action().takes_values())
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_flag_like_token(arg: &OsString, cmd: &clap::Command) -> bool {
+    arg.to_str()
+        .is_some_and(|s| s.starts_with('-') && !is_separate_hyphen_literal(s, cmd))
+}
+
+fn is_long_equals_option(s: &str) -> bool {
+    s.strip_prefix("--")
+        .and_then(|rest| rest.split_once('='))
+        .is_some_and(|(name, _)| {
+            name.as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+        })
+}
+
+fn normalize_cli_args(raw: Vec<OsString>) -> Vec<OsString> {
+    if !raw.iter().skip(1).take_while(|arg| *arg != "--").any(|arg| {
+        arg.to_str().is_some_and(could_be_hyphen_literal)
+    }) {
+        return raw;
+    }
+    let mut root = Cli::command();
+    root.build();
+
+    let mut cmd: &clap::Command = &root;
+    let mut subcmd_path: Vec<String> = Vec::new();
+    let mut idx = 1usize;
+
+    while idx < raw.len() && cmd.has_subcommands() {
+        let Some(s) = raw[idx].to_str() else {
+            break;
+        };
+        if s == "--" {
+            break;
+        }
+        if s.starts_with('-') {
+            if let Some(name) = s.strip_prefix("--") {
+                if !name.contains('=')
+                    && find_long_option(cmd, name)
+                        .is_some_and(|arg| arg.get_action().takes_values())
+                {
+                    idx += 1;
+                    if idx < raw.len()
+                        && !raw[idx].to_str().is_some_and(|next| next.starts_with('-'))
+                    {
+                        idx += 1;
+                    }
+                    continue;
+                }
+            } else if s.len() == 2 {
+                let ch = s.chars().nth(1).unwrap();
+                if find_short_option(cmd, ch)
+                    .is_some_and(|arg| arg.get_action().takes_values())
+                {
+                    idx += 1;
+                    if idx < raw.len()
+                        && !raw[idx].to_str().is_some_and(|next| next.starts_with('-'))
+                    {
+                        idx += 1;
+                    }
+                    continue;
+                }
+            }
+            idx += 1;
+            continue;
+        }
+
+        if let Some(sub) = cmd
+            .get_subcommands()
+            .find(|sub| sub.get_name() == s || sub.get_all_aliases().any(|alias| alias == s))
+        {
+            subcmd_path.push(sub.get_name().to_owned());
+            cmd = sub;
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+
+    let Some((affected_opts, affected_pos)) = affected_text_spec(&subcmd_path) else {
+        return raw;
+    };
+
+    let prefix = &raw[..idx];
+    let tail = &raw[idx..];
+    let mut in_place: Vec<OsString> = Vec::with_capacity(tail.len());
+    let mut option_tokens: Vec<OsString> = Vec::new();
+    let mut positional_tokens: Vec<OsString> = Vec::new();
+    let mut trailing_after_dd: Vec<OsString> = Vec::new();
+    let mut saw_hyphen_positional = false;
+    let mut pos_idx = 0usize;
+    let mut i = 0usize;
+
+    while i < tail.len() {
+        let tok = &tail[i];
+        let s_opt = tok.to_str();
+
+        if s_opt == Some("--") {
+            in_place.extend(tail[i..].iter().cloned());
+            trailing_after_dd.extend(tail[i + 1..].iter().cloned());
+            break;
+        }
+
+        if let Some(s) = s_opt {
+            if is_long_equals_option(s) {
+                in_place.push(tok.clone());
+                option_tokens.push(tok.clone());
+                i += 1;
+                continue;
+            }
+
+            if let Some(name) = s.strip_prefix("--") {
+                if name
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                {
+                    let takes_value = find_long_option(cmd, name)
+                        .is_some_and(|arg| arg.get_action().takes_values());
+                    if takes_value {
+                        if affected_opts.contains(&name) {
+                            if let Some(next) = tail.get(i + 1) {
+                                if next.to_str().is_some_and(|ns| {
+                                    ns.starts_with('-') && is_separate_hyphen_literal(ns, cmd)
+                                }) {
+                                    let mut combined = OsString::from(format!("--{name}="));
+                                    combined.push(next);
+                                    in_place.push(combined.clone());
+                                    option_tokens.push(combined);
+                                    i += 2;
+                                    continue;
+                                }
+                                if !next.to_str().is_some_and(|ns| ns.starts_with('-')) {
+                                    in_place.push(tok.clone());
+                                    in_place.push(next.clone());
+                                    option_tokens.push(tok.clone());
+                                    option_tokens.push(next.clone());
+                                    i += 2;
+                                    continue;
+                                }
+                            }
+                            in_place.push(tok.clone());
+                            option_tokens.push(tok.clone());
+                            i += 1;
+                            continue;
+                        } else {
+                            if let Some(next) = tail.get(i + 1) {
+                                if !is_flag_like_token(next, cmd) && next.to_str() != Some("--") {
+                                    in_place.push(tok.clone());
+                                    in_place.push(next.clone());
+                                    option_tokens.push(tok.clone());
+                                    option_tokens.push(next.clone());
+                                    i += 2;
+                                    continue;
+                                }
+                            }
+                            in_place.push(tok.clone());
+                            option_tokens.push(tok.clone());
+                            i += 1;
+                            continue;
+                        }
+                    }
+
+                    in_place.push(tok.clone());
+                    option_tokens.push(tok.clone());
+                    i += 1;
+                    continue;
+                }
+            }
+
+            if s.starts_with('-') && !is_separate_hyphen_literal(s, cmd) {
+                if s.len() == 2 {
+                    let ch = s.chars().nth(1).unwrap();
+                    if find_short_option(cmd, ch)
+                        .is_some_and(|arg| arg.get_action().takes_values())
+                    {
+                        if let Some(next) = tail.get(i + 1) {
+                            if !is_flag_like_token(next, cmd) && next.to_str() != Some("--") {
+                                in_place.push(tok.clone());
+                                in_place.push(next.clone());
+                                option_tokens.push(tok.clone());
+                                option_tokens.push(next.clone());
+                                i += 2;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                in_place.push(tok.clone());
+                option_tokens.push(tok.clone());
+                i += 1;
+                continue;
+            }
+        }
+
+        if s_opt.is_some_and(|s| s.starts_with('-')) {
+            if affected_pos == Some(pos_idx) {
+                saw_hyphen_positional = true;
+                in_place.push(tok.clone());
+                positional_tokens.push(tok.clone());
+                pos_idx += 1;
+                i += 1;
+            } else {
+                in_place.push(tok.clone());
+                option_tokens.push(tok.clone());
+                i += 1;
+            }
+        } else {
+            in_place.push(tok.clone());
+            positional_tokens.push(tok.clone());
+            pos_idx += 1;
+            i += 1;
+        }
+    }
+
+    let mut out = Vec::with_capacity(raw.len() + usize::from(saw_hyphen_positional));
+    out.extend(prefix.iter().cloned());
+    if saw_hyphen_positional {
+        out.extend(option_tokens);
+        out.push(OsString::from("--"));
+        out.extend(positional_tokens);
+        out.extend(trailing_after_dd);
+    } else {
+        out.extend(in_place);
+    }
+    out
+}
+
 pub async fn run_from_env() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = parse_cli_from(std::env::args_os()).unwrap_or_else(|err| err.exit());
     run_cli(cli).await
 }
 
@@ -966,16 +1271,35 @@ async fn handle_pages_cmd(
             let page_id = resolver::resolve_page_id(storage, Some(client), &ws_id, &page).await?;
             let edited_page = if editor {
                 let detail = sync::sync_page_detail_force(client, storage, &page_id).await?;
-                let edited = crate::ui::composer::external_edit(&detail.markdown)
+                let initial = crate::page_edit::editor_markdown_for_detail(&detail);
+                let edited = crate::ui::composer::external_edit(&initial)
                     .context("Failed to edit page in external $EDITOR")?;
-                if edited.trim_end() == detail.markdown.trim_end() {
+                if edited.trim_end() == initial.trim_end() {
                     Some(detail.page)
                 } else {
-                    let fresh = client.fetch_block_tree(&page_id, None).await?;
-                    if !crate::page_edit::same_edit_baseline(&detail.blocks, &fresh) {
-                        bail!("Page blocks changed while the editor was open. Reopen the page before saving.");
+                    let save_result: Result<NotionPage> = async {
+                        let _ = crate::page_edit::PageEdit::plan(&page_id, &detail.blocks, &edited)?;
+                        let fresh = client.fetch_block_tree(&page_id, None).await?;
+                        if !crate::page_edit::same_edit_baseline(&detail.blocks, &fresh) {
+                            bail!("Page blocks changed while the editor was open. Reopen the page before saving.");
+                        }
+                        Ok(apply_page_edit(client, storage, &page_id, &edited, Some(fresh), false)
+                            .await?
+                            .page)
                     }
-                    Some(apply_page_edit(client, storage, &page_id, &edited, Some(detail.blocks), false).await?.page)
+                    .await;
+                    match save_result {
+                        Ok(page) => Some(page),
+                        Err(err) => match crate::page_edit::save_edit_recovery(&page_id, &edited) {
+                            Ok(path) => {
+                                bail!(
+                                    "{err}\nEdited text saved for recovery at: {}",
+                                    path.display()
+                                );
+                            }
+                            Err(_) => return Err(err),
+                        },
+                    }
                 }
             } else {
                 None
@@ -1793,13 +2117,25 @@ async fn apply_page_edit(
     if plan.is_empty() {
         return sync::sync_page_detail_force(client, storage, &id).await;
     }
+    let column_guarded = crate::parser::has_column_blocks(&existing)
+        || crate::page_edit::contains_column_marker(edited_markdown);
+    if retry_stale && known.is_some() && column_guarded {
+        let fresh = client.fetch_block_tree(&id, None).await?;
+        if !crate::page_edit::same_edit_baseline(&existing, &fresh) {
+            bail!("Page blocks changed while editing. Reload the page before saving.");
+        }
+    }
     if let Err(error) = plan.apply(client, &id).await {
         // Refresh the cache even on a mid-save failure. A subsequent save can match
         // already appended content at its actual position and reuse its server ID.
         let _ = storage.invalidate_page_detail(&ws_id, &id);
         let recovered = sync::sync_page_detail_force(client, storage, &id).await;
         if let Ok(fresh) = recovered {
-            if retry_stale && known.is_some() && NotionClient::is_authoritative_not_found(&error) {
+            if retry_stale
+                && !column_guarded
+                && known.is_some()
+                && NotionClient::is_authoritative_not_found(&error)
+            {
                 let retry = crate::page_edit::PageEdit::plan(&id, &fresh.blocks, edited_markdown)?;
                 if let Err(error) = retry.apply(client, &id).await {
                     let _ = storage.invalidate_page_detail(&ws_id, &id);
@@ -2132,4 +2468,265 @@ fn read_body_or_file(body: Option<String>, file: Option<PathBuf>) -> Result<Opti
 fn print_json<T: serde::Serialize>(val: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(val)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    const KO_ITEM: &str = "- 목록 항목";
+    const TWO_LINES: &str = "- first\n- second";
+
+    #[test]
+    fn parses_hyphen_text_for_all_audited_notion_commands() {
+        // 1. pages create --title / --body
+        let cli = parse_cli_from([
+            "notion", "pages", "create", "--parent", "page", "--title", KO_ITEM, "--body",
+            TWO_LINES, "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Pages {
+                action:
+                    PagesCommand::Create {
+                        parent,
+                        title,
+                        body,
+                        json,
+                        ..
+                    },
+            }) => {
+                assert_eq!(parent, "page");
+                assert_eq!(title, KO_ITEM);
+                assert_eq!(body.as_deref(), Some(TWO_LINES));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // 2. pages append
+        let cli = parse_cli_from(["notion", "pages", "append", "page", TWO_LINES, "--json"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Pages {
+                action: PagesCommand::Append { page, body, json, .. },
+            }) => {
+                assert_eq!(page, "page");
+                assert_eq!(body.as_deref(), Some(TWO_LINES));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // 3. blocks append
+        let cli = parse_cli_from(["notion", "blocks", "append", "block", KO_ITEM, "--json"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Blocks {
+                action: BlocksCommand::Append { block_id, body, json, .. },
+            }) => {
+                assert_eq!(block_id, "block");
+                assert_eq!(body.as_deref(), Some(KO_ITEM));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // 4. blocks edit --text
+        let cli = parse_cli_from(["notion", "blocks", "edit", "block", "--text", KO_ITEM, "--json"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Blocks {
+                action: BlocksCommand::Edit { block_id, text, json },
+            }) => {
+                assert_eq!(block_id, "block");
+                assert_eq!(text, KO_ITEM);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // 5. comments add
+        let cli = parse_cli_from([
+            "notion", "comments", "add", "page", KO_ITEM, "--discussion", "disc-1", "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Comments {
+                action: CommentsCommand::Add { page, text, discussion, json },
+            }) => {
+                assert_eq!(page, "page");
+                assert_eq!(text, KO_ITEM);
+                assert_eq!(discussion.as_deref(), Some("disc-1"));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // 6. db create-item --title / --body
+        let cli = parse_cli_from([
+            "notion", "db", "create-item", "db", "--title", KO_ITEM, "--body", TWO_LINES, "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Db {
+                action: DbCommand::CreateItem { database, title, body, json, .. },
+            }) => {
+                assert_eq!(database, "db");
+                assert_eq!(title, KO_ITEM);
+                assert_eq!(body.as_deref(), Some(TWO_LINES));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // 7. pages edit --title
+        let cli = parse_cli_from(["notion", "pages", "edit", "page", "--title", KO_ITEM, "--json"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Pages {
+                action: PagesCommand::Edit { page, title, json, .. },
+            }) => {
+                assert_eq!(page, "page");
+                assert_eq!(title.as_deref(), Some(KO_ITEM));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // 8. db update-item --title
+        let cli = parse_cli_from([
+            "notion", "db", "update-item", "page", "--title", KO_ITEM, "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Db {
+                action: DbCommand::UpdateItem { page_id, title, json, .. },
+            }) => {
+                assert_eq!(page_id, "page");
+                assert_eq!(title.as_deref(), Some(KO_ITEM));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // 9. search
+        let cli = parse_cli_from(["notion", "search", KO_ITEM, "--remote", "--limit", "5", "--json"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Search {
+                query,
+                remote,
+                limit,
+                json,
+                ..
+            }) => {
+                assert_eq!(query, KO_ITEM);
+                assert!(remote);
+                assert_eq!(limit, 5);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preserves_flags_missing_values_equals_separator_and_help() {
+        // Explicit `--flag=value` and positional `--` still allow flag-looking text.
+        let cli = parse_cli_from(["notion", "blocks", "edit", "blk", "--text=--dry-run", "--json"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Blocks {
+                action: BlocksCommand::Edit { text, json, .. },
+            }) => {
+                assert_eq!(text, "--dry-run");
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = parse_cli_from(["notion", "pages", "append", "page", "--", "--dry-run"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Pages {
+                action: PagesCommand::Append { body, .. },
+            }) => assert_eq!(body.as_deref(), Some("--dry-run")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = parse_cli_from(["notion", "search", "--", "--help"]).unwrap();
+        match cli.command {
+            Some(Command::Search { query, .. }) => assert_eq!(query, "--help"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // Real flags after a missing option value must NOT be swallowed as the option value.
+        for bad in [
+            vec!["notion", "blocks", "edit", "blk", "--text", "--json"],
+            vec!["notion", "blocks", "edit", "blk", "--text", "--dry-run"],
+            vec!["notion", "blocks", "edit", "blk", "--text", "--help"],
+            vec!["notion", "pages", "create", "--parent", "p", "--title", "T", "--body", "--json"],
+            vec!["notion", "pages", "edit", "p", "--title", "--editor"],
+            vec!["notion", "db", "create-item", "db", "--title", "--json"],
+            vec!["notion", "pages", "append", "page", "--dry-run"],
+            vec!["notion", "search", "--dry-run"],
+            vec!["notion", "search", "-x"],
+        ] {
+            let err = parse_cli_from(bad.clone()).unwrap_err();
+            assert_ne!(
+                err.kind(),
+                ErrorKind::DisplayHelp,
+                "expected parse error for {bad:?}, got help"
+            );
+        }
+
+        // `pages append page --json` keeps body=None (does not swallow `--json`).
+        let cli = parse_cli_from(["notion", "pages", "append", "page", "--json"]).unwrap();
+        match cli.command {
+            Some(Command::Pages {
+                action: PagesCommand::Append { body, json, .. },
+            }) => {
+                assert_eq!(body, None);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // Help works both alone and after hyphen text values.
+        for help_args in [
+            vec!["notion", "pages", "create", "--parent", "p", "--title", "T", "--body", KO_ITEM, "--help"],
+            vec!["notion", "pages", "append", "page", KO_ITEM, "--help"],
+            vec!["notion", "blocks", "append", "blk", KO_ITEM, "--help"],
+            vec!["notion", "blocks", "edit", "blk", "--text", KO_ITEM, "--help"],
+            vec!["notion", "comments", "add", "page", KO_ITEM, "--help"],
+            vec!["notion", "db", "create-item", "db", "--title", "T", "--body", KO_ITEM, "--help"],
+            vec!["notion", "pages", "edit", "page", "--title", KO_ITEM, "--help"],
+            vec!["notion", "db", "update-item", "page", "--title", KO_ITEM, "--help"],
+            vec!["notion", "search", KO_ITEM, "--help"],
+            vec!["notion", "search", "--help"],
+            vec!["notion", "blocks", "edit", "--help"],
+            vec!["notion", "pages", "append", "page", "-h"],
+        ] {
+            let err = parse_cli_from(help_args.clone()).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                ErrorKind::DisplayHelp,
+                "expected DisplayHelp for {help_args:?}, got {err}"
+            );
+        }
+
+        // Non-text ID, number, and enum parsers stay unchanged.
+        for rejected in [
+            vec!["notion", "pages", "create", "--parent", "-bad-id", "--title", "T"],
+            vec!["notion", "pages", "append", "-bad-page", KO_ITEM],
+            vec!["notion", "pages", "list", "--limit", "-5"],
+            vec!["notion", "pages", "get", "page", "--format", "-md"],
+        ] {
+            assert!(
+                parse_cli_from(rejected.clone()).is_err(),
+                "expected parser rejection for {rejected:?}"
+            );
+        }
+    }
 }
