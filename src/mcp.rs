@@ -484,7 +484,11 @@ async fn dispatch_tool(
         }
         "update_block" => {
             let block_id = req_str("block_id")?;
-            let text = req_str("text")?;
+            let text = args
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("Missing required string argument `text`"))?
+                .to_string();
             let block_type = opt_str("block_type");
             let checked = args.get("checked").and_then(Value::as_bool);
             let updated = cli::op_update_block_text(

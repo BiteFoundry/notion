@@ -1,6 +1,6 @@
 [package]
 name = "notion-cli"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Notion terminal client & AI agent toolkit — Pages, Blocks, Databases (Table/Board/List), Comments & Multi-Workspace (CLI, TUI, HTTP API, MCP)"
 license = "MIT"
@@ -41,6 +41,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
+unicode-segmentation = "1.13.3"
 unicode-width = "0.2"
 url = "2"
 urlencoding = "2"

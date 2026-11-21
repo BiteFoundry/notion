@@ -472,8 +472,8 @@ fn affected_text_spec(path: &[String]) -> Option<(&'static [&'static str], Optio
         [a, b] if a == "pages" && b == "edit" => Some((&["title"], None)),
         [a, b] if a == "blocks" && b == "append" => Some((&[], Some(1))),
         [a, b] if a == "blocks" && b == "edit" => Some((&["text"], None)),
-        [a, b] if a == "db" && b == "create-item" => Some((&["title", "body"], None)),
-        [a, b] if a == "db" && b == "update-item" => Some((&["title"], None)),
+        [a, b] if a == "db" && b == "create-item" => Some((&["title", "body", "status"], None)),
+        [a, b] if a == "db" && b == "update-item" => Some((&["title", "status"], None)),
         [a, b] if a == "comments" && b == "add" => Some((&[], Some(1))),
         [a] if a == "search" => Some((&[], Some(0))),
         _ => None,
@@ -506,6 +506,22 @@ fn could_be_hyphen_literal(s: &str) -> bool {
     let rest = &s[1..];
     // Preserve single-letter ASCII short flags (`-h`, `-V`, `-w`, `-x`, ...).
     !(rest.len() == 1 && rest.as_bytes()[0].is_ascii_alphabetic())
+}
+
+fn is_text_slot_hyphen_literal(s: &str, cmd: &clap::Command) -> bool {
+    if !could_be_hyphen_literal(s) {
+        return false;
+    }
+    if s == "-" || s.starts_with("--") {
+        return true;
+    }
+    let rest = &s[1..];
+    if rest.chars().all(|c| {
+        find_short_option(cmd, c).is_some_and(|arg| !arg.get_action().takes_values())
+    }) {
+        return false;
+    }
+    true
 }
 
 fn is_separate_hyphen_literal(s: &str, cmd: &clap::Command) -> bool {
@@ -654,7 +670,7 @@ fn normalize_cli_args(raw: Vec<OsString>) -> Vec<OsString> {
                         if affected_opts.contains(&name) {
                             if let Some(next) = tail.get(i + 1) {
                                 if next.to_str().is_some_and(|ns| {
-                                    ns.starts_with('-') && is_separate_hyphen_literal(ns, cmd)
+                                    ns.starts_with('-') && is_text_slot_hyphen_literal(ns, cmd)
                                 }) {
                                     let mut combined = OsString::from(format!("--{name}="));
                                     combined.push(next);
@@ -701,7 +717,12 @@ fn normalize_cli_args(raw: Vec<OsString>) -> Vec<OsString> {
                 }
             }
 
-            if s.starts_with('-') && !is_separate_hyphen_literal(s, cmd) {
+            let is_literal_here = if affected_pos == Some(pos_idx) {
+                is_text_slot_hyphen_literal(s, cmd)
+            } else {
+                is_separate_hyphen_literal(s, cmd)
+            };
+            if s.starts_with('-') && !is_literal_here {
                 if s.len() == 2 {
                     let ch = s.chars().nth(1).unwrap();
                     if find_short_option(cmd, ch)
@@ -2177,7 +2198,11 @@ pub async fn op_update_block_text(
     let mut inner = serde_json::Map::new();
     let raw = original[btype]["rich_text"].as_array().map(Vec::as_slice).unwrap_or_default();
     let parsed = parse_rich_text_array(original[btype].get("rich_text"));
-    if rich_text_to_markdown(&parsed) != text {
+    if btype == "code" {
+        if crate::models::spans_plain_text(&parsed) != text {
+            inner.insert("rich_text".into(), json!(crate::page_edit::code_rich_text(text)));
+        }
+    } else if rich_text_to_markdown(&parsed) != text {
         inner.insert("rich_text".into(), json!(crate::page_edit::edited_rich_text(raw, text)?));
     }
     if let (NotionBlockKind::ToDo { checked: actual, .. }, Some(checked)) = (&current.kind, checked) {
@@ -2332,6 +2357,30 @@ fn property_map(extra: Option<Value>) -> Result<serde_json::Map<String, Value>> 
     }
 }
 
+fn explicit_property_compatible_with_status(existing: &Value, kind: &str, status: &str) -> bool {
+    let Some(obj) = existing.as_object() else {
+        return false;
+    };
+    if obj.is_empty() {
+        return true;
+    }
+    if obj.len() != 1 {
+        return false;
+    }
+    let Some(inner) = obj.get(kind).and_then(Value::as_object) else {
+        return false;
+    };
+    if inner.is_empty() {
+        return true;
+    }
+    inner.len() == 1
+        && inner
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            == Some(status)
+}
+
 fn database_item_properties<'a>(
     columns: impl Iterator<Item = (&'a str, &'a str)>,
     title: Option<&str>,
@@ -2346,16 +2395,45 @@ fn database_item_properties<'a>(
         props.insert(name.to_owned(), json!({ "title": [{ "type": "text", "text": { "content": title } }] }));
     }
     if let Some(status) = status.map(str::trim).filter(|s| !s.is_empty()) {
-        let candidates: Vec<_> = columns.iter().copied()
-            .filter(|(_, kind)| matches!(*kind, "status" | "select"))
+        let status_columns: Vec<_> = columns
+            .iter()
+            .copied()
+            .filter(|(_, kind)| *kind == "status")
             .collect();
-        let explicit: Vec<_> = candidates.iter().copied().filter(|(name, _)| props.contains_key(*name)).collect();
-        let status_columns: Vec<_> = candidates.iter().copied().filter(|(_, kind)| *kind == "status").collect();
-        let choice = match (explicit.as_slice(), status_columns.as_slice(), candidates.as_slice()) {
-            ([choice], _, _) | ([], [choice], _) | ([], [], [choice]) => *choice,
-            _ => bail!("Cannot choose a status or select property. Specify the property in properties."),
+        let choice = if !status_columns.is_empty() {
+            let explicit_status: Vec<_> = status_columns
+                .iter()
+                .copied()
+                .filter(|(name, _)| props.contains_key(*name))
+                .collect();
+            match (status_columns.as_slice(), explicit_status.as_slice()) {
+                ([choice], _) | (_, [choice]) => *choice,
+                _ => bail!("Cannot choose a status property. Specify a single status property in properties."),
+            }
+        } else {
+            let select_columns: Vec<_> = columns
+                .iter()
+                .copied()
+                .filter(|(_, kind)| *kind == "select")
+                .collect();
+            let explicit_select: Vec<_> = select_columns
+                .iter()
+                .copied()
+                .filter(|(name, _)| props.contains_key(*name))
+                .collect();
+            match (select_columns.as_slice(), explicit_select.as_slice()) {
+                ([choice], _) | (_, [choice]) => *choice,
+                _ => bail!("Cannot choose a status or select property. Specify the property in properties."),
+            }
         };
         let (name, kind) = choice;
+        if let Some(existing) = props.get(name) {
+            if !explicit_property_compatible_with_status(existing, kind, status) {
+                bail!(
+                    "Conflicting value for property '{name}': explicit properties value does not match --status '{status}'"
+                );
+            }
+        }
         props.insert(name.to_owned(), json!({ (kind): { "name": status } }));
     }
     Ok(props)
@@ -2457,12 +2535,22 @@ pub async fn op_add_comment(
 }
 
 fn read_body_or_file(body: Option<String>, file: Option<PathBuf>) -> Result<Option<String>> {
-    if let Some(path) = file {
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read input file: {}", path.display()))?;
-        return Ok(Some(content));
+    let file_content = match file {
+        Some(path) => Some(
+            fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read input file: {}", path.display()))?,
+        ),
+        None => None,
+    };
+    match (body, file_content) {
+        (Some(b), Some(f)) if !b.is_empty() && !f.is_empty() => {
+            Ok(Some(format!("{}\n{}", b.trim_end_matches('\n'), f)))
+        }
+        (Some(b), Some(_)) if !b.is_empty() => Ok(Some(b)),
+        (_, Some(f)) => Ok(Some(f)),
+        (Some(b), None) => Ok(Some(b)),
+        (None, None) => Ok(None),
     }
-    Ok(body)
 }
 
 fn print_json<T: serde::Serialize>(val: &T) -> Result<()> {

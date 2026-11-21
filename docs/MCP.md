@@ -36,7 +36,7 @@ notion mcp
 | 11 | `list_databases` | — | List accessible Notion databases with schemas. |
 | 12 | `query_database` | `database` | Query rows of a Notion database with optional Notion API JSON filter and sorts. |
 | 13 | `create_database_item` | `database`, `title` | Create a new row page inside a Notion database with title, optional status, custom properties, and Markdown body. |
-| 14 | `update_database_item` | `page_id` | Update title, status, or arbitrary properties on a database row. `title` and `status` use the row's property names and types. Pass explicit `properties` to select a specific column. |
+| 14 | `update_database_item` | `page_id` | Update title, status, or arbitrary properties on a database row. `title` and `status` use the row's property names and types (`status` targets a `status` column and falls back to `select` only when no `status` column exists; pass an explicit column in `properties` to disambiguate multiple columns of the same type without conflicting values). |
 | 15 | `list_comments` | `page` | List comments on a Notion page. |
 | 16 | `add_comment` | `page`, `text` | Add a comment to a Notion page or reply to an existing discussion thread. |
 | 17 | `download_media` | `target` | Download a Notion-hosted or external media URL or image/file/pdf block ID to local disk. |

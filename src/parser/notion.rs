@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use anyhow::{anyhow, Result};
 use bitefoundry_html::{is_safe_raster_image, sniff_content_kind, ContentKind};
 use serde_json::{json, Value};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::models::{
     spans_plain_text, NotionBlock, NotionBlockKind, NotionColor, NotionComment, NotionDatabase,
@@ -1088,10 +1089,13 @@ pub fn blocks_to_editor_markdown(blocks: &[NotionBlock]) -> String {
     lines.join("\n")
 }
 
-pub(crate) fn markdown_edit_ranges(blocks: &[NotionBlock]) -> (String, Vec<std::ops::Range<usize>>) {
+pub(crate) fn markdown_edit_ranges_with_options(
+    blocks: &[NotionBlock],
+    include_column_markers: bool,
+) -> (String, Vec<std::ops::Range<usize>>) {
     let mut lines = Vec::new();
     let mut ranges = Vec::new();
-    render_blocks_md_with_options(blocks, 0, &mut lines, Some(&mut ranges), false);
+    render_blocks_md_with_options(blocks, 0, &mut lines, Some(&mut ranges), include_column_markers);
     // A rendered item (such as a code block's content) can contain multiple lines.
     let mut offsets = vec![0];
     for line in &lines {
@@ -1099,6 +1103,16 @@ pub(crate) fn markdown_edit_ranges(blocks: &[NotionBlock]) -> (String, Vec<std::
     }
     let ranges = ranges.into_iter().map(|r| offsets[r.start]..offsets[r.end]).collect();
     (lines.join("\n"), ranges)
+}
+
+fn push_indented_lines(out: &mut Vec<String>, indent: &str, text: &str) {
+    for line in text.split('\n') {
+        if indent.is_empty() || line.is_empty() {
+            out.push(line.to_owned());
+        } else {
+            out.push(format!("{indent}{line}"));
+        }
+    }
 }
 
 fn render_blocks_md_with_options(
@@ -1119,22 +1133,67 @@ fn render_blocks_md_with_options(
         match &blk.kind {
             NotionBlockKind::Heading1 { rich_text, .. } => {
                 out.push(format!("{indent}# {}", rich_text_to_markdown(rich_text)));
+                if !blk.children.is_empty() {
+                    render_blocks_md_with_options(
+                        &blk.children,
+                        depth + 1,
+                        out,
+                        None,
+                        include_column_markers,
+                    );
+                }
                 out.push(String::new());
             }
             NotionBlockKind::Heading2 { rich_text, .. } => {
                 out.push(format!("{indent}## {}", rich_text_to_markdown(rich_text)));
+                if !blk.children.is_empty() {
+                    render_blocks_md_with_options(
+                        &blk.children,
+                        depth + 1,
+                        out,
+                        None,
+                        include_column_markers,
+                    );
+                }
                 out.push(String::new());
             }
             NotionBlockKind::Heading3 { rich_text, .. } => {
                 out.push(format!("{indent}### {}", rich_text_to_markdown(rich_text)));
+                if !blk.children.is_empty() {
+                    render_blocks_md_with_options(
+                        &blk.children,
+                        depth + 1,
+                        out,
+                        None,
+                        include_column_markers,
+                    );
+                }
                 out.push(String::new());
             }
             NotionBlockKind::Paragraph { rich_text, .. } => {
                 let text = rich_text_to_markdown(rich_text);
                 if text.is_empty() {
                     out.push(String::new());
+                    if !blk.children.is_empty() {
+                        render_blocks_md_with_options(
+                            &blk.children,
+                            depth + 1,
+                            out,
+                            None,
+                            include_column_markers,
+                        );
+                    }
                 } else {
-                    out.push(format!("{indent}{text}"));
+                    push_indented_lines(out, &indent, &text);
+                    if !blk.children.is_empty() {
+                        render_blocks_md_with_options(
+                            &blk.children,
+                            depth + 1,
+                            out,
+                            None,
+                            include_column_markers,
+                        );
+                    }
                     out.push(String::new());
                 }
             }
@@ -1215,6 +1274,15 @@ fn render_blocks_md_with_options(
             }
             NotionBlockKind::Quote { rich_text, .. } => {
                 out.push(format!("{indent}> {}", rich_text_to_markdown(rich_text)));
+                if !blk.children.is_empty() {
+                    render_blocks_md_with_options(
+                        &blk.children,
+                        depth + 1,
+                        out,
+                        None,
+                        include_column_markers,
+                    );
+                }
                 out.push(String::new());
             }
             NotionBlockKind::Divider => {
@@ -1232,7 +1300,7 @@ fn render_blocks_md_with_options(
                     language.as_str()
                 };
                 out.push(format!("{indent}```{lang}"));
-                out.push(spans_plain_text(rich_text));
+                push_indented_lines(out, &indent, &spans_plain_text(rich_text));
                 out.push(format!("{indent}```"));
                 out.push(String::new());
             }
@@ -1858,24 +1926,78 @@ pub(crate) fn strip_numbered_prefix(s: &str) -> Option<&str> {
     }
 }
 
-fn split_leading_emoji(s: &str) -> Option<(String, &str)> {
-    let mut chars = s.chars();
-    let first = chars.next()?;
-    let cp = first as u32;
-    let is_emoji = (0x1F300..=0x1FAFF).contains(&cp)
+fn is_emoji_scalar(ch: char) -> bool {
+    let cp = ch as u32;
+    (0x1F300..=0x1FAFF).contains(&cp)
         || (0x2600..=0x27BF).contains(&cp)
-        || first == '⚠'
-        || first == 'ℹ';
-    if !is_emoji {
+        || (0x1F000..=0x1F02F).contains(&cp)
+        || (0x1F0A0..=0x1F0FF).contains(&cp)
+        || matches!(
+            cp,
+            0x203C
+                | 0x2049
+                | 0x2122
+                | 0x2139
+                | 0x2194..=0x21AA
+                | 0x231A..=0x231B
+                | 0x2328
+                | 0x23CF
+                | 0x23E9..=0x23F3
+                | 0x23F8..=0x23FA
+                | 0x24C2
+                | 0x25AA..=0x25AB
+                | 0x25B6
+                | 0x25C0
+                | 0x25FB..=0x25FE
+                | 0x2934..=0x2935
+                | 0x2B05..=0x2B07
+                | 0x2B1B..=0x2B1C
+                | 0x2B50
+                | 0x2B55
+                | 0x3030
+                | 0x303D
+                | 0x3297
+                | 0x3299
+                | 0x1F170..=0x1F171
+                | 0x1F17E..=0x1F17F
+                | 0x1F18E
+                | 0x1F191..=0x1F19A
+                | 0x1F201..=0x1F202
+                | 0x1F21A
+                | 0x1F22F
+                | 0x1F232..=0x1F23A
+                | 0x1F250..=0x1F251
+        )
+}
+
+fn is_regional_indicator(ch: char) -> bool {
+    (0x1F1E6..=0x1F1FF).contains(&(ch as u32))
+}
+
+fn is_emoji_grapheme(grapheme: &str) -> bool {
+    let mut chars = grapheme.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if is_regional_indicator(first) {
+        return chars.next().is_some_and(is_regional_indicator);
+    }
+    if is_emoji_scalar(first) {
+        return true;
+    }
+    if matches!(first, '0'..='9' | '#' | '*') && grapheme.contains('\u{20E3}') {
+        return true;
+    }
+    false
+}
+
+pub(crate) fn split_leading_emoji(s: &str) -> Option<(String, &str)> {
+    let grapheme = s.graphemes(true).next()?;
+    if !is_emoji_grapheme(grapheme) {
         return None;
     }
-    let mut end = first.len_utf8();
-    // Include variation selector FE0F if present
-    if s[end..].starts_with('\u{FE0F}') {
-        end += '\u{FE0F}'.len_utf8();
-    }
-    let rest = s[end..].trim_start();
-    Some((s[..end].to_string(), rest))
+    let rest = s[grapheme.len()..].trim_start();
+    Some((grapheme.to_string(), rest))
 }
 
 fn is_known_code_lang(lang: &str) -> bool {
