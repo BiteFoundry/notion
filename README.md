@@ -2,12 +2,14 @@
 
 # `@bitefoundry/notion`
 
-**Notion-native terminal workspace & AI agent toolkit — Editorial Pages, Interactive Blocks, Databases (Table/Board/List), CLI · TUI · HTTP API · MCP.**
+**Read and edit Notion pages, work with database records, and search a synced workspace from the terminal.**
 
 [![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fnotion?style=flat-square&color=191919)](https://www.npmjs.com/package/@bitefoundry/notion)
 [![platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-24292F?style=flat-square)](docs/NPM.md)
 [![Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-DEA584?style=flat-square&logo=rust)](https://github.com/BiteFoundry/notion/blob/master/Cargo.toml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-00875A?style=flat-square)](package.json)
+[![License: MIT](https://img.shields.io/badge/license-MIT-00875A?style=flat-square)](LICENSE)
+
+[BiteFoundry](https://bitefoundry.dev/#app-notion) · [Latest release notes](https://github.com/BiteFoundry/notion/releases/latest)
 
 <br />
 
@@ -45,6 +47,12 @@ notion login --oauth --client-id "$NOTION_CLIENT_ID" --client-secret "$NOTION_CL
 notion sync
 notion
 ```
+
+```sh
+notion pages get PAGE_ID --json
+```
+
+Read page Markdown and see which blocks or comments were loaded. A compact read skips the comments request. Use `notion comments list PAGE_ID --json` to fetch comments separately. For full detail, add `--full` in the CLI or pass `compact: false` to `get_page` in MCP.
 
 ---
 
