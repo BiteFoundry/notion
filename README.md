@@ -21,7 +21,7 @@
 
 | Pillar | Capabilities |
 | :--- | :--- |
-| **Minimal-Chrome TUI** | Authentic Notion editorial aesthetic (`notion` / `nt`): 1-line **Breadcrumb Bar**, collapsible **Workspace Sidebar (`[`)** with Favorites & nested tree, **Centered (~88 col) / Full Width (`w`) Page Canvas**, 10 canonical Notion pill colors, live interactive **`to_do` checkboxes (`Space`/`x`)** & **`toggle` blocks**, **Database Table (`1`) / Board Kanban (`2`) / List (`3`) views**, **Comments Peek Drawer (`C`)**, **Quick Find (`Ctrl+K`)**, **Multi-Workspace Switcher (`Ctrl+S`)**, and **5 curated palettes** (`Clean Dark`, `Warm Paper`, `Tokyo Night`, `Catppuccin`, `Nord`). |
+| **Minimal-Chrome TUI** | Authentic Notion editorial aesthetic (`notion`): 1-line **Breadcrumb Bar**, collapsible **Workspace Sidebar (`[`)** with Favorites & nested tree, **Centered (~88 col) / Full Width (`w`) Page Canvas**, 10 canonical Notion pill colors, live interactive **`to_do` checkboxes (`Space`/`x`)** & **`toggle` blocks**, **Database Table (`1`) / Board Kanban (`2`) / List (`3`) views**, **Comments Peek Drawer (`C`)**, **Quick Find (`Ctrl+K`)**, **Multi-Workspace Switcher (`Ctrl+S`)**, and **5 curated palettes** (`Clean Dark`, `Warm Paper`, `Tokyo Night`, `Catppuccin`, `Nord`). |
 | **High-Res Terminal Images** | Native inline image previews for Notion-hosted & external media via **Kitty Graphics**, **iTerm2**, **Sixel**, and **24-bit Truecolor Half-Block (`▀`)** fallback (`v` HD modal & `notion download`). |
 | **Local SQLite FTS5 + IPC Daemon** | Workspace-scoped SQLite WAL + FTS5 cache (`pages`, `databases`, `blocks`, `comments`, `pages_fts`) with automatic `<3`-char Korean/CJK `LIKE` fallback, plus single-instance background sync IPC daemon (`notion daemon start`). |
 | **4-in-1 Agent Interface** | Same binary powers the **Interactive TUI**, scriptable **`--json` CLI**, local **HTTP JSON API** (`notion serve`, `:8791`), and **stdio MCP server** (`notion mcp`, **19 typed tools** with `confirm: true` archive guard). |
@@ -30,8 +30,10 @@
 
 ## Quick Start
 
+Upgrading from 0.1.x? Change `nt` to `notion` in shell scripts and set the MCP server’s `command` to `notion`.
+
 ```bash
-# 1. Install globally (links `notion` and `nt` native binaries)
+# 1. Install globally (installs the native `notion` command)
 npm i -g @bitefoundry/notion
 
 # 2. Authenticate — Internal Integration Token (30-second setup) or Public OAuth 2.0
@@ -41,7 +43,7 @@ notion login --oauth --client-id "$NOTION_CLIENT_ID" --client-secret "$NOTION_CL
 
 # 3. Sync your workspace & launch the Notion-native TUI
 notion sync
-notion        # alias: nt
+notion
 ```
 
 ---
@@ -127,10 +129,10 @@ Full tool catalog and argument schemas: **[docs/MCP.md](docs/MCP.md)** · npm pa
 | :--- | :--- | :--- | :--- |
 | [`@bitefoundry/teams`](https://www.npmjs.com/package/@bitefoundry/teams) | `teams` | Microsoft Teams (Chats, Channels, Meetings & Threads) | TUI · CLI · HTTP · MCP |
 | [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook` | Microsoft Outlook (Mail, Calendar & Contacts) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/onenote`](https://www.npmjs.com/package/@bitefoundry/onenote) | `onenote`, `note` | Microsoft OneNote (Notebooks, Sections & Pages) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/sharepoint`](https://www.npmjs.com/package/@bitefoundry/sharepoint) | `sharepoint`, `sp`, `onedrive`, `od` | Microsoft SharePoint & OneDrive (Sites, Libraries & Lists) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Atlassian Jira (Kanban, Sprints, JQL) & Confluence Wiki | TUI · CLI · HTTP · MCP |
-| **`@bitefoundry/notion`** | `notion`, `nt` | Notion (Editorial Pages, Interactive Blocks & Databases) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/onenote`](https://www.npmjs.com/package/@bitefoundry/onenote) | `onenote` | Microsoft OneNote (Notebooks, Sections & Pages) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/sharepoint`](https://www.npmjs.com/package/@bitefoundry/sharepoint) | `sharepoint`, `bitefoundry-onedrive` | Microsoft SharePoint & OneDrive (Sites, Libraries & Lists) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `confluence`, `conf` | Atlassian Jira (Kanban, Sprints, JQL) & Confluence Wiki | TUI · CLI · HTTP · MCP |
+| **`@bitefoundry/notion`** | `notion` | Notion (Editorial Pages, Interactive Blocks & Databases) | TUI · CLI · HTTP · MCP |
 
 ---
 

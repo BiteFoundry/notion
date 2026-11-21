@@ -1,14 +1,14 @@
 <#
 .SYNOPSIS
-    Idempotently installs the `notion` (`nt`) terminal launcher on any Windows PC.
+    Idempotently installs the `notion` terminal launcher on any Windows PC.
 
 .DESCRIPTION
     1. Ensures <RepoRoot>\target\release\notion.exe exists (downloads the prebuilt
        release binary from GitHub `BiteFoundry/notion` via `gh` when missing, so
        Rust/Cargo is NOT required on target PCs).
-    2. Registers/updates `# >>> notion launcher >>>` (`function notion` & `Set-Alias nt notion`) in PowerShell $PROFILE.
-    3. If $HOME\Tools\bin exists, also writes `notion.cmd` and `nt.cmd` there so already-open shells
-       find `notion` and `nt` immediately.
+    2. Registers/updates `# >>> notion launcher >>>` (`function notion`) in PowerShell $PROFILE.
+    3. If $HOME\Tools\bin exists, also writes `notion.cmd` there so already-open shells
+       find `notion` immediately.
 
 .EXAMPLE
     pwsh -File .\scripts\install-profile.ps1
@@ -66,7 +66,6 @@ function notion {
     }
     & `$exe @args
 }
-Set-Alias -Name nt -Value notion -Force
 $endMarker
 "@.TrimEnd("`r", "`n")
 
@@ -109,12 +108,15 @@ if ($updated -ne $existing) {
 
 $toolsBin = Join-Path $HOME 'Tools\bin'
 if (Test-Path -LiteralPath $toolsBin) {
-    foreach ($shimName in @('notion.cmd', 'nt.cmd')) {
-        $shimPath = Join-Path $toolsBin $shimName
-        $shimContent = "@echo off`r`nchcp 65001 >nul`r`n`"$releaseExe`" %*`r`n"
-        if ($PSCmdlet.ShouldProcess($shimPath, "Write PATH shim $shimName")) {
-            [System.IO.File]::WriteAllText($shimPath, $shimContent, [System.Text.Encoding]::ASCII)
-            Write-Output "Updated PATH shim: $shimPath"
-        }
+    $shimPath = Join-Path $toolsBin 'notion.cmd'
+    $shimContent = "@echo off`r`nchcp 65001 >nul`r`n`"$releaseExe`" %*`r`n"
+    $oldShim = Join-Path $toolsBin 'nt.cmd'
+    if ((Test-Path -LiteralPath $oldShim -PathType Leaf) -and
+        ([IO.File]::ReadAllText($oldShim) -ceq $shimContent) -and
+        $PSCmdlet.ShouldProcess($oldShim, 'Remove old Notion launcher')) {
+        Remove-Item -LiteralPath $oldShim
+    }
+    if ($PSCmdlet.ShouldProcess($shimPath, 'Write Notion PATH shim')) {
+        [IO.File]::WriteAllText($shimPath, $shimContent, [Text.Encoding]::ASCII)
     }
 }

@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // Zero-Node-Process npm native binary linker.
 //
-// On Unix (linux/darwin): replaces installed `bin/notion.js` and `bin/nt.js` with
+// On Unix (linux/darwin): replaces installed `bin/notion.js` with
 // hardlinks/symlinks directly to `@bitefoundry/notion-<platform>-<arch>/bin/notion` so npm's
 // bin symlink execve's the native Rust binary directly (0ms Node startup, 0MB Node RSS).
 //
-// On Windows (win32): creates NTFS hardlinks (fallback copy) `bin/notion.exe` & `bin/nt.exe`
-// and rewrites npm's `.bin/{notion,nt}[.cmd|.ps1]` shims when present to invoke
+// On Windows (win32): creates NTFS hardlinks (fallback copy) `bin/notion.exe`
+// and rewrites npm's `.bin/notion[.cmd|.ps1]` shims when present to invoke
 // the native executable directly without spawning `node.exe`.
 
 import fs from 'node:fs';
@@ -14,7 +14,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-const BIN_NAMES = ['notion', 'nt'];
+const BIN_NAMES = ['notion'];
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function linkOrCopyFile(source, destination) {

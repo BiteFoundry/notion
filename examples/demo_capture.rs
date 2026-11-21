@@ -988,7 +988,7 @@ async fn main() {
     ));
 
     let spec = json!({
-        "title": "notion · nt — Acme Product HQ",
+        "title": "notion — Acme Product HQ",
         "badge": "@bitefoundry/notion v0.1.0",
         "width": WIDTH,
         "height": HEIGHT,

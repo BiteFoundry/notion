@@ -1,4 +1,4 @@
-//! Standalone `@bitefoundry/notion` (`notion` / `nt`) CLI parser, command dispatcher,
+//! Standalone `@bitefoundry/notion` (`notion`) CLI parser, command dispatcher,
 //! and shared domain operations used across CLI, HTTP API (`serve`), and MCP (`mcp`).
 
 use std::{
