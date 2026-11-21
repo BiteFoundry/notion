@@ -189,6 +189,16 @@ impl NotionClient {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value> {
+        self.request_json_version(method, path, body, NOTION_API_VERSION).await
+    }
+
+    async fn request_json_version(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        version: &str,
+    ) -> Result<Value> {
         let token = self.auth.access_token().await?;
         let url = if path.starts_with("http://") || path.starts_with("https://") {
             path.to_string()
@@ -196,6 +206,8 @@ impl NotionClient {
             format!("{}/{}", self.api_base_url, path.trim_start_matches('/'))
         };
 
+        // Append has no idempotency key. A timeout or gateway error may follow a successful write.
+        let can_retry_write = !(method == Method::PATCH && path.ends_with("/children"));
         let mut attempt = 0usize;
         loop {
             self.wait_for_rate_limit_cooldown().await;
@@ -204,7 +216,7 @@ impl NotionClient {
                 .http
                 .request(method.clone(), &url)
                 .header(AUTHORIZATION, format!("Bearer {token}"))
-                .header("Notion-Version", NOTION_API_VERSION);
+                .header("Notion-Version", version);
             if let Some(ref payload) = body {
                 req = req
                     .header(CONTENT_TYPE, "application/json")
@@ -213,7 +225,8 @@ impl NotionClient {
 
             let resp = match req.send().await {
                 Ok(r) => r,
-                Err(err) if attempt < MAX_RETRIES && (err.is_timeout() || err.is_connect()) => {
+                Err(err) if attempt < MAX_RETRIES
+                    && (err.is_connect() || (can_retry_write && err.is_timeout())) => {
                     attempt += 1;
                     tokio::time::sleep(Duration::from_millis(250 * (1u64 << attempt.min(4)))).await;
                     continue;
@@ -244,7 +257,7 @@ impl NotionClient {
                     .unwrap_or("service_overload");
                 if code != "public_api_request_blocked" {
                     self.record_rate_limit_wait(wait);
-                    if attempt < MAX_RETRIES {
+                    if can_retry_write && attempt < MAX_RETRIES {
                         attempt += 1;
                         continue;
                     }
@@ -261,7 +274,7 @@ impl NotionClient {
                 StatusCode::BAD_GATEWAY
                     | StatusCode::SERVICE_UNAVAILABLE
                     | StatusCode::GATEWAY_TIMEOUT
-            ) && attempt < MAX_RETRIES
+            ) && can_retry_write && attempt < MAX_RETRIES
             {
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(300 * (1u64 << attempt.min(4)))).await;
@@ -514,11 +527,13 @@ impl NotionClient {
 
     /// `GET /v1/blocks/{block_id}`
     pub async fn get_block(&self, block_id: &str, page_id: &str) -> Result<NotionBlock> {
-        let id = normalize_notion_id(block_id);
-        let val = self
-            .request_json(Method::GET, &format!("/blocks/{id}"), None)
-            .await?;
+        let val = self.get_block_json(block_id).await?;
         Ok(parse_notion_block(&val, page_id, None))
+    }
+
+    pub(crate) async fn get_block_json(&self, block_id: &str) -> Result<Value> {
+        let id = normalize_notion_id(block_id);
+        self.request_json(Method::GET, &format!("/blocks/{id}"), None).await
     }
 
     /// `GET /v1/blocks/{block_id}` returning the block's raw `(parent_type, parent_id)`.
@@ -550,24 +565,26 @@ impl NotionClient {
                 None => format!("/blocks/{id}/children?page_size=100"),
             };
             let val = self.request_json(Method::GET, &path, None).await?;
-            if let Some(results) = val.get("results").and_then(Value::as_array) {
-                for item in results {
-                    out.push(parse_notion_block(item, page_id, parent_block_id));
-                }
+            let results = val.get("results").and_then(Value::as_array)
+                .context("Notion block children response is missing results")?;
+            for item in results {
+                out.push(parse_notion_block(item, page_id, parent_block_id));
             }
             if val.get("has_more").and_then(Value::as_bool).unwrap_or(false) {
-                cursor = val
+                let next = val
                     .get("next_cursor")
                     .and_then(Value::as_str)
-                    .map(str::to_string);
-                if cursor.is_none() {
-                    break;
+                    .filter(|cursor| !cursor.is_empty())
+                    .context("Notion block children response is missing its next cursor")?;
+                if cursor.as_deref() == Some(next) {
+                    bail!("Notion block children response repeated its pagination cursor");
                 }
+                cursor = Some(next.to_owned());
             } else {
-                break;
+                return Ok(out);
             }
         }
-        Ok(out)
+        bail!("Notion block children pagination did not complete")
     }
 
     /// Recursively fetches a block tree with depth cap & cursor pagination.
@@ -643,7 +660,10 @@ impl NotionClient {
         );
         let mut page = page_res?;
         let blocks = blocks_res?;
-        let comments = comments_res.unwrap_or_default();
+        let (comments, comments_error) = match comments_res {
+            Ok(comments) => (comments, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
         let plain_text = blocks_to_plain_text(&blocks);
         let markdown = blocks_to_markdown(&blocks);
         let media = collect_media_refs(&blocks);
@@ -652,6 +672,7 @@ impl NotionClient {
             page,
             blocks,
             comments,
+            comments_error,
             markdown,
             media,
         })
@@ -665,7 +686,10 @@ impl NotionClient {
             self.list_comments(&id),
         );
         let blocks = blocks_res?;
-        let comments = comments_res.unwrap_or_default();
+        let (comments, comments_error) = match comments_res {
+            Ok(comments) => (comments, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
         page.plain_text = blocks_to_plain_text(&blocks);
         let markdown = blocks_to_markdown(&blocks);
         let media = collect_media_refs(&blocks);
@@ -673,6 +697,7 @@ impl NotionClient {
             page,
             blocks,
             comments,
+            comments_error,
             markdown,
             media,
         })
@@ -696,6 +721,16 @@ impl NotionClient {
         after: Option<&str>,
         children: Vec<Value>,
     ) -> Result<Vec<NotionBlock>> {
+        self.insert_block_children(block_id, after, false, children).await
+    }
+
+    pub(crate) async fn insert_block_children(
+        &self,
+        block_id: &str,
+        after: Option<&str>,
+        at_start: bool,
+        children: Vec<Value>,
+    ) -> Result<Vec<NotionBlock>> {
         let id = normalize_notion_id(block_id);
         let mut created = Vec::new();
         let mut cursor_after = after
@@ -708,26 +743,33 @@ impl NotionClient {
             if let Some(ref after_id) = cursor_after {
                 body.insert("after".into(), json!(after_id));
             }
+            // Only the newer block API can insert before the first sibling.
+            // Keep the existing API version and `after` for all other placements.
+            let version = if at_start && created.is_empty() {
+                body.insert("position".into(), json!({ "type": "start" }));
+                "2026-03-11"
+            } else {
+                NOTION_API_VERSION
+            };
             let val = self
-                .request_json(
+                .request_json_version(
                     Method::PATCH,
                     &format!("/blocks/{id}/children"),
                     Some(Value::Object(body)),
+                    version,
                 )
                 .await?;
-            let mut batch_last_id: Option<String> = None;
-            if let Some(results) = val.get("results").and_then(Value::as_array) {
-                for item in results {
-                    let parsed = parse_notion_block(item, &id, None);
-                    if !parsed.id.is_empty() {
-                        batch_last_id = Some(parsed.id.clone());
-                    }
-                    created.push(parsed);
+            let results = val.get("results").and_then(Value::as_array)
+                .filter(|results| results.len() == chunk.len())
+                .context("Notion did not confirm every appended block")?;
+            for item in results {
+                let parsed = parse_notion_block(item, &id, None);
+                if parsed.id.is_empty() || created.iter().any(|block: &NotionBlock| block.id == parsed.id) {
+                    bail!("Notion did not return a distinct ID for every appended block");
                 }
+                created.push(parsed);
             }
-            if batch_last_id.is_some() {
-                cursor_after = batch_last_id;
-            }
+            cursor_after = created.last().map(|block| block.id.clone());
         }
         Ok(created)
     }

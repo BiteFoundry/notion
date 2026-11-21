@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 14;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 15;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 18;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 19;
 
 /// Initializes SQLite WAL PRAGMAs, Notion workspace-scoped tables, indexes, and `pages_fts`.
 /// Returns `true` if `pages_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -43,6 +43,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pages')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='databases')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='blocks')
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='block_children_fetched')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='comments')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='block_owners')",
                     [],
@@ -84,6 +85,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             created_time TEXT,
             last_edited_time TEXT,
             detail_synced_edited_time TEXT,
+            comments_error TEXT,
             synced_at TEXT,
             PRIMARY KEY (workspace_id, id)
         );
@@ -129,6 +131,12 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         CREATE INDEX IF NOT EXISTS idx_blocks_page_pos
             ON blocks(workspace_id, page_id, position ASC);
 
+        CREATE TABLE IF NOT EXISTS block_children_fetched (
+            workspace_id TEXT NOT NULL,
+            parent_id TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, parent_id)
+        ) WITHOUT ROWID;
+
         CREATE TABLE IF NOT EXISTS comments (
             id TEXT NOT NULL,
             workspace_id TEXT NOT NULL,
@@ -163,6 +171,17 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
 
     // Additive migration for pre-v14 databases: preserves all cached pages, blocks, comments, and FTS rows.
     ensure_column_exists(conn, "pages", "detail_synced_edited_time", "TEXT")?;
+    if ensure_column_exists(conn, "pages", "comments_error", "TEXT")? {
+        // Older caches stored unavailable comments as an empty list. Recheck those
+        // pages on their first online read and leave cached content available offline.
+        conn.execute_batch(
+            "UPDATE pages SET detail_synced_edited_time = NULL
+             WHERE detail_synced_edited_time IS NOT NULL AND NOT EXISTS (
+                 SELECT 1 FROM comments
+                 WHERE comments.workspace_id = pages.workspace_id AND comments.page_id = pages.id
+             )",
+        )?;
+    }
 
     let trigram = ensure_fts5_table(
         conn,
@@ -224,7 +243,7 @@ pub fn shrink_connection_memory(conn: &Connection) {
     let _ = conn.execute_batch("PRAGMA shrink_memory;");
 }
 
-fn ensure_column_exists(conn: &Connection, table: &str, column: &str, col_type: &str) -> Result<()> {
+fn ensure_column_exists(conn: &Connection, table: &str, column: &str, col_type: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table});"))?;
     let mut has_col = false;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -238,7 +257,7 @@ fn ensure_column_exists(conn: &Connection, table: &str, column: &str, col_type: 
         conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {col_type};"))
             .with_context(|| format!("Failed to add column {table}.{column}"))?;
     }
-    Ok(())
+    Ok(!has_col)
 }
 
 fn ensure_fts5_table(

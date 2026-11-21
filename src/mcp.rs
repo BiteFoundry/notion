@@ -1,7 +1,7 @@
 //! Standalone Notion stdio MCP (Model Context Protocol, JSON-RPC 2.0) server (`notion mcp`).
 //!
-//! Exposes 18 Notion tools (100% English descriptions):
-//! `whoami`, `list_workspaces`, `search_pages`, `get_page`, `get_page_blocks`, `create_page`,
+//! Exposes Notion page, block, database, and workspace tools:
+//! `whoami`, `list_workspaces`, `search_pages`, `get_page`, `get_page_blocks`, `create_page`, `update_page`,
 //! `append_blocks`, `update_block`, `toggle_todo`, `archive_page`, `list_databases`,
 //! `query_database`, `create_database_item`, `update_database_item`, `list_comments`,
 //! `add_comment`, `download_media`, `sync_now`.
@@ -184,13 +184,14 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "page": { "type": "string", "description": "Page UUID, Notion URL, or title" },
                     "refresh": { "type": "boolean", "description": "Force refetch of blocks and comments even if page timestamp did not change" },
+                    "compact": { "type": "boolean", "description": "Return only ID, title, last edited time, and Markdown" },
                     "offline": { "type": "boolean" }
                 }
             }
         }),
         json!({
             "name": "get_page_blocks",
-            "description": "List the recursive block tree for a Notion page or block ID.",
+            "description": "List the recursive block tree for a Notion page or block ID. Offline reads report a cache miss when no children have been fetched.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
@@ -216,6 +217,21 @@ pub fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "update_page",
+            "description": "Change a Notion page's title, emoji icon, or both. Omit a field to keep it or send null to clear it.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["page"],
+                "additionalProperties": false,
+                "properties": {
+                    "page": { "type": "string", "description": "Page UUID, Notion URL, or title" },
+                    "title": { "type": ["string", "null"], "description": "New title, or null for an untitled page" },
+                    "icon": { "type": ["string", "null"], "description": "New emoji, or null to remove the icon" }
+                },
+                "anyOf": [{ "required": ["title"] }, { "required": ["icon"] }]
+            }
+        }),
+        json!({
             "name": "append_blocks",
             "description": "Append Markdown or slash-style blocks (/h1, /todo, /callout, /code, /quote, /toggle) to a Notion page or block.",
             "inputSchema": {
@@ -229,7 +245,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "update_block",
-            "description": "Update an existing Notion block's rich text or to_do checked status.",
+            "description": "Update a block's rich text. Use toggle_todo when changing only the checkbox.",
             "inputSchema": {
                 "type": "object",
                 "required": ["block_id", "text"],
@@ -409,6 +425,9 @@ async fn dispatch_tool(
             let refresh = opt_bool("refresh", false);
             let offline = opt_bool("offline", false);
             let detail = cli::op_get_page_with_options(client, storage, &page, refresh, offline).await?;
+            if opt_bool("compact", false) {
+                return Ok(detail.compact());
+            }
             Ok(serde_json::to_value(detail)?)
         }
         "get_page_blocks" => {
@@ -435,6 +454,27 @@ async fn dispatch_tool(
             )
             .await?;
             Ok(serde_json::to_value(created)?)
+        }
+        "update_page" => {
+            let page = req_str("page")?;
+            if let Some(key) = args.as_object().and_then(|map| {
+                map.keys().find(|key| !matches!(key.as_str(), "page" | "title" | "icon"))
+            }) {
+                bail!("Unknown update_page argument `{key}`");
+            }
+            let field = |key| match args.get(key) {
+                None => Ok(None),
+                Some(Value::Null) => Ok(Some(None)),
+                Some(Value::String(text)) => Ok(Some(Some(text.as_str()))),
+                Some(_) => bail!("`{key}` must be a string or null"),
+            };
+            let title = field("title")?;
+            let icon = field("icon")?.map(|value| value.map(str::trim));
+            if icon == Some(Some("")) {
+                bail!("Provide an emoji for `icon` or use null to clear it");
+            }
+            let updated = cli::op_update_page_metadata(client, storage, &page, title, icon).await?;
+            Ok(serde_json::to_value(updated)?)
         }
         "append_blocks" => {
             let page = req_str("page")?;
@@ -564,9 +604,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mcp_exposes_18_english_tools() {
+    fn test_mcp_exposes_19_english_tools() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 19);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str))
@@ -578,6 +618,7 @@ mod tests {
             "get_page",
             "get_page_blocks",
             "create_page",
+            "update_page",
             "append_blocks",
             "update_block",
             "toggle_todo",

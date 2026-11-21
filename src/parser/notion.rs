@@ -1066,15 +1066,34 @@ pub fn rich_text_to_markdown(spans: &[RichTextSpan]) -> String {
 /// Exports a Notion block tree to clean, editable Markdown.
 pub fn blocks_to_markdown(blocks: &[NotionBlock]) -> String {
     let mut lines = Vec::new();
-    render_blocks_md(blocks, 0, &mut lines);
+    render_blocks_md(blocks, 0, &mut lines, None);
     lines.join("\n")
 }
 
-fn render_blocks_md(blocks: &[NotionBlock], depth: usize, out: &mut Vec<String>) {
+pub(crate) fn markdown_edit_ranges(blocks: &[NotionBlock]) -> (String, Vec<std::ops::Range<usize>>) {
+    let mut lines = Vec::new();
+    let mut ranges = Vec::new();
+    render_blocks_md(blocks, 0, &mut lines, Some(&mut ranges));
+    // A rendered item (such as a code block's content) can contain multiple lines.
+    let mut offsets = vec![0];
+    for line in &lines {
+        offsets.push(offsets.last().unwrap() + line.bytes().filter(|&b| b == b'\n').count() + 1);
+    }
+    let ranges = ranges.into_iter().map(|r| offsets[r.start]..offsets[r.end]).collect();
+    (lines.join("\n"), ranges)
+}
+
+fn render_blocks_md(
+    blocks: &[NotionBlock],
+    depth: usize,
+    out: &mut Vec<String>,
+    mut ranges: Option<&mut Vec<std::ops::Range<usize>>>,
+) {
     let indent = "  ".repeat(depth);
     let mut num_counter = 0usize;
 
     for blk in blocks {
+        let start = out.len();
         if !matches!(blk.kind, NotionBlockKind::NumberedListItem { .. }) {
             num_counter = 0;
         }
@@ -1103,7 +1122,7 @@ fn render_blocks_md(blocks: &[NotionBlock], depth: usize, out: &mut Vec<String>)
             NotionBlockKind::BulletedListItem { rich_text, .. } => {
                 out.push(format!("{indent}- {}", rich_text_to_markdown(rich_text)));
                 if !blk.children.is_empty() {
-                    render_blocks_md(&blk.children, depth + 1, out);
+                    render_blocks_md(&blk.children, depth + 1, out, None);
                 }
             }
             NotionBlockKind::NumberedListItem { rich_text, .. } => {
@@ -1113,7 +1132,7 @@ fn render_blocks_md(blocks: &[NotionBlock], depth: usize, out: &mut Vec<String>)
                     rich_text_to_markdown(rich_text)
                 ));
                 if !blk.children.is_empty() {
-                    render_blocks_md(&blk.children, depth + 1, out);
+                    render_blocks_md(&blk.children, depth + 1, out, None);
                 }
             }
             NotionBlockKind::ToDo {
@@ -1125,13 +1144,13 @@ fn render_blocks_md(blocks: &[NotionBlock], depth: usize, out: &mut Vec<String>)
                     rich_text_to_markdown(rich_text)
                 ));
                 if !blk.children.is_empty() {
-                    render_blocks_md(&blk.children, depth + 1, out);
+                    render_blocks_md(&blk.children, depth + 1, out, None);
                 }
             }
             NotionBlockKind::Toggle { rich_text, .. } => {
                 out.push(format!("{indent}> ▸ {}", rich_text_to_markdown(rich_text)));
                 if !blk.children.is_empty() {
-                    render_blocks_md(&blk.children, depth + 1, out);
+                    render_blocks_md(&blk.children, depth + 1, out, None);
                 }
                 out.push(String::new());
             }
@@ -1141,7 +1160,7 @@ fn render_blocks_md(blocks: &[NotionBlock], depth: usize, out: &mut Vec<String>)
                 let ic = icon.as_deref().unwrap_or("💡");
                 out.push(format!("{indent}> {ic} {}", rich_text_to_markdown(rich_text)));
                 if !blk.children.is_empty() {
-                    render_blocks_md(&blk.children, depth + 1, out);
+                    render_blocks_md(&blk.children, depth + 1, out, None);
                 }
                 out.push(String::new());
             }
@@ -1249,7 +1268,7 @@ fn render_blocks_md(blocks: &[NotionBlock], depth: usize, out: &mut Vec<String>)
             NotionBlockKind::ColumnList
             | NotionBlockKind::Column
             | NotionBlockKind::SyncedBlock { .. } => {
-                render_blocks_md(&blk.children, depth, out);
+                render_blocks_md(&blk.children, depth, out, None);
             }
             NotionBlockKind::TableOfContents { .. } => {
                 out.push(format!("{indent}[Table of Contents]"));
@@ -1269,24 +1288,48 @@ fn render_blocks_md(blocks: &[NotionBlock], depth: usize, out: &mut Vec<String>)
                 out.push(format!("{indent}[unsupported: {raw_type}]"));
             }
         }
+        if let Some(ranges) = ranges.as_mut() {
+            ranges.push(start..out.len());
+        }
     }
+}
+
+pub(crate) fn block_inline_markdown<'a>(block_type: &str, line: &'a str) -> &'a str {
+    let line = line.trim();
+    match block_type {
+        "heading_1" | "heading_2" | "heading_3" => line.split_once(' ').map_or(line, |(_, s)| s),
+        "to_do" => line.get(6..).unwrap_or_default(),
+        "bulleted_list_item" => line.get(2..).unwrap_or_default(),
+        "numbered_list_item" => strip_numbered_prefix(line).unwrap_or(line),
+        "toggle" => line.strip_prefix("> ▸ ").unwrap_or(line),
+        "callout" => line.strip_prefix("> ").and_then(split_leading_emoji).map_or(line, |(_, s)| s),
+        "quote" => line.strip_prefix("> ").unwrap_or(line),
+        _ => line,
+    }
+    .trim()
 }
 
 /// Converts inline Markdown (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `[text](url)`)
 /// into a Notion API `rich_text` JSON array.
 pub fn parse_inline_markdown_rich_text(input: &str) -> Vec<Value> {
+    inline_markdown_spans(input).into_iter().map(|(_, span)| span).collect()
+}
+
+/// Source ranges use Unicode scalar offsets, matching the editor's inline diff.
+pub(crate) fn inline_markdown_spans(input: &str) -> Vec<(std::ops::Range<usize>, Value)> {
     let mut spans = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
     let mut i = 0usize;
     let mut plain_buf = String::new();
 
-    let flush_plain = |buf: &mut String, out: &mut Vec<Value>| {
+    let flush_plain = |buf: &mut String, end: usize, out: &mut Vec<_>| {
         if !buf.is_empty() {
-            out.push(json!({
+            let start = end - buf.chars().count();
+            out.push((start..end, json!({
                 "type": "text",
                 "text": { "content": std::mem::take(buf) }
-            }));
+            })));
         }
     };
 
@@ -1299,11 +1342,11 @@ pub fn parse_inline_markdown_rich_text(input: &str) -> Vec<Value> {
                         let label: String = chars[i + 1..close_br].iter().collect();
                         let href: String = chars[close_br + 2..close_par].iter().collect();
                         if href.starts_with("http://") || href.starts_with("https://") {
-                            flush_plain(&mut plain_buf, &mut spans);
-                            spans.push(json!({
+                            flush_plain(&mut plain_buf, i, &mut spans);
+                            spans.push((i..close_par + 1, json!({
                                 "type": "text",
                                 "text": { "content": label, "link": { "url": href } }
-                            }));
+                            })));
                             i = close_par + 1;
                             continue;
                         }
@@ -1316,12 +1359,12 @@ pub fn parse_inline_markdown_rich_text(input: &str) -> Vec<Value> {
         if chars[i] == '`' {
             if let Some(end) = (i + 1..len).find(|&j| chars[j] == '`') {
                 let code: String = chars[i + 1..end].iter().collect();
-                flush_plain(&mut plain_buf, &mut spans);
-                spans.push(json!({
+                flush_plain(&mut plain_buf, i, &mut spans);
+                spans.push((i..end + 1, json!({
                     "type": "text",
                     "text": { "content": code },
                     "annotations": { "code": true }
-                }));
+                })));
                 i = end + 1;
                 continue;
             }
@@ -1333,12 +1376,12 @@ pub fn parse_inline_markdown_rich_text(input: &str) -> Vec<Value> {
                 .find(|&j| chars[j] == '*' && chars[j + 1] == '*')
             {
                 let text: String = chars[i + 2..end].iter().collect();
-                flush_plain(&mut plain_buf, &mut spans);
-                spans.push(json!({
+                flush_plain(&mut plain_buf, i, &mut spans);
+                spans.push((i..end + 2, json!({
                     "type": "text",
                     "text": { "content": text },
                     "annotations": { "bold": true }
-                }));
+                })));
                 i = end + 2;
                 continue;
             }
@@ -1350,12 +1393,12 @@ pub fn parse_inline_markdown_rich_text(input: &str) -> Vec<Value> {
                 .find(|&j| chars[j] == '~' && chars[j + 1] == '~')
             {
                 let text: String = chars[i + 2..end].iter().collect();
-                flush_plain(&mut plain_buf, &mut spans);
-                spans.push(json!({
+                flush_plain(&mut plain_buf, i, &mut spans);
+                spans.push((i..end + 2, json!({
                     "type": "text",
                     "text": { "content": text },
                     "annotations": { "strikethrough": true }
-                }));
+                })));
                 i = end + 2;
                 continue;
             }
@@ -1366,12 +1409,12 @@ pub fn parse_inline_markdown_rich_text(input: &str) -> Vec<Value> {
             if let Some(end) = (i + 1..len).find(|&j| chars[j] == '*') {
                 if end > i + 1 {
                     let text: String = chars[i + 1..end].iter().collect();
-                    flush_plain(&mut plain_buf, &mut spans);
-                    spans.push(json!({
+                    flush_plain(&mut plain_buf, i, &mut spans);
+                    spans.push((i..end + 1, json!({
                         "type": "text",
                         "text": { "content": text },
                         "annotations": { "italic": true }
-                    }));
+                    })));
                     i = end + 1;
                     continue;
                 }
@@ -1382,9 +1425,9 @@ pub fn parse_inline_markdown_rich_text(input: &str) -> Vec<Value> {
         i += 1;
     }
 
-    flush_plain(&mut plain_buf, &mut spans);
+    flush_plain(&mut plain_buf, i, &mut spans);
     if spans.is_empty() {
-        spans.push(json!({ "type": "text", "text": { "content": "" } }));
+        spans.push((0..0, json!({ "type": "text", "text": { "content": "" } })));
     }
     spans
 }
@@ -1717,7 +1760,7 @@ pub fn parse_slash_command_blocks(input: &str) -> Vec<Value> {
     markdown_to_notion_blocks(trimmed)
 }
 
-fn strip_numbered_prefix(s: &str) -> Option<&str> {
+pub(crate) fn strip_numbered_prefix(s: &str) -> Option<&str> {
     let dot_idx = s.find(". ")?;
     if dot_idx == 0 || dot_idx > 4 {
         return None;

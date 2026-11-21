@@ -10,7 +10,6 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
 
 use crate::{
@@ -19,14 +18,12 @@ use crate::{
     daemon, img_preview,
     models::{
         normalize_notion_id, NotionBlock, NotionBlockKind, NotionComment, NotionDatabase,
-        NotionPage, NotionPageDetail, NotionSearchHit,
+        NotionPage, NotionPageDetail, NotionPropertyValue, NotionSearchHit,
     },
     notion::{media, NotionClient, SearchFilterObject},
     parser::{
-        block_comparison_key, blocks_to_markdown, blocks_to_plain_text, collect_media_refs,
-        is_preserved_anchor_block, markdown_to_notion_blocks, parse_inline_markdown_rich_text,
-        parse_notion_block, parse_parent, parse_slash_command_blocks,
-        partition_blocks_around_anchors,
+        blocks_to_markdown, notion::rich_text_to_markdown, parse_notion_block, parse_parent, parse_rich_text_array,
+        parse_slash_command_blocks,
     },
     resolver, serve,
     storage::Storage,
@@ -104,6 +101,9 @@ pub enum PagesCommand {
         offline: bool,
         #[arg(long)]
         json: bool,
+        /// Return only the page ID, title, last edited time, and Markdown
+        #[arg(long, requires = "json")]
+        compact: bool,
     },
     /// Create a new Notion page under a parent page or database
     Create {
@@ -179,6 +179,14 @@ pub enum BlocksCommand {
         body: Option<String>,
         #[arg(long)]
         file: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Edit the inline Markdown text of one block
+    Edit {
+        block_id: String,
+        #[arg(long)]
+        text: String,
         #[arg(long)]
         json: bool,
     },
@@ -413,7 +421,7 @@ pub enum Command {
         #[arg(long)]
         api_key: Option<String>,
     },
-    /// Run stdio JSON-RPC 2.0 MCP server (18 Notion tools)
+    /// Run stdio JSON-RPC 2.0 MCP server
     #[command(visible_alias = "mcp-server")]
     Mcp,
     /// Open the interactive Notion Terminal UI
@@ -881,11 +889,17 @@ async fn handle_pages_cmd(
             refresh,
             offline,
             json: as_json,
+            compact,
         } => {
             let detail = op_get_page_with_options(client, storage, &page, refresh, offline).await?;
-            if as_json {
+            if compact {
+                print_json(&detail.compact())?;
+            } else if as_json {
                 print_json(&detail)?;
             } else {
+                if let Some(error) = &detail.comments_error {
+                    eprintln!("Could not load comments: {error}");
+                }
                 match format.as_str() {
                     "plain" => println!("{}", detail.page.plain_text),
                     "blocks" => print_json(&detail.blocks)?,
@@ -950,20 +964,29 @@ async fn handle_pages_cmd(
         } => {
             let ws_id = client.auth().active_workspace_id().await;
             let page_id = resolver::resolve_page_id(storage, Some(client), &ws_id, &page).await?;
-            if editor {
-                let detail = op_get_page(client, storage, &page_id, false).await?;
+            let edited_page = if editor {
+                let detail = sync::sync_page_detail_force(client, storage, &page_id).await?;
                 let edited = crate::ui::composer::external_edit(&detail.markdown)
                     .context("Failed to edit page in external $EDITOR")?;
-                if edited.trim() != detail.markdown.trim() {
-                    let _ = op_replace_page_markdown(client, storage, &page_id, &edited).await?;
+                if edited.trim_end() == detail.markdown.trim_end() {
+                    Some(detail.page)
+                } else {
+                    let fresh = client.fetch_block_tree(&page_id, None).await?;
+                    if !crate::page_edit::same_edit_baseline(&detail.blocks, &fresh) {
+                        bail!("Page blocks changed while the editor was open. Reopen the page before saving.");
+                    }
+                    Some(apply_page_edit(client, storage, &page_id, &edited, Some(detail.blocks), false).await?.page)
                 }
-            }
+            } else {
+                None
+            };
             let updated = if title.is_some() || icon.is_some() {
                 op_update_page_meta(client, storage, &page_id, title.as_deref(), icon.as_deref())
                     .await?
+            } else if let Some(page) = edited_page {
+                page
             } else {
-                let d = sync::sync_page_detail_force(client, storage, &page_id).await?;
-                d.page
+                sync::sync_page_detail_force(client, storage, &page_id).await?.page
             };
             if as_json {
                 print_json(&updated)?;
@@ -1048,6 +1071,15 @@ async fn handle_blocks_cmd(
                 print_json(&json!({ "ok": true, "appended": blocks.len(), "blocks": blocks }))?;
             } else {
                 println!("Appended {} block(s) to {block_id}.", blocks.len());
+            }
+            Ok(())
+        }
+        BlocksCommand::Edit { block_id, text, json: as_json } => {
+            let block = op_update_block_text(client, storage, &block_id, None, &text, None).await?;
+            if as_json {
+                print_json(&block)?;
+            } else {
+                println!("Updated block {}.", block.id);
             }
             Ok(())
         }
@@ -1574,7 +1606,7 @@ pub async fn op_create_page(
         _ => serde_json::Map::new(),
     };
     let title_key = if parent_is_database { "Name" } else { "title" };
-    if !props.contains_key(title_key) && !props.contains_key("title") && !props.contains_key("Name") {
+    if !props.contains_key(title_key) && !props.values().any(|value| value.get("title").is_some()) {
         props.insert(
             title_key.to_string(),
             json!({ "title": [{ "type": "text", "text": { "content": title } }] }),
@@ -1609,17 +1641,59 @@ pub async fn op_update_page_meta(
 ) -> Result<NotionPage> {
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id(storage, Some(client), &ws_id, page).await?;
+    let title = title.map(|text| ("title", Some(text)));
+    let icon = icon.map(str::trim).filter(|s| !s.is_empty()).map(Some);
+    patch_page_metadata(client, storage, &id, title, icon).await
+}
+
+/// `None` leaves the field untouched. `Some(None)` clears it.
+pub(crate) async fn op_update_page_metadata(
+    client: &NotionClient,
+    storage: &Storage,
+    page: &str,
+    title: Option<Option<&str>>,
+    icon: Option<Option<&str>>,
+) -> Result<NotionPage> {
+    if title.is_none() && icon.is_none() {
+        bail!("Provide title or icon");
+    }
+    let ws_id = client.auth().active_workspace_id().await;
+    let id = resolver::resolve_page_id(storage, Some(client), &ws_id, page).await?;
+    let title_key = if title.is_some() {
+        let current = client.get_page(&id).await?;
+        current.properties.into_iter().find_map(|(name, property)| {
+            matches!(property, NotionPropertyValue::Title(_)).then_some(name)
+        }).context("Page has no accessible title property")?
+    } else {
+        String::new()
+    };
+    let title = title.map(|text| (title_key.as_str(), text));
+    patch_page_metadata(client, storage, &id, title, icon).await
+}
+
+async fn patch_page_metadata(
+    client: &NotionClient,
+    storage: &Storage,
+    id: &str,
+    title: Option<(&str, Option<&str>)>,
+    icon: Option<Option<&str>>,
+) -> Result<NotionPage> {
     let mut payload = serde_json::Map::new();
-    if let Some(t) = title {
-        payload.insert(
-            "properties".into(),
-            json!({ "title": { "title": [{ "type": "text", "text": { "content": t } }] } }),
-        );
+    if let Some((key, text)) = title {
+        let spans = match text.filter(|text| !text.is_empty()) {
+            Some(text) => json!([{ "type": "text", "text": { "content": text } }]),
+            None => json!([]),
+        };
+        payload.insert("properties".into(), json!({ (key): { "title": spans } }));
     }
-    if let Some(ic) = icon.map(str::trim).filter(|s| !s.is_empty()) {
-        payload.insert("icon".into(), json!({ "type": "emoji", "emoji": ic }));
+    if let Some(icon) = icon {
+        let value = match icon {
+            Some(emoji) => json!({ "type": "emoji", "emoji": emoji }),
+            None => Value::Null,
+        };
+        payload.insert("icon".into(), value);
     }
-    let updated = client.update_page(&id, Value::Object(payload)).await?;
+    let updated = client.update_page(id, Value::Object(payload)).await?;
     let _ = storage.upsert_page(&updated);
     Ok(updated)
 }
@@ -1647,7 +1721,9 @@ pub async fn op_list_blocks(
     let id = resolver::resolve_page_id(storage, (!offline).then_some(client), &ws_id, block_or_page)
         .await?;
     if offline {
-        return storage.load_page_blocks(&ws_id, &id);
+        return storage.load_cached_children(&ws_id, &id)?.ok_or_else(|| {
+            anyhow::anyhow!("Children of '{block_or_page}' not found in offline cache (not fetched)")
+        });
     }
     let blocks = client.fetch_block_tree(&id, None).await?;
     let _ = storage.replace_page_blocks(&ws_id, &id, &blocks);
@@ -1666,340 +1742,17 @@ pub async fn op_append_blocks(
     if children.is_empty() {
         bail!("No blocks produced from input text");
     }
-    let appended = client.append_block_children(&id, children).await?;
+    let appended = client.append_block_children(&id, children).await;
+    if appended.is_err() {
+        let _ = storage.invalidate_page_detail(&ws_id, &id);
+    }
     if let Ok(full_tree) = client.fetch_block_tree(&id, None).await {
         let _ = storage.replace_page_blocks(&ws_id, &id, &full_tree);
     }
-    Ok(appended)
+    appended
 }
 
-fn is_patchable_block_type(block_type: &str) -> bool {
-    matches!(
-        block_type,
-        "paragraph"
-            | "heading_1"
-            | "heading_2"
-            | "heading_3"
-            | "bulleted_list_item"
-            | "numbered_list_item"
-            | "to_do"
-            | "toggle"
-            | "callout"
-            | "quote"
-            | "code"
-    )
-}
-
-fn build_block_update_payload(payload: &Value, block_type: &str) -> Option<Value> {
-    if !is_patchable_block_type(block_type) {
-        return None;
-    }
-    let inner = payload.get(block_type)?.clone();
-    let mut obj = serde_json::Map::new();
-    obj.insert(block_type.to_string(), inner);
-    Some(Value::Object(obj))
-}
-
-fn has_real_remote_ids(blocks: &[NotionBlock]) -> bool {
-    !blocks.is_empty()
-        && blocks
-            .iter()
-            .all(|b| !b.id.trim().is_empty() && !b.id.starts_with("__optimistic_"))
-}
-
-fn is_stale_block_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string().to_ascii_lowercase();
-    msg.contains("404")
-        || msg.contains("object_not_found")
-        || msg.contains("archived")
-        || msg.contains("could not find block")
-}
-
-async fn patch_blocks_concurrently(
-    client: &NotionClient,
-    page_id: &str,
-    old_slice: &[NotionBlock],
-    payloads_slice: &[Value],
-) -> Result<Vec<NotionBlock>> {
-    let jobs: Vec<(usize, String, Value, Vec<NotionBlock>, bool)> = old_slice
-        .iter()
-        .zip(payloads_slice.iter())
-        .enumerate()
-        .map(|(idx, (old_blk, payload))| {
-            let update_payload =
-                build_block_update_payload(payload, &old_blk.block_type).expect("patchable");
-            (
-                idx,
-                old_blk.id.clone(),
-                update_payload,
-                old_blk.children.clone(),
-                old_blk.has_children,
-            )
-        })
-        .collect();
-
-    let results: Vec<Result<(usize, NotionBlock)>> = stream::iter(jobs)
-        .map(
-            |(idx, blk_id, update_payload, prev_children, prev_has_children)| async move {
-                let mut updated = client
-                    .update_block(&blk_id, page_id, update_payload)
-                    .await?;
-                if updated.children.is_empty() && !prev_children.is_empty() {
-                    updated.children = prev_children;
-                    updated.has_children = prev_has_children || !updated.children.is_empty();
-                }
-                Ok((idx, updated))
-            },
-        )
-        .buffer_unordered(4)
-        .collect()
-        .await;
-
-    let mut indexed: Vec<(usize, NotionBlock)> = Vec::with_capacity(results.len());
-    for res in results {
-        indexed.push(res?);
-    }
-    indexed.sort_by_key(|(idx, _)| *idx);
-    Ok(indexed.into_iter().map(|(_, blk)| blk).collect())
-}
-
-async fn delete_blocks_concurrently(
-    client: &NotionClient,
-    old_slice: &[NotionBlock],
-) -> Result<()> {
-    let del_jobs: Vec<(String, bool)> = old_slice
-        .iter()
-        .filter(|blk| !is_preserved_anchor_block(blk) && !blk.id.trim().is_empty())
-        .map(|blk| (blk.id.clone(), blk.block_type == "unsupported"))
-        .collect();
-    let del_results: Vec<Result<()>> = stream::iter(del_jobs)
-        .map(|(blk_id, ignore_err)| async move {
-            match client.delete_block(&blk_id).await {
-                Ok(_) => Ok(()),
-                Err(_) if ignore_err => Ok(()),
-                Err(err) => Err(err),
-            }
-        })
-        .buffer_unordered(4)
-        .collect()
-        .await;
-    for res in del_results {
-        res?;
-    }
-    Ok(())
-}
-
-async fn diff_sync_editable_segment(
-    client: &NotionClient,
-    page_id: &str,
-    editable_existing: &[NotionBlock],
-    new_payloads: &[Value],
-    new_parsed: &[NotionBlock],
-    prev_anchor_id: Option<&str>,
-    has_following_anchors: bool,
-) -> Result<Vec<NotionBlock>> {
-    let old_keys: Vec<(String, String)> = editable_existing
-        .iter()
-        .map(block_comparison_key)
-        .collect();
-    let new_keys: Vec<(String, String)> = new_parsed.iter().map(block_comparison_key).collect();
-
-    let mut prefix_len = 0usize;
-    while prefix_len < old_keys.len()
-        && prefix_len < new_keys.len()
-        && old_keys[prefix_len] == new_keys[prefix_len]
-    {
-        prefix_len += 1;
-    }
-
-    let mut suffix_len = 0usize;
-    while suffix_len < (old_keys.len() - prefix_len)
-        && suffix_len < (new_keys.len() - prefix_len)
-        && old_keys[old_keys.len() - 1 - suffix_len] == new_keys[new_keys.len() - 1 - suffix_len]
-    {
-        suffix_len += 1;
-    }
-
-    let can_in_place_patch = |old_slice: &[NotionBlock],
-                              new_slice: &[NotionBlock],
-                              payloads_slice: &[Value]|
-     -> bool {
-        !old_slice.is_empty()
-            && old_slice.len() == new_slice.len()
-            && old_slice
-                .iter()
-                .zip(new_slice.iter())
-                .zip(payloads_slice.iter())
-                .all(|((o, n), p)| {
-                    o.block_type == n.block_type
-                        && build_block_update_payload(p, &o.block_type).is_some()
-                })
-    };
-
-    // Notion's `PATCH /v1/blocks/{id}/children` supports `"after"` (not `"before"`).
-    // When modifying index 0 with no preceding anchor block and a non-empty suffix, fold the
-    // editable suffix if we cannot patch in place (and it isn't a pure deletion) so block order
-    // stays exact — while NEVER touching preserved anchor blocks outside this segment.
-    if prefix_len == 0 && prev_anchor_id.is_none() && suffix_len > 0 {
-        let old_mid_end = editable_existing.len() - suffix_len;
-        let new_mid_end = new_payloads.len() - suffix_len;
-        let old_mid = &editable_existing[..old_mid_end];
-        let new_mid_p = &new_payloads[..new_mid_end];
-        let new_mid_b = &new_parsed[..new_mid_end];
-        let is_noop = old_mid.is_empty() && new_mid_p.is_empty();
-        let is_pure_delete = !old_mid.is_empty() && new_mid_p.is_empty();
-        if !is_noop && !is_pure_delete && !can_in_place_patch(old_mid, new_mid_b, new_mid_p) {
-            suffix_len = 0;
-        }
-    }
-
-    let old_mid_end = editable_existing.len() - suffix_len;
-    let new_mid_end = new_payloads.len() - suffix_len;
-    let old_mid = &editable_existing[prefix_len..old_mid_end];
-    let new_mid_payloads = &new_payloads[prefix_len..new_mid_end];
-    let new_mid_parsed = &new_parsed[prefix_len..new_mid_end];
-
-    let after_id = if prefix_len > 0 {
-        Some(editable_existing[prefix_len - 1].id.as_str())
-    } else {
-        prev_anchor_id
-    };
-
-    let updated_mid: Vec<NotionBlock> = if old_mid.is_empty() && new_mid_payloads.is_empty() {
-        Vec::new()
-    } else if can_in_place_patch(old_mid, new_mid_parsed, new_mid_payloads) {
-        patch_blocks_concurrently(client, page_id, old_mid, new_mid_payloads).await?
-    } else if old_mid.is_empty() {
-        client
-            .append_block_children_after(page_id, after_id, new_mid_payloads.to_vec())
-            .await?
-    } else if new_mid_payloads.is_empty() {
-        delete_blocks_concurrently(client, old_mid).await?;
-        Vec::new()
-    } else if after_id.is_none() && has_following_anchors {
-        // Modifying blocks before a preserved anchor at index 0 with no preceding block:
-        // First patch any leading same-type blocks in place so their real ID acts as `after_id`,
-        // keeping everything positioned strictly BEFORE the preserved anchor without deleting it!
-        let lead_patch = old_mid
-            .iter()
-            .zip(new_mid_parsed.iter())
-            .zip(new_mid_payloads.iter())
-            .take_while(|((o, n), p)| {
-                o.block_type == n.block_type
-                    && build_block_update_payload(p, &o.block_type).is_some()
-            })
-            .count();
-
-        if lead_patch > 0 {
-            let mut out = patch_blocks_concurrently(
-                client,
-                page_id,
-                &old_mid[..lead_patch],
-                &new_mid_payloads[..lead_patch],
-            )
-            .await?;
-            let anchor_after = out.last().map(|b| b.id.clone());
-            if lead_patch < old_mid.len() {
-                delete_blocks_concurrently(client, &old_mid[lead_patch..]).await?;
-            }
-            if lead_patch < new_mid_payloads.len() {
-                let appended = client
-                    .append_block_children_after(
-                        page_id,
-                        anchor_after.as_deref(),
-                        new_mid_payloads[lead_patch..].to_vec(),
-                    )
-                    .await?;
-                out.extend(appended);
-            }
-            out
-        } else {
-            // Different block type at index 0 before a preserved anchor:
-            // Append new blocks `after: old_mid[0]` (placing them strictly BEFORE the anchor),
-            // then delete `old_mid` — exact position preserved with 0 deletes on the anchor!
-            let temp_after = old_mid[0].id.clone();
-            let appended = client
-                .append_block_children_after(
-                    page_id,
-                    Some(&temp_after),
-                    new_mid_payloads.to_vec(),
-                )
-                .await?;
-            delete_blocks_concurrently(client, old_mid).await?;
-            appended
-        }
-    } else {
-        delete_blocks_concurrently(client, old_mid).await?;
-        client
-            .append_block_children_after(page_id, after_id, new_mid_payloads.to_vec())
-            .await?
-    };
-
-    let mut seg_result =
-        Vec::with_capacity(prefix_len + updated_mid.len() + suffix_len);
-    seg_result.extend_from_slice(&editable_existing[..prefix_len]);
-    seg_result.extend(updated_mid);
-    seg_result.extend_from_slice(&editable_existing[old_mid_end..]);
-    Ok(seg_result)
-}
-
-async fn diff_sync_with_existing(
-    client: &NotionClient,
-    page_id: &str,
-    existing: Vec<NotionBlock>,
-    edited_markdown: &str,
-) -> Result<Vec<NotionBlock>> {
-    let cleaned_existing: Vec<NotionBlock> = existing
-        .into_iter()
-        .filter(|blk| is_preserved_anchor_block(blk) || !blk.id.trim().is_empty())
-        .collect();
-
-    let new_payloads = markdown_to_notion_blocks(edited_markdown);
-    let new_parsed: Vec<NotionBlock> = new_payloads
-        .iter()
-        .map(|val| parse_notion_block(val, page_id, None))
-        .collect();
-
-    let (old_segments, anchors, new_ranges) =
-        partition_blocks_around_anchors(&cleaned_existing, &new_parsed);
-
-    let mut final_blocks: Vec<NotionBlock> =
-        Vec::with_capacity(new_parsed.len() + anchors.len());
-    let mut prev_anchor_id: Option<String> = None;
-
-    for (seg_idx, (old_seg, range)) in old_segments
-        .into_iter()
-        .zip(new_ranges.into_iter())
-        .enumerate()
-    {
-        let has_following_anchors = seg_idx < anchors.len();
-        let seg_result = diff_sync_editable_segment(
-            client,
-            page_id,
-            &old_seg,
-            &new_payloads[range.clone()],
-            &new_parsed[range],
-            prev_anchor_id.as_deref(),
-            has_following_anchors,
-        )
-        .await?;
-        final_blocks.extend(seg_result);
-
-        if let Some(anchor) = anchors.get(seg_idx) {
-            if !anchor.id.trim().is_empty() {
-                prev_anchor_id = Some(anchor.id.clone());
-            }
-            final_blocks.push(anchor.clone());
-        }
-    }
-
-    Ok(final_blocks)
-}
-
-/// Replaces the editable content blocks of a Notion page with blocks parsed from `edited_markdown`
-/// using fast diff-based sync (preserving hosted media, child pages, child databases, and structural
-/// blocks in place, skipping untouched prefix/suffix blocks, patching same-type edits concurrently,
-/// and reconstructing the updated `NotionPageDetail` + SQLite cache without slow full-tree re-fetches).
+/// Apply a Markdown edit using the hierarchy and rendered ranges of the original blocks.
 pub async fn op_replace_page_markdown(
     client: &NotionClient,
     storage: &Storage,
@@ -2009,11 +1762,6 @@ pub async fn op_replace_page_markdown(
     op_diff_sync_page_markdown(client, storage, page, edited_markdown, None).await
 }
 
-/// Smart diff-based Markdown -> Notion block sync.
-///
-/// When `known_existing` contains the page's current top-level blocks with real Notion IDs,
-/// skips the initial `GET /v1/blocks/{id}/children` roundtrip. If a stale/archived block ID
-/// causes a 404/archived API error, automatically refetches top-level children once and retries.
 pub async fn op_diff_sync_page_markdown(
     client: &NotionClient,
     storage: &Storage,
@@ -2021,77 +1769,52 @@ pub async fn op_diff_sync_page_markdown(
     edited_markdown: &str,
     known_existing: Option<Vec<NotionBlock>>,
 ) -> Result<NotionPageDetail> {
+    apply_page_edit(client, storage, page, edited_markdown, known_existing, true).await
+}
+
+async fn apply_page_edit(
+    client: &NotionClient,
+    storage: &Storage,
+    page: &str,
+    edited_markdown: &str,
+    known_existing: Option<Vec<NotionBlock>>,
+    retry_stale: bool,
+) -> Result<NotionPageDetail> {
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id(storage, Some(client), &ws_id, page).await?;
-
-    let used_known = known_existing
-        .as_ref()
-        .is_some_and(|blocks| has_real_remote_ids(blocks));
-    let existing = match known_existing {
-        Some(blocks) if has_real_remote_ids(&blocks) => blocks,
-        _ => client.list_block_children(&id, &id, None).await?,
+    let known = known_existing.filter(|blocks| blocks.iter().all(|b| {
+        !b.id.trim().is_empty() && !b.id.starts_with("__optimistic_")
+    }));
+    let existing = match known.as_ref() {
+        Some(blocks) => blocks.clone(),
+        None => client.fetch_block_tree(&id, None).await?,
     };
-
-    let mut final_blocks = match diff_sync_with_existing(client, &id, existing, edited_markdown).await {
-        Ok(blocks) => blocks,
-        Err(err) if used_known && is_stale_block_error(&err) => {
-            let fresh = client.list_block_children(&id, &id, None).await?;
-            diff_sync_with_existing(client, &id, fresh, edited_markdown).await?
-        }
-        Err(err) => return Err(err),
-    };
-
-    // Only fetch children for blocks that actually report nested children not already in memory.
-    for blk in &mut final_blocks {
-        if blk.has_children
-            && blk.children.is_empty()
-            && !matches!(
-                blk.block_type.as_str(),
-                "child_page" | "child_database" | "unsupported"
-            )
-        {
-            if let Ok(children) = client.fetch_block_tree(&blk.id, Some(3)).await {
-                blk.children = children;
-            }
-        }
+    let plan = crate::page_edit::PageEdit::plan(&id, &existing, edited_markdown)?;
+    if plan.is_empty() {
+        return sync::sync_page_detail_force(client, storage, &id).await;
     }
-
-    let mut fetched_fresh_page = false;
-    let mut page_meta = match client.get_page(&id).await {
-        Ok(fresh) => {
-            fetched_fresh_page = true;
-            fresh
-        }
-        Err(_) => match storage.get_page(&ws_id, &id)? {
-            Some(p) => p,
-            None => NotionPage {
-                id: id.clone(),
-                workspace_id: ws_id.clone(),
-                ..Default::default()
-            },
-        },
-    };
-    let comments = storage.load_page_comments(&ws_id, &id).unwrap_or_default();
-
-    page_meta.plain_text = blocks_to_plain_text(&final_blocks);
-    let markdown = blocks_to_markdown(&final_blocks);
-    let media = collect_media_refs(&final_blocks);
-    let detail = NotionPageDetail {
-        page: page_meta,
-        blocks: final_blocks,
-        comments,
-        markdown,
-        media,
-    };
-
-    if fetched_fresh_page {
-        let _ = storage.save_page_detail(&detail);
-    } else {
-        let _ = storage.replace_page_blocks(&ws_id, &id, &detail.blocks);
+    if let Err(error) = plan.apply(client, &id).await {
+        // Refresh the cache even on a mid-save failure. A subsequent save can match
+        // already appended content at its actual position and reuse its server ID.
         let _ = storage.invalidate_page_detail(&ws_id, &id);
+        let recovered = sync::sync_page_detail_force(client, storage, &id).await;
+        if let Ok(fresh) = recovered {
+            if retry_stale && known.is_some() && NotionClient::is_authoritative_not_found(&error) {
+                let retry = crate::page_edit::PageEdit::plan(&id, &fresh.blocks, edited_markdown)?;
+                if let Err(error) = retry.apply(client, &id).await {
+                    let _ = storage.invalidate_page_detail(&ws_id, &id);
+                    let _ = sync::sync_page_detail_force(client, storage, &id).await;
+                    return Err(error);
+                }
+                return sync::sync_page_detail_force(client, storage, &id).await;
+            }
+        } else if let Ok(blocks) = client.fetch_block_tree(&id, None).await {
+            let _ = storage.replace_page_blocks(&ws_id, &id, &blocks);
+        }
+        return Err(error);
     }
-
-    Ok(detail)
+    let _ = storage.invalidate_page_detail(&ws_id, &id);
+    sync::sync_page_detail_force(client, storage, &id).await
 }
 
 pub async fn op_update_block_text(
@@ -2104,22 +1827,33 @@ pub async fn op_update_block_text(
 ) -> Result<NotionBlock> {
     let ws_id = client.auth().active_workspace_id().await;
     let norm_id = normalize_notion_id(block_id);
-    let btype = match block_type {
-        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-        _ => client.get_block(&norm_id, "").await?.block_type,
-    };
-    let mut inner = serde_json::Map::new();
-    inner.insert(
-        "rich_text".into(),
-        Value::Array(parse_inline_markdown_rich_text(text)),
-    );
-    if btype == "to_do" {
-        if let Some(c) = checked {
-            inner.insert("checked".into(), json!(c));
+    let original = client.get_block_json(&norm_id).await?;
+    let current = parse_notion_block(&original, "", None);
+    let btype = &current.block_type;
+    if let Some(requested) = block_type.map(str::trim).filter(|t| !t.is_empty()) {
+        if requested != btype {
+            bail!("Block '{block_id}' is a {btype}, not a {requested}");
         }
     }
+    if !crate::page_edit::patchable(btype) {
+        bail!("Block '{block_id}' does not have editable rich text");
+    }
+    let mut inner = serde_json::Map::new();
+    let raw = original[btype]["rich_text"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let parsed = parse_rich_text_array(original[btype].get("rich_text"));
+    if rich_text_to_markdown(&parsed) != text {
+        inner.insert("rich_text".into(), json!(crate::page_edit::edited_rich_text(raw, text)?));
+    }
+    if let (NotionBlockKind::ToDo { checked: actual, .. }, Some(checked)) = (&current.kind, checked) {
+        if *actual != checked {
+            inner.insert("checked".into(), json!(checked));
+        }
+    }
+    if inner.is_empty() {
+        return Ok(current);
+    }
     let mut payload = serde_json::Map::new();
-    payload.insert(btype, Value::Object(inner));
+    payload.insert(btype.clone(), Value::Object(inner));
     let mut updated = client
         .update_block(&norm_id, "", Value::Object(payload))
         .await?;
@@ -2254,6 +1988,43 @@ pub async fn op_query_database(
     Ok(rows)
 }
 
+fn property_map(extra: Option<Value>) -> Result<serde_json::Map<String, Value>> {
+    match extra {
+        Some(Value::Object(map)) => Ok(map),
+        None => Ok(serde_json::Map::new()),
+        Some(_) => bail!("properties must be a JSON object"),
+    }
+}
+
+fn database_item_properties<'a>(
+    columns: impl Iterator<Item = (&'a str, &'a str)>,
+    title: Option<&str>,
+    status: Option<&str>,
+    extra: Option<Value>,
+) -> Result<serde_json::Map<String, Value>> {
+    let mut props = property_map(extra)?;
+    let columns: Vec<_> = columns.collect();
+    if let Some(title) = title {
+        let (name, _) = columns.iter().copied().find(|(_, kind)| *kind == "title")
+            .context("Database does not have a title property")?;
+        props.insert(name.to_owned(), json!({ "title": [{ "type": "text", "text": { "content": title } }] }));
+    }
+    if let Some(status) = status.map(str::trim).filter(|s| !s.is_empty()) {
+        let candidates: Vec<_> = columns.iter().copied()
+            .filter(|(_, kind)| matches!(*kind, "status" | "select"))
+            .collect();
+        let explicit: Vec<_> = candidates.iter().copied().filter(|(name, _)| props.contains_key(*name)).collect();
+        let status_columns: Vec<_> = candidates.iter().copied().filter(|(_, kind)| *kind == "status").collect();
+        let choice = match (explicit.as_slice(), status_columns.as_slice(), candidates.as_slice()) {
+            ([choice], _, _) | ([], [choice], _) | ([], [], [choice]) => *choice,
+            _ => bail!("Cannot choose a status or select property. Specify the property in properties."),
+        };
+        let (name, kind) = choice;
+        props.insert(name.to_owned(), json!({ (kind): { "name": status } }));
+    }
+    Ok(props)
+}
+
 pub async fn op_create_database_item(
     client: &NotionClient,
     storage: &Storage,
@@ -2265,38 +2036,9 @@ pub async fn op_create_database_item(
 ) -> Result<NotionPage> {
     let ws_id = client.auth().active_workspace_id().await;
     let db_id = resolver::resolve_database_id(storage, Some(client), &ws_id, database).await?;
-    let db = storage
-        .get_database(&ws_id, &db_id)?
-        .or_else(|| None);
-    let title_prop_name = db
-        .as_ref()
-        .and_then(|d| {
-            d.schema
-                .iter()
-                .find(|(_, s)| s.prop_type == "title")
-                .map(|(k, _)| k.clone())
-        })
-        .unwrap_or_else(|| "Name".to_string());
-
-    let mut props = match extra_properties {
-        Some(Value::Object(m)) => m,
-        _ => serde_json::Map::new(),
-    };
-    props.insert(
-        title_prop_name,
-        json!({ "title": [{ "type": "text", "text": { "content": title } }] }),
-    );
-    if let Some(st) = status.map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some(group_prop) = db.as_ref().and_then(|d| d.board_group_property()) {
-            if group_prop.prop_type == "status" {
-                props.insert(group_prop.name.clone(), json!({ "status": { "name": st } }));
-            } else {
-                props.insert(group_prop.name.clone(), json!({ "select": { "name": st } }));
-            }
-        } else {
-            props.insert("Status".into(), json!({ "status": { "name": st } }));
-        }
-    }
+    let db = op_get_database(client, storage, &db_id, false).await?;
+    let columns = db.schema.iter().map(|(name, prop)| (name.as_str(), prop.prop_type.as_str()));
+    let props = database_item_properties(columns, Some(title), status, extra_properties)?;
 
     op_create_page(
         client,
@@ -2320,18 +2062,24 @@ pub async fn op_update_database_item(
     extra_properties: Option<Value>,
 ) -> Result<NotionPage> {
     let id = normalize_notion_id(page_id);
-    let mut props = match extra_properties {
-        Some(Value::Object(m)) => m,
-        _ => serde_json::Map::new(),
+    let status = status.map(str::trim).filter(|s| !s.is_empty());
+    let props = if title.is_some() || status.is_some() {
+        let page = client.get_page(&id).await?;
+        let columns = page.properties.iter().filter_map(|(name, value)| {
+            let kind = match value {
+                NotionPropertyValue::Title(_) => "title",
+                NotionPropertyValue::Status(_) => "status",
+                NotionPropertyValue::Select(_) => "select",
+                _ => return None,
+            };
+            Some((name.as_str(), kind))
+        });
+        database_item_properties(columns, title, status, extra_properties)?
+    } else {
+        property_map(extra_properties)?
     };
-    if let Some(t) = title {
-        props.insert(
-            "Name".into(),
-            json!({ "title": [{ "type": "text", "text": { "content": t } }] }),
-        );
-    }
-    if let Some(st) = status.map(str::trim).filter(|s| !s.is_empty()) {
-        props.insert("Status".into(), json!({ "status": { "name": st } }));
+    if props.is_empty() {
+        bail!("Provide a title, status, or properties to update");
     }
     let updated = client
         .update_page(&id, json!({ "properties": Value::Object(props) }))

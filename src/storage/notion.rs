@@ -83,8 +83,7 @@ impl Storage {
         Ok(())
     }
 
-    /// Persists a page's entire block tree (recursively flattened with `parent_block_id` & `position`),
-    /// updates `pages.plain_text`, and refreshes `pages_fts`.
+    /// Persists the children of a page or block and updates the owning page's search index.
     pub fn replace_page_blocks(
         &self,
         workspace_id: &str,
@@ -93,7 +92,11 @@ impl Storage {
     ) -> Result<()> {
         let mut conn = self.writer();
         let tx = conn.transaction()?;
-        replace_page_blocks_in_tx(&tx, workspace_id, page_id, blocks)?;
+        if let Some((owner_id, _)) = cached_child_parent(&tx, workspace_id, page_id)? {
+            replace_nested_children(&tx, workspace_id, &owner_id, page_id, blocks)?;
+        } else {
+            replace_page_blocks_in_tx(&tx, workspace_id, page_id, blocks)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -107,6 +110,10 @@ impl Storage {
         let mut conn = self.writer();
         let tx = conn.transaction()?;
         replace_page_comments_in_tx(&tx, workspace_id, page_id, comments)?;
+        tx.execute(
+            "UPDATE pages SET comments_error = NULL WHERE workspace_id = ?1 AND id = ?2",
+            params![workspace_id, page_id],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -145,20 +152,23 @@ impl Storage {
             &detail.page.id,
             &detail.blocks,
         )?;
-        replace_page_comments_in_tx(
-            &tx,
-            &detail.page.workspace_id,
-            &detail.page.id,
-            &detail.comments,
-        )?;
+        if detail.comments_error.is_none() {
+            replace_page_comments_in_tx(
+                &tx,
+                &detail.page.workspace_id,
+                &detail.page.id,
+                &detail.comments,
+            )?;
+        }
         let synced_edited = detail
             .page
             .last_edited_time
             .as_deref()
-            .filter(|s| !s.trim().is_empty());
+            .filter(|s| !s.trim().is_empty() && detail.comments_error.is_none());
         tx.execute(
-            "UPDATE pages SET detail_synced_edited_time = ?1 WHERE workspace_id = ?2 AND id = ?3",
-            params![synced_edited, detail.page.workspace_id, detail.page.id],
+            "UPDATE pages SET detail_synced_edited_time = ?1, comments_error = ?2
+             WHERE workspace_id = ?3 AND id = ?4",
+            params![synced_edited, detail.comments_error, detail.page.workspace_id, detail.page.id],
         )?;
         tx.commit()?;
         Ok(true)
@@ -502,6 +512,34 @@ impl Storage {
         load_page_blocks(&conn, workspace_id, page_id)
     }
 
+    pub(crate) fn load_cached_children(
+        &self,
+        workspace_id: &str,
+        parent_id: &str,
+    ) -> Result<Option<Vec<NotionBlock>>> {
+        let mut conn = self.reader();
+        let tx = conn.transaction()?;
+        let (blocks, known_empty) = match cached_child_parent(&tx, workspace_id, parent_id)? {
+            Some((page_id, has_children)) => {
+                let mut blocks = load_blocks_under(&tx, workspace_id, &page_id, Some(parent_id))?;
+                // Match the standalone online tree, whose root is the requested block.
+                set_tree_page_id(&mut blocks, parent_id);
+                (blocks, !has_children)
+            }
+            None => (load_page_blocks(&tx, workspace_id, parent_id)?, false),
+        };
+        if known_empty || !blocks.is_empty() {
+            return Ok(Some(blocks));
+        }
+        let fetched = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM block_children_fetched
+             WHERE workspace_id = ?1 AND parent_id = ?2)",
+            params![workspace_id, parent_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(fetched.then_some(blocks))
+    }
+
     pub fn load_page_comments(
         &self,
         workspace_id: &str,
@@ -521,12 +559,18 @@ impl Storage {
         };
         let blocks = self.load_page_blocks(workspace_id, page_id)?;
         let comments = self.load_page_comments(workspace_id, page_id)?;
+        let comments_error = self.reader().query_row(
+            "SELECT comments_error FROM pages WHERE workspace_id = ?1 AND id = ?2",
+            params![workspace_id, page_id],
+            |row| row.get(0),
+        ).optional()?.flatten();
         let markdown = blocks_to_markdown(&blocks);
         let media = collect_media_refs(&blocks);
         Ok(Some(NotionPageDetail {
             page,
             blocks,
             comments,
+            comments_error,
             markdown,
             media,
         }))
@@ -799,6 +843,15 @@ fn page_detail_matches(conn: &Connection, detail: &NotionPageDetail) -> Result<b
 }
 
 fn load_page_blocks(conn: &Connection, workspace_id: &str, page_id: &str) -> Result<Vec<NotionBlock>> {
+    load_blocks_under(conn, workspace_id, page_id, None)
+}
+
+fn load_blocks_under(
+    conn: &Connection,
+    workspace_id: &str,
+    page_id: &str,
+    parent_id: Option<&str>,
+) -> Result<Vec<NotionBlock>> {
     let mut stmt = conn.prepare(
         "SELECT id, parent_block_id, content_json
          FROM blocks
@@ -820,7 +873,29 @@ fn load_page_blocks(conn: &Connection, workspace_id: &str, page_id: &str) -> Res
         })
         .collect();
 
-    Ok(rebuild_block_tree(flat))
+    Ok(rebuild_block_tree(flat, parent_id.map(str::to_owned)))
+}
+
+fn cached_child_parent(
+    conn: &Connection,
+    workspace_id: &str,
+    parent_id: &str,
+) -> Result<Option<(String, bool)>> {
+    Ok(conn.query_row(
+        "SELECT page_id, has_children FROM blocks
+         WHERE workspace_id = ?1 AND id = ?2
+           AND block_type NOT IN ('child_page', 'child_database')
+           AND NOT EXISTS (SELECT 1 FROM pages WHERE workspace_id = ?1 AND id = ?2)",
+        params![workspace_id, parent_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?)
+}
+
+fn set_tree_page_id(blocks: &mut [NotionBlock], page_id: &str) {
+    for block in blocks {
+        block.page_id = page_id.to_owned();
+        set_tree_page_id(&mut block.children, page_id);
+    }
 }
 
 fn load_page_comments(
@@ -1014,25 +1089,50 @@ fn replace_page_blocks_in_tx(
     )?;
     let mut position = 0i64;
     insert_blocks_recursive(tx, workspace_id, page_id, None, blocks, &mut position)?;
+    mark_children_fetched(tx, workspace_id, page_id)?;
+    update_page_plain_text_in_tx(tx, workspace_id, page_id, &blocks_to_plain_text(blocks))
+}
 
-    let plain = blocks_to_plain_text(blocks);
+fn replace_nested_children(
+    tx: &Connection,
+    workspace_id: &str,
+    owner_id: &str,
+    parent_id: &str,
+    blocks: &[NotionBlock],
+) -> Result<()> {
+    // Store a nested read under its owning page. The block ID is unique per workspace.
     tx.execute(
-        "UPDATE pages SET plain_text = ?1, synced_at = ?2 WHERE workspace_id = ?3 AND id = ?4",
-        params![plain, chrono::Utc::now().to_rfc3339(), workspace_id, page_id],
+        "WITH RECURSIVE descendants(id) AS (
+             SELECT id FROM blocks WHERE workspace_id = ?1 AND parent_block_id = ?2
+             UNION
+             SELECT b.id FROM blocks b JOIN descendants d ON b.parent_block_id = d.id
+             WHERE b.workspace_id = ?1
+         )
+         DELETE FROM blocks WHERE workspace_id = ?1
+           AND (page_id = ?2 OR id IN (SELECT id FROM descendants))",
+        params![workspace_id, parent_id],
     )?;
+    let mut position = 0;
+    insert_blocks_recursive(tx, workspace_id, owner_id, Some(parent_id), blocks, &mut position)?;
+    tx.execute(
+        "UPDATE blocks SET has_children = ?1, content_json = json_set(content_json, '$.has_children', json(?2))
+         WHERE workspace_id = ?3 AND id = ?4",
+        params![!blocks.is_empty(), if blocks.is_empty() { "false" } else { "true" }, workspace_id, parent_id],
+    )?;
+    // Page detail may have changed remotely in addition to this subtree.
+    tx.execute(
+        "UPDATE pages SET detail_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
+        params![workspace_id, owner_id],
+    )?;
+    mark_children_fetched(tx, workspace_id, parent_id)?;
+    recompute_page_plain_text_in_tx(tx, workspace_id, owner_id)
+}
 
-    let row: Option<(String, String, i64)> = tx
-        .query_row(
-            "SELECT title, properties_summary, archived FROM pages WHERE workspace_id = ?1 AND id = ?2",
-            params![workspace_id, page_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?;
-    if let Some((title, props_summary, archived)) = row {
-        if archived == 0 {
-            refresh_fts_row(tx, page_id, workspace_id, "page", &title, &plain, &props_summary)?;
-        }
-    }
+fn mark_children_fetched(tx: &Connection, workspace_id: &str, parent_id: &str) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO block_children_fetched (workspace_id, parent_id) VALUES (?1, ?2)",
+        params![workspace_id, parent_id],
+    )?;
     Ok(())
 }
 
@@ -1089,6 +1189,15 @@ fn recompute_page_plain_text_in_tx(
 ) -> Result<()> {
     let blocks = load_page_blocks(tx, workspace_id, page_id)?;
     let plain = blocks_to_plain_text(&blocks);
+    update_page_plain_text_in_tx(tx, workspace_id, page_id, &plain)
+}
+
+fn update_page_plain_text_in_tx(
+    tx: &Connection,
+    workspace_id: &str,
+    page_id: &str,
+    plain: &str,
+) -> Result<()> {
     tx.execute(
         "UPDATE pages SET plain_text = ?1, synced_at = ?2 WHERE workspace_id = ?3 AND id = ?4",
         params![plain, chrono::Utc::now().to_rfc3339(), workspace_id, page_id],
@@ -1102,7 +1211,7 @@ fn recompute_page_plain_text_in_tx(
         .optional()?;
     if let Some((title, props_summary, archived)) = row {
         if archived == 0 {
-            refresh_fts_row(tx, page_id, workspace_id, "page", &title, &plain, &props_summary)?;
+            refresh_fts_row(tx, page_id, workspace_id, "page", &title, plain, &props_summary)?;
         }
     }
     Ok(())
@@ -1119,6 +1228,10 @@ fn insert_blocks_recursive(
     for blk in blocks {
         let mut flat = blk.clone();
         flat.children.clear();
+        flat.page_id = page_id.to_owned();
+        if let Some(parent) = parent_block_id {
+            flat.parent_block_id = Some(parent.to_owned());
+        }
         let content_json = serde_json::to_string(&flat).unwrap_or_else(|_| "{}".into());
         let plain = flat.plain_text();
         tx.execute(
@@ -1140,12 +1253,19 @@ fn insert_blocks_recursive(
         *position += 1;
         if !blk.children.is_empty() {
             insert_blocks_recursive(tx, workspace_id, page_id, Some(&blk.id), &blk.children, position)?;
+            mark_children_fetched(tx, workspace_id, &blk.id)?;
+        } else if blk.has_children && !matches!(blk.block_type.as_str(), "child_page" | "child_database") {
+            // A depth-limited snapshot indicates children that it did not cache.
+            tx.execute(
+                "DELETE FROM block_children_fetched WHERE workspace_id = ?1 AND parent_id = ?2",
+                params![workspace_id, blk.id],
+            )?;
         }
     }
     Ok(())
 }
 
-fn rebuild_block_tree(flat: Vec<(String, Option<String>, NotionBlock)>) -> Vec<NotionBlock> {
+fn rebuild_block_tree(flat: Vec<(String, Option<String>, NotionBlock)>, root: Option<String>) -> Vec<NotionBlock> {
     let mut children_map: HashMap<Option<String>, Vec<NotionBlock>> = HashMap::new();
     for (_id, parent_id, blk) in flat {
         children_map.entry(parent_id).or_default().push(blk);
@@ -1162,7 +1282,7 @@ fn rebuild_block_tree(flat: Vec<(String, Option<String>, NotionBlock)>) -> Vec<N
         }
         list
     }
-    attach(None, &mut children_map)
+    attach(root, &mut children_map)
 }
 
 fn refresh_fts_row(
@@ -1447,6 +1567,43 @@ mod tests {
     }
 
     #[test]
+    fn offline_children_keep_verified_empty_and_nested_page_cache() {
+        let storage = Storage::open_in_memory().unwrap();
+        assert!(storage.load_cached_children("ws", "empty").unwrap().is_none());
+        storage.replace_page_blocks("ws", "empty", &[]).unwrap();
+        assert_eq!(storage.load_cached_children("ws", "empty").unwrap(), Some(Vec::new()));
+        assert!(storage.load_cached_children("other", "empty").unwrap().is_none());
+
+        let block = |id: &str| NotionBlock { id: id.into(), block_type: "paragraph".into(), ..Default::default() };
+        let mut parent = block("parent");
+        parent.has_children = true;
+        parent.children = vec![block("old-child")];
+        storage.replace_page_blocks("ws", "page", &[parent, block("sibling")]).unwrap();
+        let cached = storage.load_cached_children("ws", "parent").unwrap().unwrap();
+        assert_eq!(cached[0].id, "old-child");
+        assert_eq!(cached[0].page_id, "parent");
+
+        storage.replace_page_blocks("ws", "parent", &[block("new-child")]).unwrap();
+        let tree = storage.load_page_blocks("ws", "page").unwrap();
+        assert_eq!(tree[0].id, "parent");
+        assert_eq!(tree[0].children[0].id, "new-child");
+        assert_eq!(tree[0].children[0].page_id, "page");
+        assert_eq!(tree[1].id, "sibling");
+
+        let mut depth_limited = block("parent");
+        depth_limited.has_children = true;
+        storage.replace_page_blocks("ws", "page", &[depth_limited, block("sibling")]).unwrap();
+        assert!(storage.load_cached_children("ws", "parent").unwrap().is_none());
+
+        storage.replace_page_blocks("ws", "parent", &[]).unwrap();
+        assert_eq!(storage.load_cached_children("ws", "parent").unwrap(), Some(Vec::new()));
+        let tree = storage.load_page_blocks("ws", "page").unwrap();
+        assert!(!tree[0].has_children);
+        assert!(tree[0].children.is_empty());
+        assert_eq!(tree[1].id, "sibling");
+    }
+
+    #[test]
     fn test_migration_v13_preserves_cached_data_and_leaves_detail_synced_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let db_file = tmp.path().join("legacy_v13.db");
@@ -1587,6 +1744,7 @@ mod tests {
             page: page_v2.clone(),
             blocks: vec![todo_blk.clone(), del_blk],
             comments: Vec::new(),
+            comments_error: None,
             markdown: String::new(),
             media: Vec::new(),
         };

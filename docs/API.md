@@ -22,7 +22,7 @@ When `--api-key` is configured, pass `x-api-key: <key>` or `Authorization: Beare
 | `POST` | `/api/v1/pages` | Create a new page (`{ parent_id, title, icon?, markdown?, parent_is_database?, properties? }`) |
 | `GET` | `/api/v1/pages/{id}?offline=false` | Get full page detail (metadata, properties, block tree, comments, markdown, media refs) |
 | `PATCH` | `/api/v1/pages/{id}` | Update page title, icon, properties, or archive/unarchive (`{ title?, icon?, archived?, properties? }`) |
-| `GET` | `/api/v1/pages/{id}/blocks?offline=false` | Get recursive block tree for a page |
+| `GET` | `/api/v1/pages/{id}/blocks?offline=false` | Get a page or block's recursive children. Offline reads return HTTP 404 for an uncached list and HTTP 200 for a verified empty list. |
 | `POST` | `/api/v1/pages/{id}/blocks` | Append Markdown or slash-style blocks (`{ markdown }`) |
 | `PATCH` | `/api/v1/blocks/{id}` | Update block text or toggle `to_do.checked` (`{ block_type?, text?, checked? }`) |
 | `GET` | `/api/v1/databases?refresh=false&offline=false` | List databases & schemas |

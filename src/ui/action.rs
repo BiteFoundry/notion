@@ -2503,6 +2503,7 @@ mod tests {
             page: root_page,
             blocks,
             comments,
+            comments_error: None,
             markdown: String::new(),
             media,
         });
@@ -2840,6 +2841,7 @@ mod tests {
                 ..Default::default()
             }],
             comments: Vec::new(),
+            comments_error: None,
             markdown: String::new(),
             media: vec![NotionMediaRef {
                 block_id: "blk-img-html".into(),
@@ -2982,6 +2984,7 @@ mod tests {
             page,
             blocks,
             comments: Vec::new(),
+            comments_error: None,
             markdown: String::new(),
             media: media_refs,
         });
@@ -3171,6 +3174,7 @@ mod tests {
                 ..Default::default()
             }],
             comments: Vec::new(),
+            comments_error: None,
             markdown: String::new(),
             media: vec![
                 NotionMediaRef {
@@ -3507,6 +3511,7 @@ mod tests {
                 },
             ],
             comments: Vec::new(),
+            comments_error: None,
             markdown: "Old content".into(),
             media: Vec::new(),
         });
@@ -3768,8 +3773,19 @@ mod tests {
 
         let patch_texts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let patch_log = patch_texts.clone();
+        let confirmed_text = patch_texts.clone();
 
         let router = Router::new()
+            .route(
+                "/v1/pages/{id}",
+                get(|AxumPath(id): AxumPath<String>| async move {
+                    Json(serde_json::json!({
+                        "object": "page", "id": id,
+                        "parent": { "type": "workspace", "workspace": true },
+                        "properties": { "title": { "type": "title", "title": [{ "plain_text": "Manual Save Page" }] } }
+                    }))
+                }),
+            )
             .route(
                 "/v1/blocks/{id}",
                 axum::routing::patch(
@@ -3777,10 +3793,12 @@ mod tests {
                         let log = patch_log.clone();
                         async move {
                             let content = body
-                                .pointer("/paragraph/rich_text/0/text/content")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
+                                .pointer("/paragraph/rich_text")
+                                .and_then(|value| value.as_array())
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|span| span.pointer("/text/content").and_then(|value| value.as_str()))
+                                .collect::<String>();
                             log.lock().unwrap().push(content.clone());
                             Json(serde_json::json!({
                                 "id": id,
@@ -3794,6 +3812,22 @@ mod tests {
             )
             .route(
                 "/v1/blocks/{id}/children",
+                get(move || {
+                    let confirmed_text = confirmed_text.clone();
+                    async move {
+                        let content = confirmed_text.lock().unwrap().last().cloned()
+                            .unwrap_or_else(|| "Hello".to_owned());
+                        Json(serde_json::json!({
+                            "object": "list", "has_more": false, "results": [{
+                                "id": "blk-p-1", "type": "paragraph", "has_children": false,
+                                "paragraph": { "rich_text": [{ "plain_text": content }] }
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/comments",
                 get(|| async {
                     Json(serde_json::json!({ "object": "list", "results": [], "has_more": false }))
                 }),
@@ -3842,6 +3876,7 @@ mod tests {
                 ..Default::default()
             }],
             comments: Vec::new(),
+            comments_error: None,
             markdown: "Hello".into(),
             media: Vec::new(),
         });
@@ -4076,7 +4111,13 @@ mod tests {
                             .as_deref()
                             .and_then(|aid| guard.iter().position(|x| x["id"] == aid))
                             .map(|p| p + 1)
-                            .unwrap_or(guard.len());
+                            .unwrap_or_else(|| {
+                                if body.pointer("/position/type").and_then(|v| v.as_str()) == Some("start") {
+                                    0
+                                } else {
+                                    guard.len()
+                                }
+                            });
                         for (i, mut c) in children.into_iter().enumerate() {
                             c["id"] = serde_json::json!(format!("blk-ins-{i}"));
                             c["has_children"] = serde_json::json!(false);
@@ -4286,7 +4327,13 @@ mod tests {
                             .as_deref()
                             .and_then(|aid| guard.iter().position(|x| x["id"] == aid))
                             .map(|p| p + 1)
-                            .unwrap_or(guard.len());
+                            .unwrap_or_else(|| {
+                                if body.pointer("/position/type").and_then(|v| v.as_str()) == Some("start") {
+                                    0
+                                } else {
+                                    guard.len()
+                                }
+                            });
                         for (i, mut c) in children.into_iter().enumerate() {
                             c["id"] = serde_json::json!(format!("blk-ins-{}-{}", guard.len(), i));
                             c["has_children"] = serde_json::json!(false);

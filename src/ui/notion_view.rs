@@ -1798,12 +1798,18 @@ fn draw_comments_drawer(
         .as_ref()
         .map(|d| d.comments.as_slice())
         .unwrap_or(&[]);
+    let comments_unavailable = app.active_page_detail.as_ref()
+        .is_some_and(|detail| detail.comments_error.is_some());
 
     if comments.is_empty() {
         ui.comments_scroll = 0;
         frame.render_widget(
             Paragraph::new(Span::styled(
-                " No comments yet.\n Type below and press Enter.",
+                if comments_unavailable {
+                    " Could not load comments."
+                } else {
+                    " No comments yet.\n Type below and press Enter."
+                },
                 theme.muted_style(),
             ))
             .wrap(Wrap { trim: false })
@@ -1812,6 +1818,9 @@ fn draw_comments_drawer(
         );
     } else {
         let mut lines = Vec::new();
+        if comments_unavailable {
+            lines.push(Line::from(Span::styled(" Could not refresh cached comments.", theme.muted_style())));
+        }
         for c in comments {
             lines.push(Line::from(vec![
                 Span::styled(

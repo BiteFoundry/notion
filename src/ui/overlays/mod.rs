@@ -481,6 +481,7 @@ mod tests {
             page: pages[0].clone(),
             blocks: Vec::new(),
             comments: Vec::new(),
+            comments_error: None,
             markdown: String::new(),
             media,
         });

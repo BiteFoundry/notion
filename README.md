@@ -6,12 +6,12 @@
 
 [![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fnotion?style=flat-square&color=191919)](https://www.npmjs.com/package/@bitefoundry/notion)
 [![platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-24292F?style=flat-square)](docs/NPM.md)
-[![Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-DEA584?style=flat-square&logo=rust)](Cargo.toml)
+[![Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-DEA584?style=flat-square&logo=rust)](https://github.com/BiteFoundry/notion/blob/master/Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-00875A?style=flat-square)](package.json)
 
 <br />
 
-![Notion TUI Demo](assets/demo.gif)
+![Notion TUI Demo](https://raw.githubusercontent.com/BiteFoundry/notion/master/assets/demo.gif)
 
 </div>
 
@@ -24,7 +24,7 @@
 | **Minimal-Chrome TUI** | Authentic Notion editorial aesthetic (`notion` / `nt`): 1-line **Breadcrumb Bar**, collapsible **Workspace Sidebar (`[`)** with Favorites & nested tree, **Centered (~88 col) / Full Width (`w`) Page Canvas**, 10 canonical Notion pill colors, live interactive **`to_do` checkboxes (`Space`/`x`)** & **`toggle` blocks**, **Database Table (`1`) / Board Kanban (`2`) / List (`3`) views**, **Comments Peek Drawer (`C`)**, **Quick Find (`Ctrl+K`)**, **Multi-Workspace Switcher (`Ctrl+S`)**, and **5 curated palettes** (`Clean Dark`, `Warm Paper`, `Tokyo Night`, `Catppuccin`, `Nord`). |
 | **High-Res Terminal Images** | Native inline image previews for Notion-hosted & external media via **Kitty Graphics**, **iTerm2**, **Sixel**, and **24-bit Truecolor Half-Block (`▀`)** fallback (`v` HD modal & `notion download`). |
 | **Local SQLite FTS5 + IPC Daemon** | Workspace-scoped SQLite WAL + FTS5 cache (`pages`, `databases`, `blocks`, `comments`, `pages_fts`) with automatic `<3`-char Korean/CJK `LIKE` fallback, plus single-instance background sync IPC daemon (`notion daemon start`). |
-| **4-in-1 Agent Interface** | Same binary powers the **Interactive TUI**, scriptable **`--json` CLI**, local **HTTP JSON API** (`notion serve`, `:8791`), and **stdio MCP server** (`notion mcp`, **18 typed tools** with `confirm: true` archive guard). |
+| **4-in-1 Agent Interface** | Same binary powers the **Interactive TUI**, scriptable **`--json` CLI**, local **HTTP JSON API** (`notion serve`, `:8791`), and **stdio MCP server** (`notion mcp`, **19 typed tools** with `confirm: true` archive guard). |
 
 ---
 
@@ -74,8 +74,11 @@ notion        # alias: nt
 notion search "Q4 Roadmap" --json
 notion pages list --json
 notion pages get "Q4 Launch Plan"
+notion pages get "Q4 Launch Plan" --json --compact
+notion pages edit "Q4 Launch Plan" --editor
 notion pages append "Q4 Launch Plan" "/todo Tag v1.0 release"
 notion pages export "Q4 Launch Plan" --out launch-plan.md
+notion blocks edit <block-id> --text "Release **verified**" --json
 notion blocks toggle <block-id>
 
 # Query & create Notion database items
@@ -95,13 +98,13 @@ notion daemon start
 ### Local HTTP JSON API (`notion serve`)
 
 ```bash
-notion serve --bind 127.0.0.1 --port 8791 --token "$API_TOKEN"
-curl -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:8791/search?q=Roadmap"
+notion serve --host 127.0.0.1 --port 8791 --api-key "$API_TOKEN"
+curl -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:8791/api/v1/search?q=Roadmap"
 ```
 
 Full endpoint catalog and OpenAPI schema: **[docs/API.md](docs/API.md)** · **[docs/openapi.yaml](docs/openapi.yaml)**.
 
-### MCP Server (`notion mcp` — 18 Tools)
+### MCP Server (`notion mcp` — 19 Tools)
 
 ```json
 {
@@ -123,9 +126,9 @@ Full tool catalog and argument schemas: **[docs/MCP.md](docs/MCP.md)** · npm pa
 | Package | Commands | Workspace | Interfaces |
 | :--- | :--- | :--- | :--- |
 | [`@bitefoundry/teams`](https://www.npmjs.com/package/@bitefoundry/teams) | `teams` | Microsoft Teams (Chats, Channels, Meetings & Threads) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook`, `ol` | Microsoft Outlook (Mail, Calendar & Contacts) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/onenote`](https://www.npmjs.com/package/@bitefoundry/onenote) | `onenote`, `on` | Microsoft OneNote (Notebooks, Sections & Pages) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/sharepoint`](https://www.npmjs.com/package/@bitefoundry/sharepoint) | `sharepoint`, `sp` | Microsoft SharePoint & OneDrive (Sites, Libraries & Lists) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook` | Microsoft Outlook (Mail, Calendar & Contacts) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/onenote`](https://www.npmjs.com/package/@bitefoundry/onenote) | `onenote`, `note` | Microsoft OneNote (Notebooks, Sections & Pages) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/sharepoint`](https://www.npmjs.com/package/@bitefoundry/sharepoint) | `sharepoint`, `sp`, `onedrive`, `od` | Microsoft SharePoint & OneDrive (Sites, Libraries & Lists) | TUI · CLI · HTTP · MCP |
 | [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Atlassian Jira (Kanban, Sprints, JQL) & Confluence Wiki | TUI · CLI · HTTP · MCP |
 | **`@bitefoundry/notion`** | `notion`, `nt` | Notion (Editorial Pages, Interactive Blocks & Databases) | TUI · CLI · HTTP · MCP |
 

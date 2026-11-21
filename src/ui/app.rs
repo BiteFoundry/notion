@@ -1356,6 +1356,12 @@ impl AppState {
                     if ed.page_id == page_id {
                         ed.sync_in_flight = false;
                         ed.last_sync_error = Some(error.clone());
+                        if let Ok(Some(actual)) = self.storage.load_page_detail(&self.workspace_id, &page_id) {
+                            ed.remote_blocks = actual.blocks.clone();
+                            ed.last_synced_detail = Some(actual);
+                        } else {
+                            ed.remote_blocks.clear();
+                        }
                     }
                 }
                 ui.error(format!("Sync failed: {error}"));

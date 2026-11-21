@@ -729,6 +729,7 @@ pub(crate) fn page_detail_semantically_equal(a: &NotionPageDetail, b: &NotionPag
     page_semantically_equal(&a.page, &b.page)
         && a.blocks == b.blocks
         && a.comments == b.comments
+        && a.comments_error == b.comments_error
         && a.markdown == b.markdown
 }
 

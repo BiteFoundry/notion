@@ -870,8 +870,11 @@ pub fn external_edit(current: &str) -> std::io::Result<String> {
     let contents = std::fs::read_to_string(&path);
     let _ = std::fs::remove_file(&path);
 
-    let _ = status?;
-    Ok(normalize(&contents?).trim_end().to_string())
+    let status = status?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!("External editor exited with {status}")));
+    }
+    Ok(normalize(&contents?))
 }
 
 fn parse_editor_command(raw: &str) -> Vec<String> {

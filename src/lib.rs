@@ -6,6 +6,7 @@ pub mod img_preview;
 pub mod mcp;
 pub mod models;
 pub mod notion;
+mod page_edit;
 pub mod parser;
 pub mod resolver;
 pub mod serve;

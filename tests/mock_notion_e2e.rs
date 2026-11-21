@@ -5,7 +5,7 @@
 //!    to_do toggle PATCH, database query + item create/update, comments, 429 Retry-After, media download)
 //! 2. SQLite WAL + FTS5 cache + Korean `<3` char LIKE fallback
 //! 3. Local HTTP API server (`src/serve.rs`, `:8791` contract + API key auth)
-//! 4. Stdio MCP JSON-RPC 2.0 server (`src/mcp.rs`, all 18 tools + `archive_page` confirm guard)
+//! 4. Stdio MCP JSON-RPC 2.0 server (`src/mcp.rs`, tool catalog and `archive_page` confirm guard)
 //! 5. Notion-Native TUI rendering (`TestBackend`: Breadcrumb bar, Sidebar, Page Canvas, Callout,
 //!    Toggle expand/collapse, To-do, Code, Unicode Table, Comments Drawer, Database Table/Board/List).
 
@@ -772,7 +772,7 @@ async fn e2e_notion_client_search_recursive_blocks_todo_db_comments_and_media() 
 }
 
 #[tokio::test]
-async fn e2e_http_api_server_and_all_18_mcp_tools() {
+async fn e2e_http_api_server_and_mcp_tools() {
     let (base_url, _state, mock_server) = start_mock_notion_server().await;
     let cfg = test_config(&base_url);
     let auth = AuthManager::from_token(cfg.clone(), "ntn_mock_token_123");
@@ -868,7 +868,7 @@ async fn e2e_http_api_server_and_all_18_mcp_tools() {
 
     api_server.abort();
 
-    // --- Part B: MCP JSON-RPC 2.0 Server (18 Tools) ---
+    // --- Part B: MCP JSON-RPC 2.0 server ---
     let init = mcp::handle_request_value(
         &cfg,
         &auth,
@@ -889,7 +889,7 @@ async fn e2e_http_api_server_and_all_18_mcp_tools() {
     )
     .await
     .unwrap();
-    assert_eq!(list_tools["result"]["tools"].as_array().unwrap().len(), 18);
+    assert_eq!(list_tools["result"]["tools"].as_array().unwrap().len(), 19);
 
     // Call archive_page WITHOUT confirm -> must fail!
     let archive_denied = mcp::handle_request_value(

@@ -640,6 +640,7 @@ fn build_demo_state() -> (AppState, UiState) {
         page: page_launch.clone(),
         blocks,
         comments,
+        comments_error: None,
         markdown: String::new(),
         media: vec![],
     };

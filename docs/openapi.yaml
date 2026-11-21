@@ -78,15 +78,21 @@ paths:
           description: Updated page
   /api/v1/pages/{id}/blocks:
     get:
-      summary: Get recursive block tree for a page
+      summary: Get recursive children of a page or block
       parameters:
         - name: id
           in: path
           required: true
           schema: { type: string }
+        - name: offline
+          in: query
+          schema: { type: boolean, default: false }
+          description: Use locally cached children.
       responses:
         "200":
-          description: Block tree
+          description: Block tree, including a verified empty list
+        "404":
+          description: Resource not found or children unavailable in the offline cache
     post:
       summary: Append Markdown or slash-style blocks to a page
       parameters:

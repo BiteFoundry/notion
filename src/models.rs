@@ -637,8 +637,21 @@ pub struct NotionPageDetail {
     pub page: NotionPage,
     pub blocks: Vec<NotionBlock>,
     pub comments: Vec<NotionComment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comments_error: Option<String>,
     pub markdown: String,
     pub media: Vec<NotionMediaRef>,
+}
+
+impl NotionPageDetail {
+    pub(crate) fn compact(&self) -> Value {
+        serde_json::json!({
+            "id": self.page.id,
+            "title": self.page.title,
+            "last_edited_time": self.page.last_edited_time,
+            "markdown": self.markdown,
+        })
+    }
 }
 
 /// Search hit returned by SQLite FTS5 / LIKE fallback or remote Notion search.
