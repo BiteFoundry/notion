@@ -57,15 +57,21 @@ paths:
           description: Created page
   /api/v1/pages/{id}:
     get:
-      summary: Get full Notion page detail (metadata, blocks, comments, markdown, media)
+      summary: Get full Notion page detail (metadata, blocks, comments, markdown, media, incomplete_blocks, comments_has_more)
       parameters:
         - name: id
           in: path
           required: true
           schema: { type: string }
+        - name: offline
+          in: query
+          schema: { type: boolean, default: false }
+          description: Read only from the local offline cache.
       responses:
         "200":
           description: Page detail
+        "404":
+          description: Page not found or page body unavailable in the offline cache
     patch:
       summary: Update page metadata, properties, or archive state
       parameters:
@@ -131,6 +137,8 @@ paths:
       responses:
         "200":
           description: Database rows
+        "400":
+          description: Invalid offline query (filter or sorts combined with offline=true) or invalid limit
   /api/v1/databases/{id}/items:
     post:
       summary: Create a new database item row
@@ -150,9 +158,15 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - name: offline
+          in: query
+          schema: { type: boolean, default: false }
+          description: Read only from the local offline cache.
       responses:
         "200":
           description: Comments list
+        "404":
+          description: Page not found or comments unavailable in the offline cache
     post:
       summary: Add a comment or discussion reply
       parameters:

@@ -334,10 +334,20 @@ async fn list_pages_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<PagesListParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let pages = cli::op_list_pages(&state.client, &state.storage, q.archived, q.refresh, q.offline)
-        .await
-        .map_err(ApiError::from_anyhow)?;
-    Ok(Json(json!({ "ok": true, "count": pages.len(), "pages": pages })))
+    let pages = cli::op_list_pages(
+        &state.client,
+        &state.storage,
+        q.archived,
+        q.refresh,
+        q.offline,
+        usize::MAX,
+        None,
+    )
+    .await
+    .map_err(ApiError::from_anyhow)?;
+    Ok(Json(
+        json!({ "ok": true, "count": pages.items.len(), "pages": pages.items }),
+    ))
 }
 
 async fn get_page_handler(
@@ -345,10 +355,13 @@ async fn get_page_handler(
     AxumPath(id): AxumPath<String>,
     Query(q): Query<OfflineParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let detail = cli::op_get_page_with_options(&state.client, &state.storage, &id, q.refresh, q.offline)
-        .await
-        .map_err(ApiError::from_anyhow)?;
-    Ok(Json(json!({ "ok": true, "detail": detail })))
+    let (detail, comments_has_more) =
+        cli::op_get_page_for_output(&state.client, &state.storage, &id, q.refresh, q.offline)
+            .await
+            .map_err(ApiError::from_anyhow)?;
+    Ok(Json(
+        json!({ "ok": true, "detail": detail.full_json(comments_has_more) }),
+    ))
 }
 
 async fn create_page_handler(
@@ -411,10 +424,13 @@ async fn get_page_blocks_handler(
     AxumPath(id): AxumPath<String>,
     Query(q): Query<OfflineParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let blocks = cli::op_list_blocks(&state.client, &state.storage, &id, q.offline)
-        .await
-        .map_err(ApiError::from_anyhow)?;
-    Ok(Json(json!({ "ok": true, "count": blocks.len(), "blocks": blocks })))
+    let blocks =
+        cli::op_list_blocks(&state.client, &state.storage, &id, q.offline, usize::MAX, None)
+            .await
+            .map_err(ApiError::from_anyhow)?;
+    Ok(Json(
+        json!({ "ok": true, "count": blocks.items.len(), "blocks": blocks.items }),
+    ))
 }
 
 async fn append_page_blocks_handler(
@@ -456,10 +472,19 @@ async fn list_databases_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<OfflineParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let dbs = cli::op_list_databases(&state.client, &state.storage, q.refresh, q.offline)
-        .await
-        .map_err(ApiError::from_anyhow)?;
-    Ok(Json(json!({ "ok": true, "count": dbs.len(), "databases": dbs })))
+    let dbs = cli::op_list_databases(
+        &state.client,
+        &state.storage,
+        q.refresh,
+        q.offline,
+        usize::MAX,
+        None,
+    )
+    .await
+    .map_err(ApiError::from_anyhow)?;
+    Ok(Json(
+        json!({ "ok": true, "count": dbs.items.len(), "databases": dbs.items }),
+    ))
 }
 
 async fn query_database_handler(
@@ -474,11 +499,14 @@ async fn query_database_handler(
         body.filter,
         body.sorts,
         body.limit,
+        None,
         body.offline,
     )
     .await
     .map_err(ApiError::from_anyhow)?;
-    Ok(Json(json!({ "ok": true, "count": rows.len(), "rows": rows })))
+    Ok(Json(
+        json!({ "ok": true, "count": rows.items.len(), "rows": rows.items }),
+    ))
 }
 
 async fn create_database_item_handler(
@@ -505,10 +533,19 @@ async fn list_comments_handler(
     AxumPath(id): AxumPath<String>,
     Query(q): Query<OfflineParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let comments = cli::op_list_comments(&state.client, &state.storage, &id, q.offline)
-        .await
-        .map_err(ApiError::from_anyhow)?;
-    Ok(Json(json!({ "ok": true, "count": comments.len(), "comments": comments })))
+    let comments = cli::op_list_comments(
+        &state.client,
+        &state.storage,
+        &id,
+        q.offline,
+        usize::MAX,
+        None,
+    )
+    .await
+    .map_err(ApiError::from_anyhow)?;
+    Ok(Json(
+        json!({ "ok": true, "count": comments.items.len(), "comments": comments.items }),
+    ))
 }
 
 async fn add_comment_handler(
@@ -529,13 +566,16 @@ async fn add_comment_handler(
 }
 
 async fn sync_handler(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
-    let (workspace_id, pages, databases) = sync::sync_workspace_tree(&state.client, &state.storage)
-        .await
-        .map_err(ApiError::from_anyhow)?;
+    let (workspace_id, pages, databases, outcome) =
+        sync::sync_workspace_tree_with_options(&state.client, &state.storage, false, |_, _, _| {})
+            .await
+            .map_err(ApiError::from_anyhow)?;
     Ok(Json(json!({
         "ok": true,
         "workspace_id": workspace_id,
         "pages_count": pages.len(),
         "databases_count": databases.len(),
+        "fetched_count": outcome.fetched,
+        "complete": true,
     })))
 }

@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
@@ -21,6 +21,7 @@ use crate::{
         NotionPropertyValue, POLL_RETRY_SUMMARY,
     },
     notion::{NotionClient, SearchFilterObject},
+    parser::{blocks_to_markdown, collect_media_refs},
     storage::Storage,
 };
 
@@ -80,13 +81,141 @@ impl SyncController {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SyncOutcome {
+    /// Objects received from Notion Search and upserted in this run.
+    pub fetched: usize,
+}
+
+struct StreamedSearch {
+    fetched: usize,
+    newest_edited: Option<String>,
+    /// Page and database IDs seen in this pass; collected only for a full rescan.
+    seen: Option<(HashSet<String>, HashSet<String>)>,
+}
+
+async fn stream_workspace_search<F>(
+    client: &NotionClient,
+    storage: &Storage,
+    watermark: Option<&str>,
+    collect_seen: bool,
+    on_batch: &mut F,
+) -> std::result::Result<StreamedSearch, (usize, anyhow::Error)>
+where
+    F: FnMut(usize, usize, usize),
+{
+    let mut cursor: Option<String> = None;
+    let mut pages_total = 0usize;
+    let mut dbs_total = 0usize;
+    let mut batch_num = 0usize;
+    let mut newest_edited: Option<String> = None;
+    let mut seen = collect_seen.then(|| (HashSet::new(), HashSet::new()));
+
+    loop {
+        let fetched_so_far = pages_total + dbs_total;
+        batch_num += 1;
+        let batch = client
+            .search(None, SearchFilterObject::All, 100, cursor.as_deref())
+            .await
+            .map_err(|err| (fetched_so_far, err))?;
+
+        for p in &batch.pages {
+            if let Some(ts) = p.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
+                if newest_edited.as_deref().map_or(true, |cur| ts > cur) {
+                    newest_edited = Some(ts.to_string());
+                }
+            }
+            if let Some((ref mut seen_pages, _)) = seen {
+                seen_pages.insert(p.id.clone());
+            }
+        }
+        for d in &batch.databases {
+            if let Some(ts) = d.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
+                if newest_edited.as_deref().map_or(true, |cur| ts > cur) {
+                    newest_edited = Some(ts.to_string());
+                }
+            }
+            if let Some((_, ref mut seen_dbs)) = seen {
+                seen_dbs.insert(d.id.clone());
+            }
+        }
+
+        let hit_watermark = if let Some(wm) = watermark.filter(|s| !s.is_empty()) {
+            let mut oldest_in_batch: Option<&str> = None;
+            for p in &batch.pages {
+                if let Some(ts) = p.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
+                    if oldest_in_batch.map_or(true, |cur| ts < cur) {
+                        oldest_in_batch = Some(ts);
+                    }
+                }
+            }
+            for d in &batch.databases {
+                if let Some(ts) = d.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
+                    if oldest_in_batch.map_or(true, |cur| ts < cur) {
+                        oldest_in_batch = Some(ts);
+                    }
+                }
+            }
+            oldest_in_batch.is_some_and(|oldest| oldest < wm)
+        } else {
+            false
+        };
+
+        let batch_pages_len = batch.pages.len();
+        let batch_dbs_len = batch.databases.len();
+        let batch_pages = batch.pages;
+        let batch_dbs = batch.databases;
+        let st = storage.clone();
+        let upsert_res = tokio::task::spawn_blocking(move || -> Result<()> {
+            st.upsert_pages(&batch_pages)?;
+            st.upsert_databases(&batch_dbs)?;
+            Ok(())
+        })
+        .await
+        .map_err(|err| (fetched_so_far, anyhow::Error::from(err)))
+        .and_then(|inner| inner.map_err(|err| (fetched_so_far, err)));
+        upsert_res?;
+
+        pages_total += batch_pages_len;
+        dbs_total += batch_dbs_len;
+        let fetched = pages_total + dbs_total;
+        on_batch(batch_num, pages_total, dbs_total);
+
+        if hit_watermark || !batch.has_more {
+            return Ok(StreamedSearch {
+                fetched,
+                newest_edited,
+                seen,
+            });
+        }
+        let next = match batch.next_cursor.as_deref().filter(|c| !c.is_empty()) {
+            Some(c) => c,
+            None => {
+                return Err((
+                    fetched,
+                    anyhow::anyhow!("Notion search response is missing its next cursor"),
+                ));
+            }
+        };
+        if cursor.as_deref() == Some(next) {
+            return Err((
+                fetched,
+                anyhow::anyhow!("Notion search response repeated its pagination cursor"),
+            ));
+        }
+        cursor = Some(next.to_owned());
+    }
+}
+
 /// Performs an incremental workspace tree sync (`POST /v1/search`) into SQLite.
 /// Uses the stored `last_edited_time` watermark to stop early on unchanged batches.
 pub async fn sync_workspace_tree(
     client: &NotionClient,
     storage: &Storage,
 ) -> Result<(String, Vec<NotionPage>, Vec<NotionDatabase>)> {
-    sync_workspace_tree_with_options(client, storage, false, |_, _, _| {}).await
+    let (workspace_id, pages, databases, _) =
+        sync_workspace_tree_with_options(client, storage, false, |_, _, _| {}).await?;
+    Ok((workspace_id, pages, databases))
 }
 
 /// Performs a workspace tree sync with optional full-rescan override and batch progress callback.
@@ -95,85 +224,94 @@ pub async fn sync_workspace_tree_with_options<F>(
     storage: &Storage,
     full_rescan: bool,
     on_batch: F,
-) -> Result<(String, Vec<NotionPage>, Vec<NotionDatabase>)>
+) -> Result<(String, Vec<NotionPage>, Vec<NotionDatabase>, SyncOutcome)>
 where
     F: FnMut(usize, usize, usize),
 {
-    let (workspace_id, _, databases) =
+    let ((workspace_id, _, databases), outcome) =
         sync_workspace_tree_summaries_with_options(client, storage, full_rescan, on_batch).await?;
     let st = storage.clone();
     let ws = workspace_id.clone();
     let pages = tokio::task::spawn_blocking(move || st.list_pages(&ws, true)).await??;
-    Ok((workspace_id, pages, databases))
+    Ok((workspace_id, pages, databases, outcome))
 }
 
 pub(crate) async fn sync_workspace_tree_summaries(
     client: &NotionClient,
     storage: &Storage,
 ) -> Result<WorkspaceTree> {
-    sync_workspace_tree_summaries_with_options(client, storage, false, |_, _, _| {}).await
+    sync_workspace_tree_summaries_with_options(client, storage, false, |_, _, _| {})
+        .await
+        .map(|(tree, _)| tree)
 }
 
 async fn sync_workspace_tree_summaries_with_options<F>(
     client: &NotionClient,
     storage: &Storage,
     full_rescan: bool,
-    on_batch: F,
-) -> Result<WorkspaceTree>
+    mut on_batch: F,
+) -> Result<(WorkspaceTree, SyncOutcome)>
 where
     F: FnMut(usize, usize, usize),
 {
     let workspace_id = client.auth().active_workspace_id().await;
     let scope_key = format!("workspace:{workspace_id}");
+    let complete_key = format!("workspace-complete:{workspace_id}");
 
-    let watermark = if full_rescan {
-        None
-    } else {
+    let (stored_wm, complete) = {
         let st_wm = storage.clone();
         let sk = scope_key.clone();
-        tokio::task::spawn_blocking(move || st_wm.get_sync_cursor(&sk))
-            .await
-            .ok()
-            .flatten()
+        let ck = complete_key.clone();
+        tokio::task::spawn_blocking(move || {
+            let wm = st_wm.get_sync_cursor(&sk);
+            let done = st_wm.get_sync_cursor(&ck).is_some();
+            (wm, done)
+        })
+        .await
+        .unwrap_or((None, false))
     };
 
-    let res = client
-        .search_incremental(
-            None,
-            SearchFilterObject::All,
-            500,
-            watermark.as_deref(),
-            on_batch,
-        )
-        .await?;
+    let watermark = if full_rescan || !complete {
+        None
+    } else {
+        stored_wm.clone()
+    };
 
-    // Compute newest `last_edited_time` across synced items for the next incremental watermark
-    let mut newest_edited: Option<String> = watermark;
-    for p in &res.pages {
-        if let Some(ts) = p.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
-            if newest_edited.as_deref().map_or(true, |cur| ts > cur) {
-                newest_edited = Some(ts.to_string());
-            }
+    let streamed = match stream_workspace_search(
+        client,
+        storage,
+        watermark.as_deref(),
+        full_rescan,
+        &mut on_batch,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err((fetched, err)) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Workspace sync stopped after {fetched} objects; they stay cached and the next sync starts again from the newest item"
+                )
+            });
         }
-    }
-    for d in &res.databases {
-        if let Some(ts) = d.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
-            if newest_edited.as_deref().map_or(true, |cur| ts > cur) {
-                newest_edited = Some(ts.to_string());
-            }
-        }
-    }
+    };
 
-    let seen_ids = full_rescan.then(|| {
-        let pages = res.pages.iter().map(|p| p.id.clone()).collect::<HashSet<_>>();
-        let databases = res.databases.iter().map(|d| d.id.clone()).collect::<HashSet<_>>();
-        (pages, databases)
-    });
+    let newest = match (stored_wm.as_deref(), streamed.newest_edited.as_deref()) {
+        (Some(a), Some(b)) => Some(if b > a { b.to_string() } else { a.to_string() }),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        (None, None) => None,
+    };
+
+    let seen_ids = streamed.seen;
+    let outcome = SyncOutcome {
+        fetched: streamed.fetched,
+    };
+
     let st = storage.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        st.upsert_pages(&res.pages)?;
-        st.upsert_databases(&res.databases)?;
-        st.set_sync_cursor(&scope_key, newest_edited.as_deref())?;
+        st.set_sync_cursor(&scope_key, newest.as_deref())?;
+        st.set_sync_cursor(&complete_key, Some("1"))?;
         Ok(())
     })
     .await??;
@@ -363,7 +501,7 @@ where
         }
     }
 
-    Ok((workspace_id, pages, databases))
+    Ok(((workspace_id, pages, databases), outcome))
 }
 
 /// Syncs a single page's metadata, recursive block tree, and comments into SQLite.
@@ -384,6 +522,144 @@ pub async fn sync_page_detail_force(
     page_id: &str,
 ) -> Result<crate::models::NotionPageDetail> {
     sync_page_detail_with_mode(client, storage, page_id, DetailSyncMode::Force).await
+}
+
+/// Page metadata + blocks for compact reads. Issues no /v1/comments request and never writes comment state.
+pub async fn sync_page_body(
+    client: &NotionClient,
+    storage: &Storage,
+    page_id: &str,
+    force: bool,
+) -> Result<crate::models::NotionPageDetail> {
+    let ws_id = client.auth().active_workspace_id().await;
+    let norm_id = crate::models::normalize_notion_id(page_id);
+
+    let (page, blocks) = if !force {
+        let st_check = storage.clone();
+        let ws_check = ws_id.clone();
+        let id_check = norm_id.clone();
+        let (cached, has_body, detail_synced_ts, body_synced_ts) =
+            tokio::task::spawn_blocking(move || {
+                let cached = st_check
+                    .load_page_detail(&ws_check, &id_check)
+                    .ok()
+                    .flatten();
+                let has_body = st_check
+                    .load_cached_children(&ws_check, &id_check)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                let detail_ts = st_check
+                    .get_page_detail_synced_edited_time(&ws_check, &id_check)
+                    .ok()
+                    .flatten();
+                let body_ts = st_check
+                    .get_page_body_synced_edited_time(&ws_check, &id_check)
+                    .ok()
+                    .flatten();
+                (cached, has_body, detail_ts, body_ts)
+            })
+            .await
+            .unwrap_or((None, false, None, None));
+
+        if let Some(mut cached_detail) =
+            cached.filter(|_| has_body && (detail_synced_ts.is_some() || body_synced_ts.is_some()))
+        {
+            let mut fresh_page = match client.get_page(&norm_id).await {
+                Ok(p) => p,
+                Err(err) => {
+                    if NotionClient::is_authoritative_not_found(&err) {
+                        let st_nf = storage.clone();
+                        let ws_nf = ws_id.clone();
+                        let id_nf = norm_id.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            st_nf.mark_page_archived(&ws_nf, &id_nf)
+                        })
+                        .await;
+                    }
+                    return Err(err);
+                }
+            };
+            let matched = fresh_page.last_edited_time.as_deref().is_some_and(|ts| {
+                detail_synced_ts.as_deref() == Some(ts) || body_synced_ts.as_deref() == Some(ts)
+            });
+            if matched {
+                if fresh_page.plain_text.trim().is_empty() {
+                    fresh_page.plain_text = cached_detail.page.plain_text.clone();
+                }
+                let meta_changed = cached_detail.page.title != fresh_page.title
+                    || cached_detail.page.icon != fresh_page.icon
+                    || cached_detail.page.archived != fresh_page.archived
+                    || cached_detail.page.properties != fresh_page.properties
+                    || cached_detail.page.parent_id != fresh_page.parent_id
+                    || cached_detail.page.parent_type != fresh_page.parent_type;
+                cached_detail.page = fresh_page;
+                if meta_changed {
+                    let st_meta = storage.clone();
+                    let page_meta = cached_detail.page.clone();
+                    let _ = tokio::task::spawn_blocking(move || st_meta.upsert_page(&page_meta))
+                        .await;
+                }
+                return Ok(NotionPageDetail {
+                    page: cached_detail.page,
+                    blocks: cached_detail.blocks,
+                    comments: Vec::new(),
+                    comments_error: None,
+                    markdown: cached_detail.markdown,
+                    media: cached_detail.media,
+                });
+            }
+            client.fetch_page_body(&norm_id, Some(fresh_page)).await?
+        } else {
+            match client.fetch_page_body(&norm_id, None).await {
+                Ok(pair) => pair,
+                Err(err) => {
+                    if NotionClient::is_authoritative_not_found(&err) {
+                        let st_nf = storage.clone();
+                        let ws_nf = ws_id.clone();
+                        let id_nf = norm_id.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            st_nf.mark_page_archived(&ws_nf, &id_nf)
+                        })
+                        .await;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    } else {
+        match client.fetch_page_body(&norm_id, None).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                if NotionClient::is_authoritative_not_found(&err) {
+                    let st_nf = storage.clone();
+                    let ws_nf = ws_id.clone();
+                    let id_nf = norm_id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        st_nf.mark_page_archived(&ws_nf, &id_nf)
+                    })
+                    .await;
+                }
+                return Err(err);
+            }
+        }
+    };
+
+    let st = storage.clone();
+    let page_clone = page.clone();
+    let blocks_clone = blocks.clone();
+    tokio::task::spawn_blocking(move || st.save_page_body(&page_clone, &blocks_clone)).await??;
+
+    let markdown = blocks_to_markdown(&blocks);
+    let media = collect_media_refs(&blocks);
+    Ok(NotionPageDetail {
+        page,
+        blocks,
+        comments: Vec::new(),
+        comments_error: None,
+        markdown,
+        media,
+    })
 }
 
 /// Syncs a single page detail using `mode`.
@@ -519,10 +795,10 @@ pub async fn sync_database_rows(
     let norm_db_id = crate::models::normalize_notion_id(database_id);
     let (db_res, rows_res) = tokio::join!(
         client.get_database(&norm_db_id),
-        client.query_database_all_with_meta(&norm_db_id, None, None, 250),
+        client.query_database_all_with_meta(&norm_db_id, None, None, 250, None),
     );
     let db = db_res.ok();
-    let (rows, has_more) = rows_res?;
+    let (rows, has_more, _) = rows_res?;
     let st = storage.clone();
     let db_clone = db.clone();
     let rows_clone = rows.clone();

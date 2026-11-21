@@ -76,7 +76,8 @@ notion
 notion search "Q4 Roadmap" --json
 notion pages list --json
 notion pages get "Q4 Launch Plan"
-notion pages get "Q4 Launch Plan" --json --compact
+notion pages get "Q4 Launch Plan" --json
+notion pages get "Q4 Launch Plan" --json --full
 notion pages edit "Q4 Launch Plan" --editor
 notion pages append "Q4 Launch Plan" "/todo Tag v1.0 release"
 notion pages export "Q4 Launch Plan" --out launch-plan.md
@@ -87,6 +88,7 @@ notion blocks toggle <block-id>
 notion db list --json
 notion db query "Q4 Roadmap" --json
 notion db create-item "Q4 Roadmap" --title "Ship v1.0" --status "In Progress"
+notion comments list "Q4 Launch Plan" --json --limit 50 --cursor <next_cursor>
 notion comments add "Q4 Launch Plan" "Green light for launch!"
 notion download <url-or-block-id> --json
 

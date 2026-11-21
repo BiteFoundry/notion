@@ -739,9 +739,12 @@ async fn e2e_notion_client_search_recursive_blocks_todo_db_comments_and_media() 
     ));
 
     // 6. Database query + item create + update
-    let rows = notion_cli::cli::op_query_database(&client, &storage, "db-tasks", None, None, 20, false)
-        .await
-        .unwrap();
+    let rows = notion_cli::cli::op_query_database(
+        &client, &storage, "db-tasks", None, None, 20, None, false,
+    )
+    .await
+    .unwrap()
+    .items;
     assert_eq!(rows.len(), 2);
 
     let created = notion_cli::cli::op_create_database_item(
@@ -1813,13 +1816,17 @@ async fn e2e_bidirectional_sync_versions_forced_refresh_block_writes_and_section
 
     // Section 4A: Notion Search limitation safety & authoritative reconciliation + DB query cap
     // 1. Database query hitting its limit with has_more=true MUST NOT prune unseen cached rows!
-    let capped_rows = cli::op_query_database(&client, &storage, "db-1", None, None, 1, false)
-        .await
-        .unwrap();
+    let capped_rows =
+        cli::op_query_database(&client, &storage, "db-1", None, None, 1, None, false)
+            .await
+            .unwrap()
+            .items;
     assert_eq!(capped_rows.len(), 1);
-    let offline_after_cap = cli::op_query_database(&client, &storage, "db-1", None, None, 50, true)
-        .await
-        .unwrap();
+    let offline_after_cap =
+        cli::op_query_database(&client, &storage, "db-1", None, None, 50, None, true)
+            .await
+            .unwrap()
+            .items;
     assert_eq!(
         offline_after_cap.len(),
         2,
@@ -1856,9 +1863,10 @@ async fn e2e_bidirectional_sync_versions_forced_refresh_block_writes_and_section
         .await
         .unwrap();
     let ws_id = client.auth().active_workspace_id().await;
-    let active_pages = cli::op_list_pages(&client, &storage, false, false, true)
+    let active_pages = cli::op_list_pages(&client, &storage, false, false, true, usize::MAX, None)
         .await
-        .unwrap();
+        .unwrap()
+        .items;
     assert!(
         active_pages.iter().any(|p| p.id == "page-valid-omitted"),
         "valid page missing from Search must remain cached"
@@ -1906,13 +1914,17 @@ async fn e2e_bidirectional_sync_versions_forced_refresh_block_writes_and_section
 
     // 3. Complete unfiltered DB query (has_more=false) after archiving row-2 prunes row-2:
     state.lock().unwrap().row2_archived = true;
-    let db_rows_live = cli::op_query_database(&client, &storage, "db-1", None, None, 50, false)
-        .await
-        .unwrap();
+    let db_rows_live =
+        cli::op_query_database(&client, &storage, "db-1", None, None, 50, None, false)
+            .await
+            .unwrap()
+            .items;
     assert_eq!(db_rows_live.len(), 1);
-    let db_rows_offline = cli::op_query_database(&client, &storage, "db-1", None, None, 50, true)
-        .await
-        .unwrap();
+    let db_rows_offline =
+        cli::op_query_database(&client, &storage, "db-1", None, None, 50, None, true)
+            .await
+            .unwrap()
+            .items;
     assert_eq!(db_rows_offline.len(), 1);
     assert_eq!(db_rows_offline[0].id, "row-1");
 

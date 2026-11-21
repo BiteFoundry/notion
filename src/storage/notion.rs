@@ -15,6 +15,20 @@ use crate::{
     storage::Storage,
 };
 
+pub(crate) enum CachedComments {
+    NotFetched,
+    Failed(String),
+    Complete(Vec<NotionComment>),
+    Partial(Vec<NotionComment>),
+}
+
+pub(crate) struct CommentsSummary {
+    /// "cached" | "partial" | "failed" | "not_fetched"
+    pub state: &'static str,
+    pub count: Option<usize>,
+    pub error: Option<String>,
+}
+
 impl Storage {
     pub fn upsert_workspace(&self, profile: &WorkspaceProfile) -> Result<()> {
         let conn = self.writer();
@@ -106,13 +120,15 @@ impl Storage {
         workspace_id: &str,
         page_id: &str,
         comments: &[NotionComment],
+        complete: bool,
     ) -> Result<()> {
         let mut conn = self.writer();
         let tx = conn.transaction()?;
         replace_page_comments_in_tx(&tx, workspace_id, page_id, comments)?;
+        let fetched: i64 = if complete { 1 } else { 2 };
         tx.execute(
-            "UPDATE pages SET comments_error = NULL WHERE workspace_id = ?1 AND id = ?2",
-            params![workspace_id, page_id],
+            "UPDATE pages SET comments_error = NULL, comments_fetched = ?1 WHERE workspace_id = ?2 AND id = ?3",
+            params![fetched, workspace_id, page_id],
         )?;
         tx.commit()?;
         Ok(())
@@ -123,6 +139,90 @@ impl Storage {
     pub fn save_page_detail(&self, detail: &NotionPageDetail) -> Result<()> {
         self.store_page_detail(detail, false)?;
         Ok(())
+    }
+
+    /// Stores page metadata and blocks only. Leaves comments, comments_error, comments_fetched
+    /// and detail_synced_edited_time untouched.
+    pub fn save_page_body(&self, page: &NotionPage, blocks: &[NotionBlock]) -> Result<()> {
+        let mut conn = self.writer();
+        let tx = conn.transaction()?;
+        upsert_page_in_tx(&tx, page)?;
+        replace_page_blocks_in_tx(&tx, &page.workspace_id, &page.id, blocks)?;
+        let body_synced = page
+            .last_edited_time
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
+        tx.execute(
+            "UPDATE pages SET body_synced_edited_time = ?1 WHERE workspace_id = ?2 AND id = ?3",
+            params![body_synced, page.workspace_id, page.id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Returns the remote `last_edited_time` recorded when blocks were last fetched via compact sync.
+    pub fn get_page_body_synced_edited_time(
+        &self,
+        workspace_id: &str,
+        page_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.reader();
+        let ts: Option<String> = conn
+            .query_row(
+                "SELECT body_synced_edited_time FROM pages WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, page_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .filter(|s| !s.trim().is_empty());
+        Ok(ts)
+    }
+
+    /// Comment state and count from existing markers; reads no comment bodies.
+    pub(crate) fn cached_comments_summary(
+        &self,
+        workspace_id: &str,
+        page_id: &str,
+    ) -> Result<CommentsSummary> {
+        let conn = self.reader();
+        let row: Option<(i64, Option<String>, i64)> = conn
+            .query_row(
+                "SELECT comments_fetched, comments_error,
+                        (SELECT COUNT(*) FROM comments
+                         WHERE workspace_id = ?1 AND page_id = ?2)
+                 FROM pages WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, page_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            None => CommentsSummary {
+                state: "not_fetched",
+                count: None,
+                error: None,
+            },
+            Some((_, Some(err), _)) => CommentsSummary {
+                state: "failed",
+                count: None,
+                error: Some(err),
+            },
+            Some((1, None, count)) => CommentsSummary {
+                state: "cached",
+                count: Some(count.max(0) as usize),
+                error: None,
+            },
+            Some((2, None, _)) => CommentsSummary {
+                state: "partial",
+                count: None,
+                error: None,
+            },
+            Some((_, None, _)) => CommentsSummary {
+                state: "not_fetched",
+                count: None,
+                error: None,
+            },
+        })
     }
 
     /// Records a fresh poll and returns whether it replaced the cached detail.
@@ -159,6 +259,16 @@ impl Storage {
                 &detail.page.id,
                 &detail.comments,
             )?;
+            let comments_fetched: i64 =
+                if detail.comments.len() == crate::notion::DETAIL_COMMENTS_LIMIT + 1 {
+                    2
+                } else {
+                    1
+                };
+            tx.execute(
+                "UPDATE pages SET comments_fetched = ?1 WHERE workspace_id = ?2 AND id = ?3",
+                params![comments_fetched, detail.page.workspace_id, detail.page.id],
+            )?;
         }
         let synced_edited = detail
             .page
@@ -190,7 +300,7 @@ impl Storage {
     pub fn invalidate_page_detail(&self, workspace_id: &str, page_id: &str) -> Result<()> {
         let conn = self.writer();
         conn.execute(
-            "UPDATE pages SET detail_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
+            "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
             params![workspace_id, page_id],
         )?;
         Ok(())
@@ -251,7 +361,7 @@ impl Storage {
             let needs_refetch = block.has_children && existing_has_children == 0;
             if needs_refetch {
                 tx.execute(
-                    "UPDATE pages SET detail_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
+                    "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
                     params![workspace_id, page_id],
                 )?;
             }
@@ -262,7 +372,7 @@ impl Storage {
         // Block is not cached yet; invalidate owning page detail if known so next read refetches.
         if !block.page_id.trim().is_empty() {
             tx.execute(
-                "UPDATE pages SET detail_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
+                "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
                 params![workspace_id, block.page_id],
             )?;
             tx.commit()?;
@@ -547,6 +657,49 @@ impl Storage {
     ) -> Result<Vec<NotionComment>> {
         let conn = self.reader();
         load_page_comments(&conn, workspace_id, page_id)
+    }
+
+    pub(crate) fn load_cached_comments(
+        &self,
+        workspace_id: &str,
+        page_id: &str,
+    ) -> Result<CachedComments> {
+        let conn = self.reader();
+        let row: Option<(i64, Option<String>)> = conn
+            .query_row(
+                "SELECT comments_fetched, comments_error FROM pages WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, page_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            None => Ok(CachedComments::NotFetched),
+            Some((_, Some(err))) => Ok(CachedComments::Failed(err)),
+            Some((1, None)) => Ok(CachedComments::Complete(load_page_comments(
+                &conn,
+                workspace_id,
+                page_id,
+            )?)),
+            Some((2, None)) => Ok(CachedComments::Partial(load_page_comments(
+                &conn,
+                workspace_id,
+                page_id,
+            )?)),
+            Some((_, None)) => Ok(CachedComments::NotFetched),
+        }
+    }
+
+    /// True when the cache holds only the first part of this page's comments.
+    pub(crate) fn comments_partial(&self, workspace_id: &str, page_id: &str) -> Result<bool> {
+        let conn = self.reader();
+        let fetched: Option<i64> = conn
+            .query_row(
+                "SELECT comments_fetched FROM pages WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, page_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(fetched == Some(2))
     }
 
     pub fn load_page_detail(
@@ -1121,7 +1274,7 @@ fn replace_nested_children(
     )?;
     // Page detail may have changed remotely in addition to this subtree.
     tx.execute(
-        "UPDATE pages SET detail_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
+        "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
         params![workspace_id, owner_id],
     )?;
     mark_children_fetched(tx, workspace_id, parent_id)?;
@@ -1817,5 +1970,259 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn save_page_body_leaves_comment_state_alone() {
+        let storage = Storage::open_in_memory().unwrap();
+        let make_block = |id: &str, page_id: &str, text: &str| NotionBlock {
+            id: id.into(),
+            page_id: page_id.into(),
+            block_type: "paragraph".into(),
+            kind: NotionBlockKind::Paragraph {
+                rich_text: vec![RichTextSpan::plain(text)],
+                color: NotionColor::Default,
+            },
+            ..Default::default()
+        };
+        let make_page = |id: &str, edited: &str| NotionPage {
+            id: id.into(),
+            workspace_id: "ws-1".into(),
+            parent_type: "workspace".into(),
+            title: id.into(),
+            last_edited_time: Some(edited.into()),
+            ..Default::default()
+        };
+        let make_comment = |id: &str, page_id: &str| NotionComment {
+            id: id.into(),
+            page_id: page_id.into(),
+            author: "Bot".into(),
+            body: id.into(),
+            created_time: "2026-01-01T00:00:00.000Z".into(),
+            ..Default::default()
+        };
+
+        // (a) Page previously saved via save_page_detail with 2 comments
+        storage
+            .save_page_detail(&NotionPageDetail {
+                page: make_page("p-cached", "2026-11-20T01:00:00.000Z"),
+                blocks: vec![make_block("b-old-a", "p-cached", "old a")],
+                comments: vec![
+                    make_comment("c-1", "p-cached"),
+                    make_comment("c-2", "p-cached"),
+                ],
+                comments_error: None,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // (b) Page previously saved with comments_error: Some("E")
+        storage
+            .save_page_detail(&NotionPageDetail {
+                page: make_page("p-failed", "2026-11-20T01:00:00.000Z"),
+                blocks: vec![make_block("b-old-b", "p-failed", "old b")],
+                comments: Vec::new(),
+                comments_error: Some("E".into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let t2 = "2026-11-20T02:00:00.000Z";
+        for (pid, bid, txt) in [
+            ("p-cached", "b-new-a", "new a"),
+            ("p-failed", "b-new-b", "new b"),
+            ("p-new", "b-new-c", "new c"),
+        ] {
+            let p = make_page(pid, t2);
+            let blks = vec![make_block(bid, pid, txt)];
+            storage.save_page_body(&p, &blks).unwrap();
+            assert_eq!(
+                storage
+                    .get_page_body_synced_edited_time("ws-1", pid)
+                    .unwrap()
+                    .as_deref(),
+                Some(t2)
+            );
+            let loaded = storage.load_cached_children("ws-1", pid).unwrap().unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].id, bid);
+        }
+
+        let s_cached = storage.cached_comments_summary("ws-1", "p-cached").unwrap();
+        assert_eq!(s_cached.state, "cached");
+        assert_eq!(s_cached.count, Some(2));
+        assert_eq!(s_cached.error, None);
+        assert_eq!(
+            storage
+                .get_page_detail_synced_edited_time("ws-1", "p-cached")
+                .unwrap()
+                .as_deref(),
+            Some("2026-11-20T01:00:00.000Z")
+        );
+
+        let s_failed = storage.cached_comments_summary("ws-1", "p-failed").unwrap();
+        assert_eq!(s_failed.state, "failed");
+        assert_eq!(s_failed.count, None);
+        assert_eq!(s_failed.error.as_deref(), Some("E"));
+
+        let s_new = storage.cached_comments_summary("ws-1", "p-new").unwrap();
+        assert_eq!(s_new.state, "not_fetched");
+        assert_eq!(s_new.count, None);
+        assert_eq!(s_new.error, None);
+    }
+
+    #[test]
+    fn migration_backfills_comments_fetched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_file = tmp.path().join("legacy_v19.db");
+        {
+            let conn = rusqlite::Connection::open(&db_file).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, icon TEXT, bot_id TEXT, bot_name TEXT, auth_mode TEXT NOT NULL DEFAULT 'integration', updated_at TEXT NOT NULL);
+                CREATE TABLE pages (
+                    id TEXT NOT NULL, workspace_id TEXT NOT NULL, parent_type TEXT NOT NULL DEFAULT 'workspace',
+                    parent_id TEXT, title TEXT NOT NULL, icon TEXT, cover_url TEXT, url TEXT NOT NULL DEFAULT '',
+                    archived INTEGER NOT NULL DEFAULT 0, is_favorite INTEGER NOT NULL DEFAULT 0,
+                    properties_json TEXT NOT NULL DEFAULT '{}', properties_summary TEXT NOT NULL DEFAULT '',
+                    plain_text TEXT NOT NULL DEFAULT '', created_time TEXT, last_edited_time TEXT,
+                    detail_synced_edited_time TEXT, comments_error TEXT, synced_at TEXT,
+                    PRIMARY KEY (workspace_id, id)
+                );
+                CREATE TABLE databases (
+                    id TEXT NOT NULL, workspace_id TEXT NOT NULL, parent_type TEXT NOT NULL DEFAULT 'workspace',
+                    parent_id TEXT, title TEXT NOT NULL, icon TEXT, description TEXT NOT NULL DEFAULT '',
+                    schema_json TEXT NOT NULL DEFAULT '{}', url TEXT NOT NULL DEFAULT '',
+                    archived INTEGER NOT NULL DEFAULT 0, is_favorite INTEGER NOT NULL DEFAULT 0,
+                    last_edited_time TEXT, synced_at TEXT, PRIMARY KEY (workspace_id, id)
+                );
+                CREATE TABLE blocks (
+                    id TEXT NOT NULL, page_id TEXT NOT NULL, parent_block_id TEXT, workspace_id TEXT NOT NULL,
+                    position INTEGER NOT NULL DEFAULT 0, block_type TEXT NOT NULL, content_json TEXT NOT NULL,
+                    plain_text TEXT NOT NULL DEFAULT '', has_children INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (workspace_id, id)
+                );
+                CREATE TABLE block_children_fetched (
+                    workspace_id TEXT NOT NULL, parent_id TEXT NOT NULL,
+                    PRIMARY KEY (workspace_id, parent_id)
+                ) WITHOUT ROWID;
+                CREATE TABLE comments (
+                    id TEXT NOT NULL, workspace_id TEXT NOT NULL, page_id TEXT NOT NULL,
+                    discussion_id TEXT NOT NULL DEFAULT '', author TEXT NOT NULL, body TEXT NOT NULL,
+                    rich_text_json TEXT NOT NULL DEFAULT '[]', created_time TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (workspace_id, id)
+                );
+                CREATE TABLE sync_cursors (scope_key TEXT PRIMARY KEY, cursor TEXT, last_synced_at TEXT NOT NULL);
+                CREATE TABLE block_owners (workspace_id TEXT NOT NULL, block_id TEXT NOT NULL, owner_page_id TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (workspace_id, block_id));
+                CREATE VIRTUAL TABLE pages_fts USING fts5(page_id UNINDEXED, workspace_id UNINDEXED, item_type UNINDEXED, title, plain_text, properties_summary, tokenize='unicode61');
+                INSERT INTO pages (id, workspace_id, title, detail_synced_edited_time) VALUES
+                    ('p-3', 'ws-1', 'Three', NULL),
+                    ('p-synced', 'ws-1', 'Synced Empty', '2026-11-20T01:00:00.000Z'),
+                    ('p-cold', 'ws-1', 'Cold', NULL),
+                    ('p-2000', 'ws-1', 'Two Thousand', '2026-11-20T01:00:00.000Z');
+                INSERT INTO comments (id, workspace_id, page_id, author, body, created_time) VALUES
+                    ('c-1', 'ws-1', 'p-3', 'Bot', '1', '2026-01-01T00:00:01Z'),
+                    ('c-2', 'ws-1', 'p-3', 'Bot', '2', '2026-01-01T00:00:02Z'),
+                    ('c-3', 'ws-1', 'p-3', 'Bot', '3', '2026-01-01T00:00:03Z');
+                PRAGMA user_version = 18;
+                ",
+            )
+            .unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO comments (id, workspace_id, page_id, author, body, created_time)
+                         VALUES (?1, 'ws-1', 'p-2000', 'Bot', 'x', '2026-01-01T00:00:00Z')",
+                    )
+                    .unwrap();
+                for i in 0..2000 {
+                    stmt.execute(params![format!("mc-{i}")]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+
+        let storage = Storage::open(&db_file).unwrap();
+        for pid in ["p-3", "p-synced", "p-cold", "p-2000"] {
+            assert_eq!(
+                storage.get_page_body_synced_edited_time("ws-1", pid).unwrap(),
+                None
+            );
+        }
+
+        match storage.load_cached_comments("ws-1", "p-3").unwrap() {
+            CachedComments::Complete(list) => assert_eq!(list.len(), 3),
+            other => panic!("expected Complete(3), got {:?}", std::mem::discriminant(&other)),
+        }
+        match storage.load_cached_comments("ws-1", "p-synced").unwrap() {
+            CachedComments::Complete(list) => assert_eq!(list.len(), 0),
+            other => panic!("expected Complete(0), got {:?}", std::mem::discriminant(&other)),
+        }
+        assert!(matches!(
+            storage.load_cached_comments("ws-1", "p-cold").unwrap(),
+            CachedComments::NotFetched
+        ));
+        match storage.load_cached_comments("ws-1", "p-2000").unwrap() {
+            CachedComments::Partial(list) => assert_eq!(list.len(), 2000),
+            other => panic!("expected Partial(2000), got {:?}", std::mem::discriminant(&other)),
+        }
+        assert_eq!(
+            storage
+                .get_page_detail_synced_edited_time("ws-1", "p-2000")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn comments_fetched_tracks_complete_and_partial_saves() {
+        let storage = Storage::open_in_memory().unwrap();
+        let make_comments = |n: usize| -> Vec<NotionComment> {
+            (0..n)
+                .map(|i| NotionComment {
+                    id: format!("c-{i}"),
+                    page_id: "p-1".into(),
+                    author: "Bot".into(),
+                    body: format!("body-{i}"),
+                    created_time: format!("2026-01-01T00:00:{:02}.{:03}Z", i % 60, i % 1000),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let page = NotionPage {
+            id: "p-1".into(),
+            workspace_id: "ws-1".into(),
+            title: "Many".into(),
+            last_edited_time: Some("2026-11-20T01:00:00.000Z".into()),
+            ..Default::default()
+        };
+
+        storage
+            .save_page_detail(&NotionPageDetail {
+                page: page.clone(),
+                comments: make_comments(2001),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(storage.comments_partial("ws-1", "p-1").unwrap());
+
+        storage
+            .save_page_detail(&NotionPageDetail {
+                page,
+                comments: make_comments(2000),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!storage.comments_partial("ws-1", "p-1").unwrap());
+
+        storage
+            .replace_page_comments("ws-1", "p-1", &make_comments(2100), true)
+            .unwrap();
+        assert!(!storage.comments_partial("ws-1", "p-1").unwrap());
+        match storage.load_cached_comments("ws-1", "p-1").unwrap() {
+            CachedComments::Complete(list) => assert_eq!(list.len(), 2100),
+            _ => panic!("expected Complete(2100)"),
+        }
     }
 }

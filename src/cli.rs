@@ -21,13 +21,13 @@ use crate::{
         normalize_notion_id, NotionBlock, NotionBlockKind, NotionComment, NotionDatabase,
         NotionPage, NotionPageDetail, NotionPropertyValue, NotionSearchHit,
     },
-    notion::{media, NotionClient, SearchFilterObject},
+    notion::{media, NotionClient, SearchFilterObject, SearchResponse, DETAIL_COMMENTS_LIMIT},
     parser::{
-        blocks_to_markdown, notion::rich_text_to_markdown, parse_notion_block, parse_parent, parse_rich_text_array,
-        parse_slash_command_blocks,
+        blocks_to_markdown, incomplete_block_ids, notion::rich_text_to_markdown,
+        parse_notion_block, parse_parent, parse_rich_text_array, parse_slash_command_blocks,
     },
     resolver, serve,
-    storage::Storage,
+    storage::{notion::CachedComments, Storage},
     sync, tui, updater,
 };
 
@@ -88,6 +88,9 @@ pub enum PagesCommand {
         offline: bool,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Continue from the next_cursor of a previous --json reply
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -102,7 +105,10 @@ pub enum PagesCommand {
         offline: bool,
         #[arg(long)]
         json: bool,
-        /// Return only the page ID, title, last edited time, and Markdown
+        /// Return every field: page properties, block tree, comments and media
+        #[arg(long, requires = "json", conflicts_with = "compact")]
+        full: bool,
+        /// Compatibility alias: compact output is already the --json default
         #[arg(long, requires = "json")]
         compact: bool,
     },
@@ -171,6 +177,12 @@ pub enum BlocksCommand {
         block_id: String,
         #[arg(long)]
         offline: bool,
+        /// Maximum items to return [default: 50 with --json, all otherwise]
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Continue from the next_cursor of a previous --json reply
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -216,6 +228,12 @@ pub enum DbCommand {
         refresh: bool,
         #[arg(long)]
         offline: bool,
+        /// Maximum items to return [default: 50 with --json, all otherwise]
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Continue from the next_cursor of a previous --json reply
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -236,6 +254,9 @@ pub enum DbCommand {
         sorts: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Continue from the next_cursor of a previous --json reply
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         offline: bool,
         #[arg(long)]
@@ -278,6 +299,12 @@ pub enum CommentsCommand {
         page: String,
         #[arg(long)]
         offline: bool,
+        /// Maximum items to return [default: 50 with --json, all otherwise]
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Continue from the next_cursor of a previous --json reply
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -399,7 +426,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Synchronize workspace pages & databases into local SQLite WAL + FTS5 cache
+    /// Synchronize workspace pages & databases into local SQLite WAL + FTS5 cache. Streams every accessible object into the cache on the first run; later runs stop at the last synced edit time.
     Sync {
         /// Force a full rescan instead of incremental `last_edited_time` sync
         #[arg(long)]
@@ -972,7 +999,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             let (_auth, client, storage) = open_runtime(&config, workspace_override).await?;
             let show_progress = !as_json && io::stderr().is_terminal();
             let started = std::time::Instant::now();
-            let (ws_id, pages, databases) =
+            let (ws_id, pages, databases, outcome) =
                 sync::sync_workspace_tree_with_options(&client, &storage, full, |batch, p, d| {
                     if show_progress {
                         eprint!("\rSyncing workspace... batch {batch} ({p} pages, {d} databases)");
@@ -993,6 +1020,8 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     "pages_count": pages.len(),
                     "databases_count": databases.len(),
                     "incremental": !full,
+                    "fetched_count": outcome.fetched,
+                    "complete": true,
                 }))?;
             } else {
                 println!(
@@ -1195,17 +1224,27 @@ async fn handle_pages_cmd(
             refresh,
             offline,
             limit,
+            cursor,
             json: as_json,
         } => {
-            let mut pages = op_list_pages(client, storage, archived, refresh, offline).await?;
-            pages.truncate(limit);
+            let list = op_list_pages(
+                client,
+                storage,
+                archived,
+                refresh,
+                offline,
+                limit,
+                cursor.as_deref(),
+            )
+            .await?;
             if as_json {
-                print_json(&json!({ "ok": true, "count": pages.len(), "pages": pages }))?;
+                print_json(&list_envelope("pages", &list))?;
             } else {
-                for p in pages {
+                for p in &list.items {
                     let fav = if p.is_favorite { "★ " } else { "" };
                     println!("{fav}{} {} ({})", p.display_icon(), p.display_title(), p.id);
                 }
+                warn_more_results(&list);
             }
             Ok(())
         }
@@ -1215,14 +1254,23 @@ async fn handle_pages_cmd(
             refresh,
             offline,
             json: as_json,
+            full,
             compact,
         } => {
-            let detail = op_get_page_with_options(client, storage, &page, refresh, offline).await?;
-            if compact {
-                print_json(&detail.compact())?;
+            let _ = compact;
+            if as_json && !full {
+                let val = op_get_page_compact(client, storage, &page, refresh, offline, |id| {
+                    format!("notion pages get {id} --json --full")
+                })
+                .await?;
+                print_json(&val)?;
             } else if as_json {
-                print_json(&detail)?;
+                let (detail, comments_has_more) =
+                    op_get_page_for_output(client, storage, &page, refresh, offline).await?;
+                print_json(&detail.full_json(comments_has_more))?;
             } else {
+                let detail =
+                    op_get_page_with_options(client, storage, &page, refresh, offline).await?;
                 if let Some(error) = &detail.comments_error {
                     eprintln!("Could not load comments: {error}");
                 }
@@ -1234,6 +1282,7 @@ async fn handle_pages_cmd(
                         println!("{}", detail.markdown);
                     }
                 }
+                warn_incomplete_blocks(&detail.blocks);
             }
             Ok(())
         }
@@ -1359,11 +1408,15 @@ async fn handle_pages_cmd(
                     "title": detail.page.title,
                     "path": out.map(|p| p.to_string_lossy().into_owned()),
                     "markdown": full_md,
+                    "incomplete_blocks": incomplete_block_ids(&detail.blocks),
                 }))?;
-            } else if let Some(path) = out {
-                println!("Exported '{}' -> {}", detail.page.title, path.display());
             } else {
-                print!("{full_md}");
+                if let Some(path) = out {
+                    println!("Exported '{}' -> {}", detail.page.title, path.display());
+                } else {
+                    print!("{full_md}");
+                }
+                warn_incomplete_blocks(&detail.blocks);
             }
             Ok(())
         }
@@ -1393,13 +1446,33 @@ async fn handle_blocks_cmd(
         BlocksCommand::List {
             block_id,
             offline,
+            limit,
+            cursor,
             json: as_json,
         } => {
-            let blocks = op_list_blocks(client, storage, &block_id, offline).await?;
+            let effective_limit = limit.unwrap_or(if as_json { 50 } else { usize::MAX });
+            let list = op_list_blocks(
+                client,
+                storage,
+                &block_id,
+                offline,
+                effective_limit,
+                cursor.as_deref(),
+            )
+            .await?;
             if as_json {
-                print_json(&json!({ "ok": true, "count": blocks.len(), "blocks": blocks }))?;
+                let mut val = list_envelope("blocks", &list);
+                if let Some(map) = val.as_object_mut() {
+                    map.insert(
+                        "incomplete_blocks".into(),
+                        json!(incomplete_block_ids(&list.items)),
+                    );
+                }
+                print_json(&val)?;
             } else {
-                println!("{}", blocks_to_markdown(&blocks));
+                println!("{}", blocks_to_markdown(&list.items));
+                warn_incomplete_blocks(&list.items);
+                warn_more_results(&list);
             }
             Ok(())
         }
@@ -1475,15 +1548,27 @@ async fn handle_db_cmd(
         DbCommand::List {
             refresh,
             offline,
+            limit,
+            cursor,
             json: as_json,
         } => {
-            let dbs = op_list_databases(client, storage, refresh, offline).await?;
+            let effective_limit = limit.unwrap_or(if as_json { 50 } else { usize::MAX });
+            let list = op_list_databases(
+                client,
+                storage,
+                refresh,
+                offline,
+                effective_limit,
+                cursor.as_deref(),
+            )
+            .await?;
             if as_json {
-                print_json(&json!({ "ok": true, "count": dbs.len(), "databases": dbs }))?;
+                print_json(&list_envelope("databases", &list))?;
             } else {
-                for db in dbs {
+                for db in &list.items {
                     println!("{} {} ({})", db.display_icon(), db.display_title(), db.id);
                 }
+                warn_more_results(&list);
             }
             Ok(())
         }
@@ -1508,6 +1593,7 @@ async fn handle_db_cmd(
             filter,
             sorts,
             limit,
+            cursor,
             offline,
             json: as_json,
         } => {
@@ -1521,20 +1607,21 @@ async fn handle_db_cmd(
                 .map(serde_json::from_str::<Value>)
                 .transpose()
                 .context("Invalid --sorts JSON")?;
-            let rows = op_query_database(
+            let list = op_query_database(
                 client,
                 storage,
                 &database,
                 filter_val,
                 sorts_val,
                 limit,
+                cursor.as_deref(),
                 offline,
             )
             .await?;
             if as_json {
-                print_json(&json!({ "ok": true, "count": rows.len(), "rows": rows }))?;
+                print_json(&list_envelope("rows", &list))?;
             } else {
-                for row in rows {
+                for row in &list.items {
                     println!(
                         "{} {}  [{}]",
                         row.display_icon(),
@@ -1542,6 +1629,7 @@ async fn handle_db_cmd(
                         row.properties_summary()
                     );
                 }
+                warn_more_results(&list);
             }
             Ok(())
         }
@@ -1615,17 +1703,30 @@ async fn handle_comments_cmd(
         CommentsCommand::List {
             page,
             offline,
+            limit,
+            cursor,
             json: as_json,
         } => {
-            let comments = op_list_comments(client, storage, &page, offline).await?;
+            let effective_limit = limit.unwrap_or(if as_json { 50 } else { usize::MAX });
+            let list = op_list_comments(
+                client,
+                storage,
+                &page,
+                offline,
+                effective_limit,
+                cursor.as_deref(),
+            )
+            .await?;
             if as_json {
-                print_json(&json!({ "ok": true, "count": comments.len(), "comments": comments }))?;
-            } else if comments.is_empty() {
+                print_json(&list_envelope("comments", &list))?;
+            } else if list.items.is_empty() {
                 println!("No comments on page.");
+                warn_more_results(&list);
             } else {
-                for c in comments {
+                for c in &list.items {
                     println!("[{}] {}: {}", c.created_time, c.author, c.body);
                 }
+                warn_more_results(&list);
             }
             Ok(())
         }
@@ -1761,6 +1862,118 @@ async fn handle_doctor_cmd(
 // Shared Domain Operations (used by CLI, HTTP API `serve.rs`, and MCP `mcp.rs`)
 // ============================================================================
 
+pub struct ListPage<T> {
+    pub items: Vec<T>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    /// Set only when the list cannot be continued with next_cursor (partial offline comment cache).
+    pub hint: Option<String>,
+}
+
+/// Envelope shared by CLI JSON and MCP: ok, count, returned, <key>, has_more, next_cursor, and hint when set.
+pub fn list_envelope<T: serde::Serialize>(key: &str, page: &ListPage<T>) -> Value {
+    let n = page.items.len();
+    let mut map = serde_json::Map::new();
+    map.insert("ok".into(), json!(true));
+    map.insert("count".into(), json!(n));
+    map.insert("returned".into(), json!(n));
+    map.insert(
+        key.into(),
+        serde_json::to_value(&page.items).unwrap_or_else(|_| Value::Array(Vec::new())),
+    );
+    map.insert("has_more".into(), json!(page.has_more));
+    map.insert(
+        "next_cursor".into(),
+        match &page.next_cursor {
+            Some(c) => Value::String(c.clone()),
+            None => Value::Null,
+        },
+    );
+    if let Some(hint) = &page.hint {
+        map.insert("hint".into(), Value::String(hint.clone()));
+    }
+    Value::Object(map)
+}
+
+fn require_limit(limit: usize) -> Result<()> {
+    if limit == 0 {
+        bail!("Invalid limit 0: must be at least 1");
+    }
+    Ok(())
+}
+
+fn parse_offset_cursor(cursor: Option<&str>) -> Result<usize> {
+    match cursor {
+        None => Ok(0),
+        Some(raw) => {
+            if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+                bail!("Invalid cursor '{raw}': expected the integer offset returned as next_cursor");
+            }
+            let parsed: u64 = raw.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid cursor '{raw}': expected the integer offset returned as next_cursor"
+                )
+            })?;
+            Ok(usize::try_from(parsed).unwrap_or(usize::MAX))
+        }
+    }
+}
+
+/// Slices a fully loaded cache list by integer-offset cursor.
+fn offset_page<T>(all: Vec<T>, limit: usize, cursor: Option<&str>) -> Result<ListPage<T>> {
+    require_limit(limit)?;
+    let offset = parse_offset_cursor(cursor)?;
+    let total = all.len();
+    if offset >= total {
+        return Ok(ListPage {
+            items: Vec::new(),
+            has_more: false,
+            next_cursor: None,
+            hint: None,
+        });
+    }
+    let end = offset.saturating_add(limit).min(total);
+    let items: Vec<T> = all.into_iter().skip(offset).take(end - offset).collect();
+    let has_more = end < total;
+    let next_cursor = has_more.then(|| end.to_string());
+    Ok(ListPage {
+        items,
+        has_more,
+        next_cursor,
+        hint: None,
+    })
+}
+
+fn search_hits_from_response(resp: SearchResponse, limit: usize) -> Vec<NotionSearchHit> {
+    let mut hits = Vec::new();
+    for p in resp.pages {
+        hits.push(NotionSearchHit {
+            id: p.id.clone(),
+            workspace_id: p.workspace_id.clone(),
+            item_type: "page".into(),
+            title: p.title.clone(),
+            icon: p.icon.clone(),
+            snippet: p.properties_summary(),
+            url: p.url.clone(),
+            last_edited_time: p.last_edited_time.clone(),
+        });
+    }
+    for d in resp.databases {
+        hits.push(NotionSearchHit {
+            id: d.id.clone(),
+            workspace_id: d.workspace_id.clone(),
+            item_type: "database".into(),
+            title: d.title.clone(),
+            icon: d.icon.clone(),
+            snippet: d.description.clone(),
+            url: d.url.clone(),
+            last_edited_time: d.last_edited_time.clone(),
+        });
+    }
+    hits.truncate(limit);
+    hits
+}
+
 pub async fn op_whoami(
     config: &AppConfig,
     auth: &AuthManager,
@@ -1810,33 +2023,7 @@ pub async fn op_search(
             .await?;
         let _ = storage.upsert_pages(&resp.pages);
         let _ = storage.upsert_databases(&resp.databases);
-        let mut hits = Vec::new();
-        for p in resp.pages {
-            hits.push(NotionSearchHit {
-                id: p.id.clone(),
-                workspace_id: p.workspace_id.clone(),
-                item_type: "page".into(),
-                title: p.title.clone(),
-                icon: p.icon.clone(),
-                snippet: p.properties_summary(),
-                url: p.url.clone(),
-                last_edited_time: p.last_edited_time.clone(),
-            });
-        }
-        for d in resp.databases {
-            hits.push(NotionSearchHit {
-                id: d.id.clone(),
-                workspace_id: d.workspace_id.clone(),
-                item_type: "database".into(),
-                title: d.title.clone(),
-                icon: d.icon.clone(),
-                snippet: d.description.clone(),
-                url: d.url.clone(),
-                last_edited_time: d.last_edited_time.clone(),
-            });
-        }
-        hits.truncate(limit);
-        return Ok(hits);
+        return Ok(search_hits_from_response(resp, limit));
     }
 
     let local = storage.search_local(&ws_id, query, limit)?;
@@ -1853,21 +2040,7 @@ pub async fn op_search(
     if !refreshed.is_empty() {
         return Ok(refreshed);
     }
-    Ok(resp
-        .pages
-        .into_iter()
-        .map(|p| NotionSearchHit {
-            id: p.id,
-            workspace_id: p.workspace_id,
-            item_type: "page".into(),
-            title: p.title,
-            icon: p.icon,
-            snippet: p.plain_text,
-            url: p.url,
-            last_edited_time: p.last_edited_time,
-        })
-        .take(limit)
-        .collect())
+    Ok(search_hits_from_response(resp, limit))
 }
 
 pub async fn op_list_pages(
@@ -1876,20 +2049,27 @@ pub async fn op_list_pages(
     include_archived: bool,
     refresh: bool,
     offline: bool,
-) -> Result<Vec<NotionPage>> {
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<ListPage<NotionPage>> {
+    require_limit(limit)?;
+    let _ = parse_offset_cursor(cursor)?;
     let ws_id = client.auth().active_workspace_id().await;
-    if !offline {
+    let all = if !offline {
         let cached = storage.list_pages(&ws_id, include_archived)?;
         if refresh || cached.is_empty() {
             let (_, pages, _) = sync::sync_workspace_tree(client, storage).await?;
-            return Ok(pages
+            pages
                 .into_iter()
                 .filter(|p| include_archived || !p.archived)
-                .collect());
+                .collect()
+        } else {
+            cached
         }
-        return Ok(cached);
-    }
-    storage.list_pages(&ws_id, include_archived)
+    } else {
+        storage.list_pages(&ws_id, include_archived)?
+    };
+    offset_page(all, limit, cursor)
 }
 
 pub async fn op_get_page(
@@ -1911,15 +2091,81 @@ pub async fn op_get_page_with_options(
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id(storage, (!offline).then_some(client), &ws_id, page).await?;
     if offline {
-        return storage
+        let mut detail = storage
             .load_page_detail(&ws_id, &id)?
-            .ok_or_else(|| anyhow::anyhow!("Page '{page}' not found in local cache"));
+            .ok_or_else(|| anyhow::anyhow!("Page '{page}' not found in local cache"))?;
+        if storage.load_cached_children(&ws_id, &id)?.is_none() {
+            bail!(
+                "Page '{page}' body not found in offline cache (not fetched); read it online once"
+            );
+        }
+        if detail.comments_error.is_none()
+            && matches!(
+                storage.load_cached_comments(&ws_id, &id)?,
+                CachedComments::NotFetched
+            )
+        {
+            detail.comments_error = Some("Comments not fetched into the offline cache".into());
+        }
+        return Ok(detail);
     }
     if refresh {
         sync::sync_page_detail_force(client, storage, &id).await
     } else {
         sync::sync_page_detail(client, storage, &id).await
     }
+}
+
+/// Compact page JSON. Fetches metadata + blocks only; comment facts come from cache markers.
+pub async fn op_get_page_compact(
+    client: &NotionClient,
+    storage: &Storage,
+    page: &str,
+    refresh: bool,
+    offline: bool,
+    hint_for: impl Fn(&str) -> String,
+) -> Result<Value> {
+    let ws_id = client.auth().active_workspace_id().await;
+    let id = resolver::resolve_page_id(storage, (!offline).then_some(client), &ws_id, page).await?;
+    let detail = if offline {
+        let detail = storage
+            .load_page_detail(&ws_id, &id)?
+            .ok_or_else(|| anyhow::anyhow!("Page '{page}' not found in local cache"))?;
+        if storage.load_cached_children(&ws_id, &id)?.is_none() {
+            bail!(
+                "Page '{page}' body not found in offline cache (not fetched); read it online once"
+            );
+        }
+        detail
+    } else {
+        sync::sync_page_body(client, storage, &id, refresh).await?
+    };
+    let summary = storage.cached_comments_summary(&ws_id, &detail.page.id)?;
+    Ok(detail.compact(
+        hint_for(&detail.page.id),
+        summary.state,
+        summary.count,
+        summary.error.as_deref(),
+    ))
+}
+
+/// Full page detail plus whether more comments exist than the detail carries.
+pub async fn op_get_page_for_output(
+    client: &NotionClient,
+    storage: &Storage,
+    page: &str,
+    refresh: bool,
+    offline: bool,
+) -> Result<(NotionPageDetail, bool)> {
+    let ws_id = client.auth().active_workspace_id().await;
+    let detail = op_get_page_with_options(client, storage, page, refresh, offline).await?;
+    let comments_has_more = if detail.comments_error.is_some() {
+        false
+    } else {
+        detail.comments.len() > DETAIL_COMMENTS_LIMIT
+            || storage.comments_partial(&ws_id, &detail.page.id)?
+    };
+    Ok((detail, comments_has_more))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2061,18 +2307,29 @@ pub async fn op_list_blocks(
     storage: &Storage,
     block_or_page: &str,
     offline: bool,
-) -> Result<Vec<NotionBlock>> {
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<ListPage<NotionBlock>> {
+    require_limit(limit)?;
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id(storage, (!offline).then_some(client), &ws_id, block_or_page)
         .await?;
     if offline {
-        return storage.load_cached_children(&ws_id, &id)?.ok_or_else(|| {
+        let cached = storage.load_cached_children(&ws_id, &id)?.ok_or_else(|| {
             anyhow::anyhow!("Children of '{block_or_page}' not found in offline cache (not fetched)")
-        });
+        })?;
+        return offset_page(cached, limit, cursor);
     }
-    let blocks = client.fetch_block_tree(&id, None).await?;
-    let _ = storage.replace_page_blocks(&ws_id, &id, &blocks);
-    Ok(blocks)
+    let (blocks, has_more, next_cursor) = client.fetch_block_tree_page(&id, limit, cursor).await?;
+    if cursor.is_none() && !has_more {
+        let _ = storage.replace_page_blocks(&ws_id, &id, &blocks);
+    }
+    Ok(ListPage {
+        items: blocks,
+        has_more,
+        next_cursor,
+        hint: None,
+    })
 }
 
 pub async fn op_append_blocks(
@@ -2278,17 +2535,24 @@ pub async fn op_list_databases(
     storage: &Storage,
     refresh: bool,
     offline: bool,
-) -> Result<Vec<NotionDatabase>> {
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<ListPage<NotionDatabase>> {
+    require_limit(limit)?;
+    let _ = parse_offset_cursor(cursor)?;
     let ws_id = client.auth().active_workspace_id().await;
-    if !offline {
+    let all = if !offline {
         let cached = storage.list_databases(&ws_id)?;
         if refresh || cached.is_empty() {
             let (_, _, dbs) = sync::sync_workspace_tree(client, storage).await?;
-            return Ok(dbs);
+            dbs
+        } else {
+            cached
         }
-        return Ok(cached);
-    }
-    storage.list_databases(&ws_id)
+    } else {
+        storage.list_databases(&ws_id)?
+    };
+    offset_page(all, limit, cursor)
 }
 
 pub async fn op_get_database(
@@ -2319,6 +2583,7 @@ pub async fn op_get_database(
     Ok(db)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn op_query_database(
     client: &NotionClient,
     storage: &Storage,
@@ -2326,27 +2591,38 @@ pub async fn op_query_database(
     filter: Option<Value>,
     sorts: Option<Value>,
     limit: usize,
+    cursor: Option<&str>,
     offline: bool,
-) -> Result<Vec<NotionPage>> {
+) -> Result<ListPage<NotionPage>> {
+    require_limit(limit)?;
+    if offline && (filter.is_some() || sorts.is_some()) {
+        bail!(
+            "Invalid offline query: --filter/--sorts cannot be evaluated against the local cache; rerun without --offline, or drop them to list cached rows"
+        );
+    }
     let ws_id = client.auth().active_workspace_id().await;
     let id =
         resolver::resolve_database_id(storage, (!offline).then_some(client), &ws_id, database)
             .await?;
     if offline {
-        let mut rows = storage.list_database_rows(&ws_id, &id)?;
-        rows.truncate(limit);
-        return Ok(rows);
+        let rows = storage.list_database_rows(&ws_id, &id)?;
+        return offset_page(rows, limit, cursor);
     }
     let unfiltered = filter.is_none();
-    let (rows, has_more) = client
-        .query_database_all_with_meta(&id, filter, sorts, limit)
+    let (rows, has_more, next_cursor) = client
+        .query_database_all_with_meta(&id, filter, sorts, limit, cursor)
         .await?;
     let _ = storage.upsert_pages(&rows);
-    if unfiltered && !has_more {
+    if unfiltered && cursor.is_none() && !has_more {
         let active_row_ids: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
         let _ = storage.reconcile_database_rows_archived(&ws_id, &id, &active_row_ids);
     }
-    Ok(rows)
+    Ok(ListPage {
+        items: rows,
+        has_more,
+        next_cursor,
+        hint: None,
+    })
 }
 
 fn property_map(extra: Option<Value>) -> Result<serde_json::Map<String, Value>> {
@@ -2507,15 +2783,44 @@ pub async fn op_list_comments(
     storage: &Storage,
     page: &str,
     offline: bool,
-) -> Result<Vec<NotionComment>> {
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<ListPage<NotionComment>> {
+    require_limit(limit)?;
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id(storage, (!offline).then_some(client), &ws_id, page).await?;
     if offline {
-        return storage.load_page_comments(&ws_id, &id);
+        return match storage.load_cached_comments(&ws_id, &id)? {
+            CachedComments::NotFetched => {
+                bail!("Comments of '{page}' not found in offline cache (not fetched)")
+            }
+            CachedComments::Failed(err) => {
+                bail!("Comments of '{page}' not found in offline cache (last fetch failed: {err})")
+            }
+            CachedComments::Complete(list) => offset_page(list, limit, cursor),
+            CachedComments::Partial(list) => {
+                let mut page_out = offset_page(list, limit, cursor)?;
+                if !page_out.has_more {
+                    page_out.has_more = true;
+                    page_out.next_cursor = None;
+                    page_out.hint = Some(format!(
+                        "Only part of the comments is cached; read the rest online: notion comments list {id} --json --limit 100"
+                    ));
+                }
+                Ok(page_out)
+            }
+        };
     }
-    let comments = client.list_comments(&id).await?;
-    let _ = storage.replace_page_comments(&ws_id, &id, &comments);
-    Ok(comments)
+    let (comments, has_more, next_cursor) = client.list_comments_page(&id, limit, cursor).await?;
+    if cursor.is_none() && !has_more {
+        let _ = storage.replace_page_comments(&ws_id, &id, &comments, true);
+    }
+    Ok(ListPage {
+        items: comments,
+        has_more,
+        next_cursor,
+        hint: None,
+    })
 }
 
 pub async fn op_add_comment(
@@ -2529,7 +2834,8 @@ pub async fn op_add_comment(
     let id = resolver::resolve_page_id(storage, Some(client), &ws_id, page).await?;
     let comment = client.add_comment(Some(&id), discussion_id, text).await?;
     if let Ok(all) = client.list_comments(&id).await {
-        let _ = storage.replace_page_comments(&ws_id, &id, &all);
+        let _ =
+            storage.replace_page_comments(&ws_id, &id, &all, all.len() <= DETAIL_COMMENTS_LIMIT);
     }
     Ok(comment)
 }
@@ -2558,10 +2864,73 @@ fn print_json<T: serde::Serialize>(val: &T) -> Result<()> {
     Ok(())
 }
 
+fn warn_incomplete_blocks(blocks: &[NotionBlock]) {
+    let ids = incomplete_block_ids(blocks);
+    if !ids.is_empty() {
+        eprintln!(
+            "Warning: {} block(s) have children that were not loaded: {}. Read them with: notion blocks list <block-id>",
+            ids.len(),
+            ids.join(", ")
+        );
+    }
+}
+
+fn warn_more_results<T>(page: &ListPage<T>) {
+    if page.has_more {
+        if let Some(next) = &page.next_cursor {
+            eprintln!("More results available: rerun with --json --cursor {next}");
+        } else if let Some(hint) = &page.hint {
+            eprintln!("{hint}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+
+    #[test]
+    fn offset_page_boundaries() {
+        let items = vec![10, 20, 30, 40, 50];
+
+        let p1 = offset_page(items.clone(), 2, Some("2")).unwrap();
+        assert_eq!(p1.items, vec![30, 40]);
+        assert!(p1.has_more);
+        assert_eq!(p1.next_cursor.as_deref(), Some("4"));
+
+        let p2 = offset_page(items.clone(), 2, Some("4")).unwrap();
+        assert_eq!(p2.items, vec![50]);
+        assert!(!p2.has_more);
+        assert_eq!(p2.next_cursor, None);
+
+        let p3 = offset_page(items.clone(), 2, Some("5")).unwrap();
+        assert!(p3.items.is_empty());
+        assert!(!p3.has_more);
+        assert_eq!(p3.next_cursor, None);
+
+        let p4 = offset_page(items.clone(), 2, Some("9")).unwrap();
+        assert!(p4.items.is_empty());
+        assert!(!p4.has_more);
+        assert_eq!(p4.next_cursor, None);
+
+        let bad_cursor = offset_page(items.clone(), 2, Some("x"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(bad_cursor.contains("Invalid cursor 'x'"));
+
+        let bad_limit = offset_page(items.clone(), 0, None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(bad_limit.contains("Invalid limit 0"));
+
+        let all = offset_page(items.clone(), usize::MAX, None).unwrap();
+        assert_eq!(all.items, items);
+        assert!(!all.has_more);
+        assert_eq!(all.next_cursor, None);
+    }
 
     const KO_ITEM: &str = "- 목록 항목";
     const TWO_LINES: &str = "- first\n- second";

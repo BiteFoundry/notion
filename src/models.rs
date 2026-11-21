@@ -644,13 +644,82 @@ pub struct NotionPageDetail {
 }
 
 impl NotionPageDetail {
-    pub(crate) fn compact(&self) -> Value {
-        serde_json::json!({
-            "id": self.page.id,
-            "title": self.page.title,
-            "last_edited_time": self.page.last_edited_time,
-            "markdown": self.markdown,
-        })
+    /// Compact detail: identifiers, Markdown body, what was left out, and how to get it.
+    pub(crate) fn compact(
+        &self,
+        hint: String,
+        comments_state: &str,
+        comments_count: Option<usize>,
+        comments_error: Option<&str>,
+    ) -> Value {
+        let fields: Vec<String> = serde_json::to_value(&self.page)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .map(|map| {
+                map.keys()
+                    .filter(|k| !matches!(k.as_str(), "id" | "title" | "last_edited_time"))
+                    .map(|k| format!("page.{k}"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut out = serde_json::Map::new();
+        out.insert("id".into(), serde_json::json!(self.page.id));
+        out.insert("title".into(), serde_json::json!(self.page.title));
+        out.insert(
+            "last_edited_time".into(),
+            serde_json::json!(self.page.last_edited_time),
+        );
+        out.insert("markdown".into(), serde_json::json!(self.markdown));
+        out.insert(
+            "incomplete_blocks".into(),
+            serde_json::json!(crate::parser::incomplete_block_ids(&self.blocks)),
+        );
+        out.insert("comments_state".into(), serde_json::json!(comments_state));
+        if let Some(err) = comments_error {
+            out.insert("comments_error".into(), serde_json::json!(err));
+        }
+        out.insert(
+            "omitted".into(),
+            serde_json::json!({
+                "blocks": self.blocks.len(),
+                "comments": comments_count,
+                "media": self.media.len(),
+                "fields": fields,
+            }),
+        );
+        out.insert("hint".into(), serde_json::json!(hint));
+        Value::Object(out)
+    }
+
+    /// Full detail plus the computed `incomplete_blocks` and the `comments_has_more` keys.
+    /// Serializes at most `DETAIL_COMMENTS_LIMIT` (2,000) comments without cloning so any
+    /// 2,001st lookahead entry remains internal/cached.
+    pub(crate) fn full_json(&self, comments_has_more: bool) -> Value {
+        #[derive(Serialize)]
+        struct FullPageDetailView<'a> {
+            page: &'a NotionPage,
+            blocks: &'a [NotionBlock],
+            comments: &'a [NotionComment],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            comments_error: &'a Option<String>,
+            markdown: &'a str,
+            media: &'a [NotionMediaRef],
+            incomplete_blocks: Vec<String>,
+            comments_has_more: bool,
+        }
+
+        let visible_len = self.comments.len().min(crate::notion::DETAIL_COMMENTS_LIMIT);
+        let view = FullPageDetailView {
+            page: &self.page,
+            blocks: &self.blocks,
+            comments: &self.comments[..visible_len],
+            comments_error: &self.comments_error,
+            markdown: &self.markdown,
+            media: &self.media,
+            incomplete_blocks: crate::parser::incomplete_block_ids(&self.blocks),
+            comments_has_more,
+        };
+        serde_json::to_value(view).unwrap_or_else(|_| serde_json::json!({}))
     }
 }
 
@@ -864,5 +933,114 @@ mod tests {
             NotionColor::Yellow
         );
         assert_eq!(NotionColor::from_notion_str(None), NotionColor::Default);
+    }
+
+    #[test]
+    fn compact_lists_omissions_and_hint() {
+        let block = |id: &str| NotionBlock {
+            id: id.into(),
+            block_type: "paragraph".into(),
+            ..Default::default()
+        };
+        let comment = |id: &str| NotionComment {
+            id: id.into(),
+            page_id: "p1".into(),
+            body: "ignored".into(),
+            ..Default::default()
+        };
+        let detail = NotionPageDetail {
+            page: NotionPage {
+                id: "p1".into(),
+                title: "Spec".into(),
+                last_edited_time: Some("2026-11-01T00:00:00.000Z".into()),
+                ..Default::default()
+            },
+            blocks: vec![block("b1"), block("b2")],
+            comments: vec![comment("c1"), comment("c2"), comment("c3")],
+            comments_error: Some("ignored".into()),
+            markdown: "hello".into(),
+            media: Vec::new(),
+        };
+
+        let cached = detail.compact("H".into(), "cached", Some(1), None);
+        assert_eq!(cached["omitted"]["blocks"], 2);
+        assert_eq!(cached["omitted"]["comments"], 1);
+        assert_eq!(cached["omitted"]["media"], 0);
+        assert_eq!(cached["comments_state"], "cached");
+        assert!(cached.get("comments_error").is_none());
+        let fields: Vec<&str> = cached["omitted"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(fields.contains(&"page.properties"));
+        assert!(!fields.contains(&"page.id"));
+        assert_eq!(cached["hint"], "H");
+
+        let failed = detail.compact("H".into(), "failed", None, Some("E"));
+        assert!(failed["omitted"]["comments"].is_null());
+        assert_eq!(failed["comments_state"], "failed");
+        assert_eq!(failed["comments_error"], "E");
+
+        let not_fetched = detail.compact("H".into(), "not_fetched", None, None);
+        assert!(not_fetched["omitted"]["comments"].is_null());
+        assert_eq!(not_fetched["comments_state"], "not_fetched");
+        assert!(not_fetched.get("comments_error").is_none());
+        assert!(not_fetched.get("comments_has_more").is_none());
+    }
+
+    #[test]
+    fn full_json_caps_serialized_comments_at_detail_limit_without_mutating_detail() {
+        let make_comments = |n: usize| -> Vec<NotionComment> {
+            (0..n)
+                .map(|i| NotionComment {
+                    id: format!("c-{i}"),
+                    page_id: "p1".into(),
+                    body: format!("body-{i}"),
+                    ..Default::default()
+                })
+                .collect()
+        };
+
+        let exact_detail = NotionPageDetail {
+            page: NotionPage {
+                id: "p1".into(),
+                title: "Exact 2000".into(),
+                ..Default::default()
+            },
+            comments: make_comments(crate::notion::DETAIL_COMMENTS_LIMIT),
+            ..Default::default()
+        };
+        let exact_json = exact_detail.full_json(false);
+        assert_eq!(
+            exact_json["comments"].as_array().unwrap().len(),
+            crate::notion::DETAIL_COMMENTS_LIMIT
+        );
+        assert_eq!(exact_json["comments_has_more"], false);
+        assert_eq!(exact_json["incomplete_blocks"], serde_json::json!([]));
+        assert!(exact_json.get("comments_error").is_none());
+
+        let partial_detail = NotionPageDetail {
+            page: NotionPage {
+                id: "p2".into(),
+                title: "Partial 2001".into(),
+                ..Default::default()
+            },
+            comments: make_comments(crate::notion::DETAIL_COMMENTS_LIMIT + 1),
+            ..Default::default()
+        };
+        let partial_json = partial_detail.full_json(true);
+        let serialized = partial_json["comments"].as_array().unwrap();
+        assert_eq!(serialized.len(), crate::notion::DETAIL_COMMENTS_LIMIT);
+        assert_eq!(serialized.first().unwrap()["id"], "c-0");
+        assert_eq!(serialized.last().unwrap()["id"], "c-1999");
+        assert_eq!(partial_json["comments_has_more"], true);
+        // The 2,001st lookahead entry remains intact on the in-memory detail.
+        assert_eq!(
+            partial_detail.comments.len(),
+            crate::notion::DETAIL_COMMENTS_LIMIT + 1
+        );
+        assert_eq!(partial_detail.comments[2000].id, "c-2000");
     }
 }

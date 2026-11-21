@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 18;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 19;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 20;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 21;
 
 /// Initializes SQLite WAL PRAGMAs, Notion workspace-scoped tables, indexes, and `pages_fts`.
 /// Returns `true` if `pages_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -85,7 +85,9 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             created_time TEXT,
             last_edited_time TEXT,
             detail_synced_edited_time TEXT,
+            body_synced_edited_time TEXT,
             comments_error TEXT,
+            comments_fetched INTEGER NOT NULL DEFAULT 0,
             synced_at TEXT,
             PRIMARY KEY (workspace_id, id)
         );
@@ -171,6 +173,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
 
     // Additive migration for pre-v14 databases: preserves all cached pages, blocks, comments, and FTS rows.
     ensure_column_exists(conn, "pages", "detail_synced_edited_time", "TEXT")?;
+    ensure_column_exists(conn, "pages", "body_synced_edited_time", "TEXT")?;
     if ensure_column_exists(conn, "pages", "comments_error", "TEXT")? {
         // Older caches stored unavailable comments as an empty list. Recheck those
         // pages on their first online read and leave cached content available offline.
@@ -180,6 +183,18 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
                  SELECT 1 FROM comments
                  WHERE comments.workspace_id = pages.workspace_id AND comments.page_id = pages.id
              )",
+        )?;
+    }
+    if ensure_column_exists(conn, "pages", "comments_fetched", "INTEGER NOT NULL DEFAULT 0")? {
+        conn.execute_batch(
+            "UPDATE pages SET comments_fetched = 1
+             WHERE detail_synced_edited_time IS NOT NULL OR EXISTS (
+                 SELECT 1 FROM comments
+                 WHERE comments.workspace_id = pages.workspace_id AND comments.page_id = pages.id
+             );
+             UPDATE pages SET comments_fetched = 2, detail_synced_edited_time = NULL
+             WHERE (SELECT COUNT(*) FROM comments
+                    WHERE comments.workspace_id = pages.workspace_id AND comments.page_id = pages.id) >= 2000;",
         )?;
     }
 

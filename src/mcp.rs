@@ -116,7 +116,7 @@ pub async fn handle_request_value(
                 .unwrap_or_else(|| json!({}));
             match dispatch_tool(config, auth, client, storage, tool_name, &args).await {
                 Ok(result_val) => {
-                    let text = serde_json::to_string_pretty(&result_val)
+                    let text = serde_json::to_string(&result_val)
                         .unwrap_or_else(|_| result_val.to_string());
                     Some(json!({
                         "jsonrpc": "2.0",
@@ -177,26 +177,28 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_page",
-            "description": "Fetch a Notion page with properties, recursive block tree, Markdown export, comments, and media references.",
+            "description": "Fetch a Notion page. Compact by default: id, title, last_edited_time, Markdown, incomplete_blocks, comments_state, omitted counts and a hint; compact never requests comments and reports only what the cache knows. Pass compact:false for properties, block tree, comments and media. Full details carry up to 2000 comments; use list_comments with cursor for the rest.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
                 "properties": {
                     "page": { "type": "string", "description": "Page UUID, Notion URL, or title" },
                     "refresh": { "type": "boolean", "description": "Force refetch of blocks and comments even if page timestamp did not change" },
-                    "compact": { "type": "boolean", "description": "Return only ID, title, last edited time, and Markdown" },
+                    "compact": { "type": "boolean", "default": true, "description": "false returns the full page detail" },
                     "offline": { "type": "boolean" }
                 }
             }
         }),
         json!({
             "name": "get_page_blocks",
-            "description": "List the recursive block tree for a Notion page or block ID. Offline reads report a cache miss when no children have been fetched.",
+            "description": "List the recursive block tree for a Notion page or block ID. Offline reads report a cache miss when no children have been fetched. Returns has_more/next_cursor and incomplete_blocks.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
                 "properties": {
                     "page": { "type": "string", "description": "Page or block ID" },
+                    "limit": { "type": "integer", "minimum": 1, "default": 50 },
+                    "cursor": { "type": "string", "description": "next_cursor from a previous reply" },
                     "offline": { "type": "boolean" }
                 }
             }
@@ -289,13 +291,15 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "refresh": { "type": "boolean" },
+                    "limit": { "type": "integer", "minimum": 1, "default": 50 },
+                    "cursor": { "type": "string", "description": "next_cursor from a previous reply" },
                     "offline": { "type": "boolean" }
                 }
             }
         }),
         json!({
             "name": "query_database",
-            "description": "Query rows of a Notion database with optional Notion API JSON filter and sorts.",
+            "description": "Query rows of a Notion database with optional Notion API JSON filter and sorts. filter and sorts are rejected with offline:true.",
             "inputSchema": {
                 "type": "object",
                 "required": ["database"],
@@ -304,6 +308,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "filter": { "type": "object", "description": "Optional Notion API filter JSON object" },
                     "sorts": { "type": "array", "description": "Optional Notion API sorts JSON array" },
                     "limit": { "type": "integer", "default": 50 },
+                    "cursor": { "type": "string", "description": "next_cursor from a previous reply" },
                     "offline": { "type": "boolean" }
                 }
             }
@@ -339,12 +344,14 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "list_comments",
-            "description": "List comments on a Notion page.",
+            "description": "List comments on a Notion page. With offline:true, comments that were never fetched are a tool error.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
                 "properties": {
                     "page": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "default": 50 },
+                    "cursor": { "type": "string", "description": "next_cursor from a previous reply" },
                     "offline": { "type": "boolean" }
                 }
             }
@@ -376,7 +383,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "sync_now",
-            "description": "Synchronize Notion workspace pages and databases into the local SQLite WAL + FTS5 cache immediately.",
+            "description": "Synchronize Notion workspace pages and databases into the local SQLite WAL + FTS5 cache immediately. Streams every search batch into the cache; returns fetched_count and complete.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
     ]
@@ -408,6 +415,10 @@ async fn dispatch_tool(
     let opt_bool = |key: &str, default: bool| -> bool {
         args.get(key).and_then(Value::as_bool).unwrap_or(default)
     };
+    let limit_arg = |default: u64| -> usize {
+        args.get("limit").and_then(Value::as_u64).unwrap_or(default) as usize
+    };
+    let cursor = opt_str("cursor");
 
     match name {
         "whoami" => cli::op_whoami(config, auth, client).await,
@@ -416,7 +427,7 @@ async fn dispatch_tool(
             let query = req_str("query")?;
             let remote = opt_bool("remote", false);
             let offline = opt_bool("offline", false);
-            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(30) as usize;
+            let limit = limit_arg(30);
             let hits = cli::op_search(client, storage, &query, remote, offline, limit).await?;
             Ok(json!({ "ok": true, "count": hits.len(), "results": hits }))
         }
@@ -424,17 +435,43 @@ async fn dispatch_tool(
             let page = req_str("page")?;
             let refresh = opt_bool("refresh", false);
             let offline = opt_bool("offline", false);
-            let detail = cli::op_get_page_with_options(client, storage, &page, refresh, offline).await?;
-            if opt_bool("compact", false) {
-                return Ok(detail.compact());
+            if opt_bool("compact", true) {
+                return cli::op_get_page_compact(
+                    client,
+                    storage,
+                    &page,
+                    refresh,
+                    offline,
+                    |id| {
+                        format!(
+                            "Call get_page with {{\"page\":\"{id}\",\"compact\":false}} for properties, blocks, comments and media."
+                        )
+                    },
+                )
+                .await;
             }
-            Ok(serde_json::to_value(detail)?)
+            let (detail, comments_has_more) =
+                cli::op_get_page_for_output(client, storage, &page, refresh, offline).await?;
+            Ok(detail.full_json(comments_has_more))
         }
         "get_page_blocks" => {
             let page = req_str("page")?;
             let offline = opt_bool("offline", false);
-            let blocks = cli::op_list_blocks(client, storage, &page, offline).await?;
-            Ok(json!({ "ok": true, "count": blocks.len(), "blocks": blocks }))
+            let list = cli::op_list_blocks(
+                client,
+                storage,
+                &page,
+                offline,
+                limit_arg(50),
+                cursor.as_deref(),
+            )
+            .await?;
+            let incomplete = crate::parser::incomplete_block_ids(&list.items);
+            let mut val = cli::list_envelope("blocks", &list);
+            if let Some(map) = val.as_object_mut() {
+                map.insert("incomplete_blocks".into(), json!(incomplete));
+            }
+            Ok(val)
         }
         "create_page" => {
             let parent_id = req_str("parent_id")?;
@@ -520,19 +557,35 @@ async fn dispatch_tool(
         "list_databases" => {
             let refresh = opt_bool("refresh", false);
             let offline = opt_bool("offline", false);
-            let dbs = cli::op_list_databases(client, storage, refresh, offline).await?;
-            Ok(json!({ "ok": true, "count": dbs.len(), "databases": dbs }))
+            let list = cli::op_list_databases(
+                client,
+                storage,
+                refresh,
+                offline,
+                limit_arg(50),
+                cursor.as_deref(),
+            )
+            .await?;
+            Ok(cli::list_envelope("databases", &list))
         }
         "query_database" => {
             let database = req_str("database")?;
             let filter = args.get("filter").cloned().filter(|v| !v.is_null());
             let sorts = args.get("sorts").cloned().filter(|v| !v.is_null());
-            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
+            let limit = limit_arg(50);
             let offline = opt_bool("offline", false);
-            let rows =
-                cli::op_query_database(client, storage, &database, filter, sorts, limit, offline)
-                    .await?;
-            Ok(json!({ "ok": true, "count": rows.len(), "rows": rows }))
+            let list = cli::op_query_database(
+                client,
+                storage,
+                &database,
+                filter,
+                sorts,
+                limit,
+                cursor.as_deref(),
+                offline,
+            )
+            .await?;
+            Ok(cli::list_envelope("rows", &list))
         }
         "create_database_item" => {
             let database = req_str("database")?;
@@ -571,8 +624,16 @@ async fn dispatch_tool(
         "list_comments" => {
             let page = req_str("page")?;
             let offline = opt_bool("offline", false);
-            let comments = cli::op_list_comments(client, storage, &page, offline).await?;
-            Ok(json!({ "ok": true, "count": comments.len(), "comments": comments }))
+            let list = cli::op_list_comments(
+                client,
+                storage,
+                &page,
+                offline,
+                limit_arg(50),
+                cursor.as_deref(),
+            )
+            .await?;
+            Ok(cli::list_envelope("comments", &list))
         }
         "add_comment" => {
             let page = req_str("page")?;
@@ -591,12 +652,16 @@ async fn dispatch_tool(
             Ok(serde_json::to_value(res)?)
         }
         "sync_now" => {
-            let (ws_id, pages, databases) = sync::sync_workspace_tree(client, storage).await?;
+            let (ws_id, pages, databases, outcome) =
+                sync::sync_workspace_tree_with_options(client, storage, false, |_, _, _| {})
+                    .await?;
             Ok(json!({
                 "ok": true,
                 "workspace_id": ws_id,
                 "pages_count": pages.len(),
                 "databases_count": databases.len(),
+                "fetched_count": outcome.fetched,
+                "complete": true,
             }))
         }
         other => bail!("Unknown MCP tool: {other}"),

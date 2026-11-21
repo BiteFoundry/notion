@@ -34,7 +34,9 @@ use crate::{
 };
 
 const MAX_RETRIES: usize = 4;
-const DEFAULT_BLOCK_TREE_DEPTH: usize = 4;
+const DEFAULT_BLOCK_TREE_DEPTH: usize = 12;
+/// Comments carried inside a page detail. One extra comment is fetched to learn whether more exist.
+pub const DETAIL_COMMENTS_LIMIT: usize = 2000;
 const MAX_APPEND_BATCH_SIZE: usize = 100;
 const STATUS_SERVICE_OVERLOAD: u16 = 529;
 const MIN_RETRY_AFTER_SECS: f64 = 0.05;
@@ -599,19 +601,82 @@ impl NotionClient {
             .await
     }
 
-    fn fetch_block_tree_rec<'a>(
+    /// One page of a block's direct children (each with its subtree), following Notion cursors up to `limit`.
+    pub async fn fetch_block_tree_page(
+        &self,
+        root_block_id: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<NotionBlock>, bool, Option<String>)> {
+        if limit == 0 {
+            bail!("Invalid limit 0: must be at least 1");
+        }
+        let page_id = normalize_notion_id(root_block_id);
+        let mut out = Vec::new();
+        let mut cur: Option<String> = cursor.map(str::to_owned);
+        let mut last_has_more = false;
+        let mut last_next_cursor: Option<String> = None;
+
+        loop {
+            let remaining = limit.saturating_sub(out.len());
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(100);
+            let path = match cur.as_deref() {
+                Some(c) => format!(
+                    "/blocks/{page_id}/children?page_size={page_size}&start_cursor={}",
+                    urlencoding::encode(c)
+                ),
+                None => format!("/blocks/{page_id}/children?page_size={page_size}"),
+            };
+            let val = self.request_json(Method::GET, &path, None).await?;
+            let results = val
+                .get("results")
+                .and_then(Value::as_array)
+                .context("Notion block children response is missing results")?;
+            for item in results {
+                out.push(parse_notion_block(item, &page_id, None));
+            }
+            let has_more = val
+                .get("has_more")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if has_more {
+                let next = val
+                    .get("next_cursor")
+                    .and_then(Value::as_str)
+                    .filter(|c| !c.is_empty())
+                    .context("Notion block children response is missing its next cursor")?;
+                if cur.as_deref() == Some(next) {
+                    bail!("Notion block children response repeated its pagination cursor");
+                }
+                last_has_more = true;
+                last_next_cursor = Some(next.to_owned());
+                if out.len() >= limit {
+                    break;
+                }
+                cur = Some(next.to_owned());
+            } else {
+                last_has_more = false;
+                last_next_cursor = None;
+                break;
+            }
+        }
+        self.hydrate_children(&mut out, &page_id, DEFAULT_BLOCK_TREE_DEPTH)
+            .await?;
+        Ok((out, last_has_more, last_next_cursor))
+    }
+
+    fn hydrate_children<'a>(
         &'a self,
-        block_id: &'a str,
+        blocks: &'a mut Vec<NotionBlock>,
         page_id: &'a str,
-        parent_block_id: Option<&'a str>,
         remaining_depth: usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<NotionBlock>>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            let mut blocks = self
-                .list_block_children(block_id, page_id, parent_block_id)
-                .await?;
             if remaining_depth == 0 {
-                return Ok(blocks);
+                return Ok(());
             }
             // Collect indices of child blocks to recurse into and fetch in bounded parallel chunks of 3
             // (respects Notion's 3 req/s rate limit while cutting nested page latency ~3x).
@@ -645,6 +710,25 @@ impl NotionClient {
                 for (idx, res) in futures::future::join_all(futs).await {
                     blocks[idx].children = res?;
                 }
+            }
+            Ok(())
+        })
+    }
+
+    fn fetch_block_tree_rec<'a>(
+        &'a self,
+        block_id: &'a str,
+        page_id: &'a str,
+        parent_block_id: Option<&'a str>,
+        remaining_depth: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<NotionBlock>>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut blocks = self
+                .list_block_children(block_id, page_id, parent_block_id)
+                .await?;
+            if remaining_depth > 0 {
+                self.hydrate_children(&mut blocks, page_id, remaining_depth)
+                    .await?;
             }
             Ok(blocks)
         })
@@ -701,6 +785,30 @@ impl NotionClient {
             markdown,
             media,
         })
+    }
+
+    /// Page metadata and block tree only; never calls /v1/comments.
+    pub async fn fetch_page_body(
+        &self,
+        page_id: &str,
+        known_page: Option<NotionPage>,
+    ) -> Result<(NotionPage, Vec<NotionBlock>)> {
+        let id = normalize_notion_id(page_id);
+        let (mut page, blocks) = match known_page {
+            Some(page) => {
+                let blocks = self.fetch_block_tree(&id, None).await?;
+                (page, blocks)
+            }
+            None => {
+                let (page_res, blocks_res) = tokio::join!(
+                    self.get_page(&id),
+                    self.fetch_block_tree(&id, None),
+                );
+                (page_res?, blocks_res?)
+            }
+        };
+        page.plain_text = blocks_to_plain_text(&blocks);
+        Ok((page, blocks))
     }
 
     /// `PATCH /v1/blocks/{block_id}/children` (automatically chunks by 100 blocks per Notion API limits).
@@ -873,48 +981,54 @@ impl NotionClient {
         sorts: Option<Value>,
         max_rows: usize,
     ) -> Result<Vec<NotionPage>> {
-        let (rows, _) = self
-            .query_database_all_with_meta(database_id, filter, sorts, max_rows)
+        let (rows, _, _) = self
+            .query_database_all_with_meta(database_id, filter, sorts, max_rows, None)
             .await?;
         Ok(rows)
     }
 
-    /// Paginated `POST /v1/databases/{database_id}/query` returning `(rows, has_more)`.
-    /// `has_more` is `true` if Notion reported more pages or results were truncated at `max_rows`.
+    /// Paginated `POST /v1/databases/{database_id}/query` returning `(rows, has_more, next_cursor)`.
     pub async fn query_database_all_with_meta(
         &self,
         database_id: &str,
         filter: Option<Value>,
         sorts: Option<Value>,
         max_rows: usize,
-    ) -> Result<(Vec<NotionPage>, bool)> {
+        start_cursor: Option<&str>,
+    ) -> Result<(Vec<NotionPage>, bool, Option<String>)> {
         let mut all = Vec::new();
-        let mut cursor: Option<String> = None;
+        let mut cursor: Option<String> = start_cursor.map(str::to_owned);
         let limit = max_rows.max(1);
-        let more_remaining: bool;
+        let mut last_has_more = false;
+        let mut last_next_cursor: Option<String> = None;
         loop {
+            let remaining = limit.saturating_sub(all.len());
+            if remaining == 0 {
+                break;
+            }
             let (rows, has_more, next_cursor) = self
                 .query_database(
                     database_id,
                     filter.clone(),
                     sorts.clone(),
-                    100.min(limit),
+                    100.min(remaining),
                     cursor.as_deref(),
                 )
                 .await?;
             all.extend(rows);
             if !has_more || next_cursor.is_none() {
-                more_remaining = has_more || all.len() > limit;
+                last_has_more = has_more;
+                last_next_cursor = if has_more { next_cursor } else { None };
                 break;
             }
             if all.len() >= limit {
-                more_remaining = true;
+                last_has_more = true;
+                last_next_cursor = next_cursor;
                 break;
             }
             cursor = next_cursor;
         }
-        all.truncate(limit);
-        Ok((all, more_remaining))
+        Ok((all, last_has_more, last_next_cursor))
     }
 
     /// `POST /v1/databases`
@@ -926,19 +1040,38 @@ impl NotionClient {
         parse_notion_database(&val, &workspace_id)
     }
 
-    /// `GET /v1/comments?block_id={id}` (paginated)
-    pub async fn list_comments(&self, block_id: &str) -> Result<Vec<NotionComment>> {
+    /// `GET /v1/comments?block_id={id}` paginated up to `limit` starting at `cursor`.
+    pub async fn list_comments_page(
+        &self,
+        block_id: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<NotionComment>, bool, Option<String>)> {
+        if limit == 0 {
+            bail!("Invalid limit 0: must be at least 1");
+        }
         let id = normalize_notion_id(block_id);
         let mut out = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..20 {
-            let path = match cursor.as_deref() {
+        let mut cur: Option<String> = cursor.map(str::to_owned);
+        let mut last_has_more = false;
+        let mut last_next_cursor: Option<String> = None;
+
+        loop {
+            let remaining = limit.saturating_sub(out.len());
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(100);
+            let path = match cur.as_deref() {
                 Some(c) => format!(
-                    "/comments?block_id={}&page_size=100&start_cursor={}",
+                    "/comments?block_id={}&page_size={page_size}&start_cursor={}",
                     urlencoding::encode(&id),
                     urlencoding::encode(c)
                 ),
-                None => format!("/comments?block_id={}&page_size=100", urlencoding::encode(&id)),
+                None => format!(
+                    "/comments?block_id={}&page_size={page_size}",
+                    urlencoding::encode(&id)
+                ),
             };
             let val = self.request_json(Method::GET, &path, None).await?;
             if let Some(results) = val.get("results").and_then(Value::as_array) {
@@ -946,19 +1079,40 @@ impl NotionClient {
                     out.push(parse_notion_comment(item, &id));
                 }
             }
-            if val.get("has_more").and_then(Value::as_bool).unwrap_or(false) {
-                cursor = val
+            let has_more = val
+                .get("has_more")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if has_more {
+                let next = val
                     .get("next_cursor")
                     .and_then(Value::as_str)
-                    .map(str::to_string);
-                if cursor.is_none() {
+                    .filter(|c| !c.is_empty())
+                    .context("Notion comments response is missing its next cursor")?;
+                if cur.as_deref() == Some(next) {
+                    bail!("Notion comments response repeated its pagination cursor");
+                }
+                last_has_more = true;
+                last_next_cursor = Some(next.to_owned());
+                if out.len() >= limit {
                     break;
                 }
+                cur = Some(next.to_owned());
             } else {
+                last_has_more = false;
+                last_next_cursor = None;
                 break;
             }
         }
-        Ok(out)
+        Ok((out, last_has_more, last_next_cursor))
+    }
+
+    /// `GET /v1/comments?block_id={id}` (for page detail: up to `DETAIL_COMMENTS_LIMIT + 1`).
+    pub async fn list_comments(&self, block_id: &str) -> Result<Vec<NotionComment>> {
+        let (comments, _, _) = self
+            .list_comments_page(block_id, DETAIL_COMMENTS_LIMIT + 1, None)
+            .await?;
+        Ok(comments)
     }
 
     /// `POST /v1/comments` (on a page or existing discussion thread)

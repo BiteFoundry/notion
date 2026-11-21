@@ -301,18 +301,45 @@ pub fn parse_property_value(val: &Value) -> NotionPropertyValue {
             NotionPropertyValue::Formula(s)
         }
         "rollup" => {
-            let r = val.get("rollup");
-            let s = r
-                .and_then(|x| {
-                    x.get("number")
+            let s = val
+                .get("rollup")
+                .map(|r| match r.get("type").and_then(Value::as_str) {
+                    Some("number") => r
+                        .get("number")
                         .and_then(Value::as_f64)
                         .map(|n| n.to_string())
-                        .or_else(|| {
-                            x.get("date")
-                                .and_then(|d| d.get("start"))
+                        .unwrap_or_default(),
+                    Some("date") => {
+                        let d = r.get("date");
+                        NotionPropertyValue::Date {
+                            start: d
+                                .and_then(|x| x.get("start"))
                                 .and_then(Value::as_str)
-                                .map(str::to_string)
+                                .map(str::to_string),
+                            end: d
+                                .and_then(|x| x.get("end"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        }
+                        .to_plain_string()
+                    }
+                    Some("array") => r
+                        .get("array")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|elem| {
+                                    parse_property_value(elem)
+                                        .to_plain_string()
+                                        .trim()
+                                        .to_string()
+                                })
+                                .filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         })
+                        .unwrap_or_default(),
+                    _ => String::new(),
                 })
                 .unwrap_or_default();
             NotionPropertyValue::Rollup(s)
@@ -339,6 +366,28 @@ pub fn parse_property_value(val: &Value) -> NotionPropertyValue {
                 _ => String::new(),
             };
             NotionPropertyValue::UniqueId(formatted)
+        }
+        "created_by" | "last_edited_by" => {
+            let s = val
+                .get(ptype)
+                .and_then(|u| {
+                    u.get("name")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| u.get("id").and_then(Value::as_str))
+                })
+                .unwrap_or_default()
+                .to_string();
+            NotionPropertyValue::Other(s)
+        }
+        "verification" => {
+            let s = val
+                .get("verification")
+                .and_then(|v| v.get("state"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            NotionPropertyValue::Other(s)
         }
         _ => NotionPropertyValue::Other(String::new()),
     }
@@ -843,6 +892,28 @@ pub fn parse_notion_comment(val: &Value, page_id: &str) -> NotionComment {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+    }
+}
+
+/// IDs of blocks that report children but carry none in this tree (document order).
+pub fn incomplete_block_ids(blocks: &[NotionBlock]) -> Vec<String> {
+    let mut out = Vec::new();
+    incomplete_block_ids_rec(blocks, &mut out);
+    out
+}
+
+fn incomplete_block_ids_rec(blocks: &[NotionBlock], out: &mut Vec<String>) {
+    for blk in blocks {
+        if blk.has_children
+            && blk.children.is_empty()
+            && !matches!(
+                blk.block_type.as_str(),
+                "child_page" | "child_database" | "unsupported"
+            )
+        {
+            out.push(blk.id.clone());
+        }
+        incomplete_block_ids_rec(&blk.children, out);
     }
 }
 
@@ -2402,5 +2473,125 @@ mod tests {
         assert_eq!(page.parent_type, "database_id");
         assert!(page.properties_summary().contains("In Progress"));
         assert!(page.properties_summary().contains("CLI, Rust"));
+    }
+
+    #[test]
+    fn rollup_array_and_date_range_render_values() {
+        let arr = parse_property_value(&json!({
+            "type": "rollup",
+            "rollup": {
+                "type": "array",
+                "array": [
+                    { "type": "number", "number": 10 },
+                    { "type": "number", "number": 20 }
+                ]
+            }
+        }));
+        assert_eq!(arr, NotionPropertyValue::Rollup("10, 20".into()));
+
+        let empty = parse_property_value(&json!({
+            "type": "rollup",
+            "rollup": { "type": "array", "array": [] }
+        }));
+        assert_eq!(empty, NotionPropertyValue::Rollup(String::new()));
+
+        let num = parse_property_value(&json!({
+            "type": "rollup",
+            "rollup": { "type": "number", "number": 30 }
+        }));
+        assert_eq!(num, NotionPropertyValue::Rollup("30".into()));
+
+        let range = parse_property_value(&json!({
+            "type": "rollup",
+            "rollup": {
+                "type": "date",
+                "date": { "start": "2026-01-01", "end": "2026-01-05" }
+            }
+        }));
+        assert_eq!(
+            range,
+            NotionPropertyValue::Rollup("2026-01-01 -> 2026-01-05".into())
+        );
+
+        let single_date = parse_property_value(&json!({
+            "type": "rollup",
+            "rollup": {
+                "type": "date",
+                "date": { "start": "2026-01-01", "end": null }
+            }
+        }));
+        assert_eq!(single_date, NotionPropertyValue::Rollup("2026-01-01".into()));
+
+        let incomplete = parse_property_value(&json!({
+            "type": "rollup",
+            "rollup": { "type": "incomplete" }
+        }));
+        assert_eq!(incomplete, NotionPropertyValue::Rollup(String::new()));
+    }
+
+    #[test]
+    fn other_user_and_verification_keep_values() {
+        assert_eq!(
+            parse_property_value(&json!({
+                "type": "created_by",
+                "created_by": { "name": "Ada" }
+            })),
+            NotionPropertyValue::Other("Ada".into())
+        );
+        assert_eq!(
+            parse_property_value(&json!({
+                "type": "last_edited_by",
+                "last_edited_by": { "id": "u1" }
+            })),
+            NotionPropertyValue::Other("u1".into())
+        );
+        assert_eq!(
+            parse_property_value(&json!({
+                "type": "verification",
+                "verification": { "state": "verified" }
+            })),
+            NotionPropertyValue::Other("verified".into())
+        );
+        assert_eq!(
+            parse_property_value(&json!({
+                "type": "button",
+                "button": {}
+            })),
+            NotionPropertyValue::Other(String::new())
+        );
+    }
+
+    #[test]
+    fn incomplete_block_ids_reports_unloaded_children_in_order() {
+        let blocks = vec![
+            NotionBlock {
+                id: "blk-child-page".into(),
+                block_type: "child_page".into(),
+                has_children: true,
+                ..Default::default()
+            },
+            NotionBlock {
+                id: "blk-loaded-parent".into(),
+                block_type: "toggle".into(),
+                has_children: true,
+                children: vec![NotionBlock {
+                    id: "blk-nested-missing".into(),
+                    block_type: "toggle".into(),
+                    has_children: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            NotionBlock {
+                id: "blk-top-missing".into(),
+                block_type: "bulleted_list_item".into(),
+                has_children: true,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            incomplete_block_ids(&blocks),
+            vec!["blk-nested-missing".to_string(), "blk-top-missing".to_string()]
+        );
     }
 }
