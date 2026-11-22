@@ -1,4 +1,6 @@
 pub mod client;
 pub mod media;
 
-pub use client::{NotionClient, SearchFilterObject, SearchResponse, DETAIL_COMMENTS_LIMIT};
+pub use client::{
+    NotionApiError, NotionClient, SearchFilterObject, SearchResponse, DETAIL_COMMENTS_LIMIT,
+};

@@ -58,15 +58,23 @@ struct ApiError {
 impl ApiError {
     fn from_anyhow(err: anyhow::Error) -> Self {
         let msg = err.to_string();
-        let lower = msg.to_ascii_lowercase();
-        let status = if lower.contains("not found") || lower.contains("404") {
-            StatusCode::NOT_FOUND
-        } else if lower.contains("empty") || lower.contains("invalid") || lower.contains("required")
-        {
-            StatusCode::BAD_REQUEST
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
+        let status = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::notion::NotionApiError>())
+            .and_then(|api| StatusCode::from_u16(api.status).ok())
+            .unwrap_or_else(|| {
+                let lower = msg.to_ascii_lowercase();
+                if lower.contains("not found") || lower.contains("404") {
+                    StatusCode::NOT_FOUND
+                } else if lower.contains("empty")
+                    || lower.contains("invalid")
+                    || lower.contains("required")
+                {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            });
         Self {
             status,
             message: msg,
@@ -407,15 +415,16 @@ async fn patch_page_handler(
         .map_err(ApiError::from_anyhow)?;
         return Ok(Json(json!({ "ok": true, "page": updated })));
     }
-    let updated = cli::op_update_page_meta(
-        &state.client,
-        &state.storage,
-        &id,
-        body.title.as_deref(),
-        body.icon.as_deref(),
-    )
-    .await
-    .map_err(ApiError::from_anyhow)?;
+    let title = body.title.as_deref().map(Some);
+    let icon = body
+        .icon
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Some);
+    let updated = cli::op_update_page_metadata(&state.client, &state.storage, &id, title, icon)
+        .await
+        .map_err(ApiError::from_anyhow)?;
     Ok(Json(json!({ "ok": true, "page": updated })))
 }
 

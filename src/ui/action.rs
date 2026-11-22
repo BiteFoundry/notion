@@ -2388,6 +2388,7 @@ mod tests {
                         color: NotionColor::Green,
                     },
                 ],
+                relation_database_id: None,
             },
         );
         app.databases = vec![NotionDatabase {

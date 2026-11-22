@@ -818,6 +818,42 @@ async fn e2e_http_api_server_and_mcp_tools() {
         .unwrap();
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
 
+    // Whoami returns API workspace_name rather than placeholder profile name (W9)
+    let whoami_resp: Value = http
+        .get(format!("{api_base}/api/v1/whoami"))
+        .header("x-api-key", "local-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(whoami_resp["workspace_name"], "Acme Workspace");
+    assert_eq!(whoami_resp["user"]["workspace_name"], "Acme Workspace");
+
+    // Upstream 401 from Notion API propagates as HTTP 401 from `serve` (W3 F2e)
+    let bad_auth = AuthManager::from_token(cfg.clone(), "ntn_wrong_token");
+    let bad_client = NotionClient::new(&cfg, bad_auth.clone()).unwrap();
+    let bad_api_state = Arc::new(serve::ApiState {
+        config: cfg.clone(),
+        auth: bad_auth,
+        client: bad_client,
+        storage: Storage::open_in_memory().unwrap(),
+        api_key: None,
+    });
+    let bad_api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bad_api_addr = bad_api_listener.local_addr().unwrap();
+    let bad_api_server = tokio::spawn(async move {
+        let _ = axum::serve(bad_api_listener, serve::build_router(bad_api_state)).await;
+    });
+    let upstream_401 = http
+        .get(format!("http://{bad_api_addr}/api/v1/whoami"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upstream_401.status(), StatusCode::UNAUTHORIZED);
+    bad_api_server.abort();
+
     // Sync via HTTP API
     let sync_resp: Value = http
         .post(format!("{api_base}/api/v1/sync"))
@@ -892,7 +928,7 @@ async fn e2e_http_api_server_and_mcp_tools() {
     )
     .await
     .unwrap();
-    assert_eq!(list_tools["result"]["tools"].as_array().unwrap().len(), 19);
+    assert_eq!(list_tools["result"]["tools"].as_array().unwrap().len(), 20);
 
     // Call archive_page WITHOUT confirm -> must fail!
     let archive_denied = mcp::handle_request_value(
@@ -945,6 +981,14 @@ async fn e2e_http_api_server_and_mcp_tools() {
     .unwrap();
     assert_eq!(append_ok["result"]["isError"], false);
     assert_eq!(append_ok["result"]["structuredContent"]["appended"], 1);
+    assert!(append_ok["result"]["structuredContent"].get("blocks").is_none());
+    assert_eq!(
+        append_ok["result"]["structuredContent"]["block_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 
     mock_server.abort();
 }
@@ -1704,6 +1748,46 @@ async fn e2e_bidirectional_sync_versions_forced_refresh_block_writes_and_section
     let storage = Storage::open(&db_path).unwrap();
     let d_v5 = sync::sync_page_detail(&client, &storage, "page-a").await.unwrap();
     assert_eq!(d_v5.blocks[0].plain_text(), "Body V5 after-restart");
+
+    // ③b F4c: same-minute edit with current `last_edited_time` is not frozen in cache.
+    let now_ts = chrono::Utc::now().to_rfc3339();
+    {
+        let mut g = state.lock().unwrap();
+        g.para_text = "Body SameMinute V1".into();
+        g.page_ts = now_ts.clone();
+    }
+    let d_sm1 = sync::sync_page_body(&client, &storage, "page-a", false)
+        .await
+        .unwrap();
+    assert_eq!(d_sm1.blocks[0].plain_text(), "Body SameMinute V1");
+    {
+        let mut g = state.lock().unwrap();
+        // Same timestamp (minute granularity), updated block content
+        g.para_text = "Body SameMinute V2".into();
+    }
+    let d_sm2 = sync::sync_page_body(&client, &storage, "page-a", false)
+        .await
+        .unwrap();
+    assert_eq!(d_sm2.blocks[0].plain_text(), "Body SameMinute V2");
+    let d_sm_detail1 = sync::sync_page_detail(&client, &storage, "page-a")
+        .await
+        .unwrap();
+    assert_eq!(d_sm_detail1.blocks[0].plain_text(), "Body SameMinute V2");
+    {
+        let mut g = state.lock().unwrap();
+        g.para_text = "Body SameMinute V3".into();
+    }
+    let d_sm_detail2 = sync::sync_page_detail(&client, &storage, "page-a")
+        .await
+        .unwrap();
+    assert_eq!(d_sm_detail2.blocks[0].plain_text(), "Body SameMinute V3");
+    // Restore historical timestamp for subsequent assertions in this test
+    {
+        let mut g = state.lock().unwrap();
+        g.para_text = "Body V5 after-restart".into();
+        g.page_ts = "2026-11-20T05:00:00.000Z".into();
+    }
+    let _ = sync::sync_page_detail(&client, &storage, "page-a").await.unwrap();
 
     // Frozen parent timestamp + nested toggle child edit + new comment:
     // RefreshAll on spawn_sync_engine MUST see both AND fetch block tree ONLY ONCE!
@@ -3138,6 +3222,248 @@ async fn regression_notion_bug_01_status_with_select_properties_and_controls() {
     assert_eq!(writes[0].body.pointer("/properties/Stage/select/name"), Some(&json!("Done")));
 
     api_server.abort();
+    mock_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn regression_w2_custom_db_title_column_and_pages_edit_guard() {
+    use std::collections::HashMap;
+    use tokio::process::Command;
+
+    const DB_CUSTOM: &str = "22000000-0000-0000-0000-000000000001";
+    const ROW_CUSTOM: &str = "22000000-0000-0000-0000-000000000011";
+    const PAGE_PLAIN: &str = "22000000-0000-0000-0000-000000000022";
+
+    #[derive(Clone, Debug)]
+    struct ReqLog {
+        method: String,
+        path: String,
+        body: Value,
+    }
+
+    #[derive(Clone)]
+    struct W2Mock {
+        dbs: HashMap<String, Value>,
+        pages: Arc<Mutex<HashMap<String, Value>>>,
+        writes: Arc<Mutex<Vec<ReqLog>>>,
+    }
+
+    impl W2Mock {
+        fn take_writes(&self) -> Vec<ReqLog> {
+            std::mem::take(&mut *self.writes.lock().unwrap())
+        }
+    }
+
+    let mut dbs = HashMap::new();
+    dbs.insert(
+        DB_CUSTOM.into(),
+        json!({
+            "object": "database",
+            "id": DB_CUSTOM,
+            "url": format!("https://www.notion.so/{DB_CUSTOM}"),
+            "parent": { "type": "workspace", "workspace": true },
+            "title": [{ "plain_text": "Sprint Board" }],
+            "description": [],
+            "properties": {
+                "Task Title": { "id": "title", "type": "title", "title": {} },
+                "Status": { "id": "st", "type": "status", "status": { "options": [] } }
+            }
+        }),
+    );
+    let mut pages = HashMap::new();
+    pages.insert(
+        ROW_CUSTOM.into(),
+        json!({
+            "object": "page",
+            "id": ROW_CUSTOM,
+            "url": format!("https://www.notion.so/{ROW_CUSTOM}"),
+            "parent": { "type": "database_id", "database_id": DB_CUSTOM },
+            "archived": false,
+            "properties": {
+                "Task Title": { "type": "title", "title": [{ "plain_text": "Ship CLI Audit" }] },
+                "Status": { "type": "status", "status": { "name": "Todo", "color": "gray" } }
+            }
+        }),
+    );
+    pages.insert(
+        PAGE_PLAIN.into(),
+        json!({
+            "object": "page",
+            "id": PAGE_PLAIN,
+            "url": format!("https://www.notion.so/{PAGE_PLAIN}"),
+            "parent": { "type": "workspace", "workspace": true },
+            "archived": false,
+            "properties": {
+                "title": { "type": "title", "title": [{ "plain_text": "Regular Page" }] }
+            }
+        }),
+    );
+
+    let st = W2Mock {
+        dbs,
+        pages: Arc::new(Mutex::new(pages)),
+        writes: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let router = Router::new()
+        .route(
+            "/v1/databases/{id}",
+            get(|State(s): State<W2Mock>, AxumPath(id): AxumPath<String>| async move {
+                match s.dbs.get(&id) {
+                    Some(v) => Json(v.clone()).into_response(),
+                    None => (StatusCode::NOT_FOUND, Json(json!({"code": "object_not_found", "message": "not found"}))).into_response(),
+                }
+            }),
+        )
+        .route(
+            "/v1/pages",
+            post(|State(s): State<W2Mock>, Json(body): Json<Value>| async move {
+                let is_db = body.pointer("/parent/database_id").is_some();
+                if is_db && body.pointer("/properties/Task Title").is_none() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "code": "validation_error",
+                            "message": "Name is not a property that exists."
+                        })),
+                    )
+                        .into_response();
+                }
+                s.writes.lock().unwrap().push(ReqLog {
+                    method: "POST".into(),
+                    path: "/v1/pages".into(),
+                    body: body.clone(),
+                });
+                Json(json!({
+                    "object": "page",
+                    "id": "22000000-0000-0000-0000-000000000099",
+                    "url": "https://www.notion.so/22000000000000000000000000000099",
+                    "parent": body["parent"],
+                    "archived": false,
+                    "properties": body["properties"]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/pages/{id}",
+            get(|State(s): State<W2Mock>, AxumPath(id): AxumPath<String>| async move {
+                match s.pages.lock().unwrap().get(&id).cloned() {
+                    Some(v) => Json(v).into_response(),
+                    None => (StatusCode::NOT_FOUND, Json(json!({"code": "object_not_found", "message": "not found"}))).into_response(),
+                }
+            })
+            .patch(|State(s): State<W2Mock>, AxumPath(id): AxumPath<String>, Json(body): Json<Value>| async move {
+                let current = s.pages.lock().unwrap().get(&id).cloned().unwrap();
+                let is_db_row = current.pointer("/parent/database_id").is_some();
+                if is_db_row && body.pointer("/properties/title").is_some() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "code": "validation_error",
+                            "message": "title is not a property that exists."
+                        })),
+                    )
+                        .into_response();
+                }
+                s.writes.lock().unwrap().push(ReqLog {
+                    method: "PATCH".into(),
+                    path: format!("/v1/pages/{id}"),
+                    body: body.clone(),
+                });
+                let mut updated = current;
+                if let Some(props) = body.get("properties").and_then(Value::as_object) {
+                    if let Some(target) = updated.get_mut("properties").and_then(Value::as_object_mut) {
+                        for (k, v) in props {
+                            target.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                Json(updated).into_response()
+            }),
+        )
+        .with_state(st.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let mock_server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_dir = tmp.path().join("cfg");
+    let data_dir = tmp.path().join("data");
+
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_notion"));
+        cmd.args(args)
+            .env("NOTION_API_BASE_URL", format!("{base_url}/v1"))
+            .env("NOTION_TOKEN", "ntn_mock_token")
+            .env("NOTION_CONFIG_DIR", &cfg_dir)
+            .env("NOTION_DATA_DIR", &data_dir)
+            .env("NOTION_DISABLE_KEYRING", "1");
+        cmd
+    };
+
+    // F5a: pages edit --title on custom-title DB row uses "Task Title"
+    let out = run(&["pages", "edit", ROW_CUSTOM, "--title", "Renamed", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let writes = st.take_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].method, "PATCH");
+    assert_eq!(writes[0].path, format!("/v1/pages/{ROW_CUSTOM}"));
+    assert_eq!(
+        writes[0].body.pointer("/properties/Task Title/title/0/text/content"),
+        Some(&json!("Renamed"))
+    );
+    assert!(writes[0].body.pointer("/properties/title").is_none());
+
+    // F5b: pages create --parent <db> --database uses "Task Title"
+    let out = run(&[
+        "pages", "create", "--parent", DB_CUSTOM, "--database", "--title", "New Row", "--json",
+    ])
+    .output()
+    .await
+    .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let writes = st.take_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].method, "POST");
+    assert_eq!(writes[0].path, "/v1/pages");
+    assert_eq!(
+        writes[0].body.pointer("/properties/Task Title/title/0/text/content"),
+        Some(&json!("New Row"))
+    );
+    assert!(writes[0].body.pointer("/properties/Name").is_none());
+
+    // Control: regular workspace page edit --title uses "title"
+    let out = run(&["pages", "edit", PAGE_PLAIN, "--title", "Updated Regular", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let writes = st.take_writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        writes[0].body.pointer("/properties/title/title/0/text/content"),
+        Some(&json!("Updated Regular"))
+    );
+
+    // F8d: pages edit with no flags exits 1 with invalid_input JSON envelope and 0 writes
+    let out = run(&["pages", "edit", PAGE_PLAIN, "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err_json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(err_json["ok"], false);
+    assert_eq!(err_json["error"]["code"], "invalid_input");
+    assert!(st.take_writes().is_empty());
+
     mock_server.abort();
 }
 

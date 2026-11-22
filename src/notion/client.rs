@@ -41,6 +41,32 @@ const MAX_APPEND_BATCH_SIZE: usize = 100;
 const STATUS_SERVICE_OVERLOAD: u16 = 529;
 const MIN_RETRY_AFTER_SECS: f64 = 0.05;
 
+#[derive(Debug, Clone)]
+pub struct NotionApiError {
+    pub status: u16,
+    pub code: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for NotionApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match StatusCode::from_u16(self.status) {
+            Ok(st) => write!(
+                f,
+                "Notion API error (HTTP {st}, {}): {}",
+                self.code, self.message
+            ),
+            Err(_) => write!(
+                f,
+                "Notion API error (HTTP {}, {}): {}",
+                self.status, self.code, self.message
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NotionApiError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchFilterObject {
     All,
@@ -268,7 +294,12 @@ impl NotionClient {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or_else(|| text.trim());
-                bail!("Notion API error (HTTP {status}, {code}): {msg}");
+                return Err(NotionApiError {
+                    status: status.as_u16(),
+                    code: code.to_string(),
+                    message: msg.to_string(),
+                }
+                .into());
             }
 
             if matches!(
@@ -295,7 +326,12 @@ impl NotionClient {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or_else(|| text.trim());
-                bail!("Notion API error (HTTP {status}, {code}): {msg}");
+                return Err(NotionApiError {
+                    status: status.as_u16(),
+                    code: code.to_string(),
+                    message: msg.to_string(),
+                }
+                .into());
             }
 
             return Ok(parsed);

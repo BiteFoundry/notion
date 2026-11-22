@@ -93,6 +93,7 @@ mod tests {
             "blocks",
             "db",
             "comments",
+            "users",
             "download",
             "sync",
             "doctor",

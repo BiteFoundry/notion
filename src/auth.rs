@@ -231,9 +231,10 @@ impl AuthManager {
                 return Ok(cred.access_token);
             }
         }
-        bail!(
-            "Not logged in to Notion. Run `notion login` (with an internal integration token or `--oauth`) or set `NOTION_TOKEN`."
-        );
+        Err(crate::models::coded(
+            "not_logged_in",
+            "Not logged in to Notion. Run `notion login` (with an internal integration token or `--oauth`) or set `NOTION_TOKEN`.",
+        ))
     }
 
     /// Switches active workspace in memory (used by TUI Workspace Switcher `Ctrl+S`).

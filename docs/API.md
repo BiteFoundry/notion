@@ -10,6 +10,8 @@ notion serve --host 0.0.0.0 --port 8791 --api-key "$NOTION_LOCAL_API_KEY"
 
 When `--api-key` is configured, pass `x-api-key: <key>` or `Authorization: Bearer <key>` on all `/api/v1/*` routes.
 
+Errors return `{ "ok": false, "error": "..." }` and preserve the upstream Notion API HTTP status code (such as `401`, `403`, `404`, `409`, or `429`) when a request fails upstream.
+
 ## Endpoints
 
 | Method | Path | Description |

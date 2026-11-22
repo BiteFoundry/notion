@@ -1,10 +1,10 @@
 //! Standalone Notion stdio MCP (Model Context Protocol, JSON-RPC 2.0) server (`notion mcp`).
 //!
-//! Exposes Notion page, block, database, and workspace tools:
-//! `whoami`, `list_workspaces`, `search_pages`, `get_page`, `get_page_blocks`, `create_page`, `update_page`,
-//! `append_blocks`, `update_block`, `toggle_todo`, `archive_page`, `list_databases`,
-//! `query_database`, `create_database_item`, `update_database_item`, `list_comments`,
-//! `add_comment`, `download_media`, `sync_now`.
+//! Exposes Notion page, block, database, user, and workspace tools:
+//! `whoami`, `list_workspaces`, `list_users`, `search_pages`, `get_page`, `get_page_blocks`,
+//! `create_page`, `update_page`, `append_blocks`, `update_block`, `toggle_todo`, `archive_page`,
+//! `list_databases`, `query_database`, `create_database_item`, `update_database_item`,
+//! `list_comments`, `add_comment`, `download_media`, `sync_now`.
 
 use std::{
     io::{self, BufRead, Write},
@@ -162,6 +162,17 @@ pub fn tool_definitions() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
+            "name": "list_users",
+            "description": "List Notion workspace users with their IDs, names, types, and emails.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "default": 50 },
+                    "cursor": { "type": "string", "description": "next_cursor from a previous reply" }
+                }
+            }
+        }),
+        json!({
             "name": "search_pages",
             "description": "Search Notion pages and databases using local SQLite FTS5 (with Korean <3 char LIKE fallback) or remote Notion Search API.",
             "inputSchema": {
@@ -235,13 +246,14 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "append_blocks",
-            "description": "Append Markdown or slash-style blocks (/h1, /todo, /callout, /code, /quote, /toggle) to a Notion page or block.",
+            "description": "Append Markdown or slash-style blocks (/h1, /todo, /callout, /code, /quote, /toggle) to a Notion page or block. Returns compact {ok, appended, block_ids} by default; pass compact:false for full block objects.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page", "markdown"],
                 "properties": {
-                    "page": { "type": "string", "description": "Target page or block ID/title" },
-                    "markdown": { "type": "string", "description": "Markdown or slash command text to append" }
+                    "page": { "type": "string", "description": "Target page or block ID, URL, or exact title" },
+                    "markdown": { "type": "string", "description": "Markdown or slash command text to append" },
+                    "compact": { "type": "boolean", "default": true, "description": "false returns the full appended block objects" }
                 }
             }
         }),
@@ -335,7 +347,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "required": ["page_id"],
                 "properties": {
-                    "page_id": { "type": "string" },
+                    "page_id": { "type": "string", "description": "Row page UUID, Notion URL, or exact title" },
                     "title": { "type": "string" },
                     "status": { "type": "string" },
                     "properties": { "type": "object" }
@@ -423,6 +435,10 @@ async fn dispatch_tool(
     match name {
         "whoami" => cli::op_whoami(config, auth, client).await,
         "list_workspaces" => Ok(cli::op_list_workspaces(config)),
+        "list_users" => {
+            let list = cli::op_list_users(client, limit_arg(50), cursor.as_deref()).await?;
+            Ok(cli::list_envelope("users", &list))
+        }
         "search_pages" => {
             let query = req_str("query")?;
             let remote = opt_bool("remote", false);
@@ -517,7 +533,12 @@ async fn dispatch_tool(
             let page = req_str("page")?;
             let markdown = req_str("markdown")?;
             let blocks = cli::op_append_blocks(client, storage, &page, &markdown).await?;
-            Ok(json!({ "ok": true, "appended": blocks.len(), "blocks": blocks }))
+            if opt_bool("compact", true) {
+                let block_ids: Vec<&str> = blocks.iter().map(|b| b.id.as_str()).collect();
+                Ok(json!({ "ok": true, "appended": blocks.len(), "block_ids": block_ids }))
+            } else {
+                Ok(json!({ "ok": true, "appended": blocks.len(), "blocks": blocks }))
+            }
         }
         "update_block" => {
             let block_id = req_str("block_id")?;
@@ -673,9 +694,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mcp_exposes_19_english_tools() {
+    fn test_mcp_exposes_20_english_tools() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 20);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str))
@@ -683,6 +704,7 @@ mod tests {
         for expected in [
             "whoami",
             "list_workspaces",
+            "list_users",
             "search_pages",
             "get_page",
             "get_page_blocks",

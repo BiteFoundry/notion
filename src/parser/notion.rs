@@ -495,6 +495,15 @@ pub fn parse_notion_database(val: &Value, workspace_id: &str) -> Result<NotionDa
                     .unwrap_or_default(),
                 _ => Vec::new(),
             };
+            let relation_database_id = if prop_type == "relation" {
+                pval.get("relation")
+                    .and_then(|r| r.get("database_id"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+            } else {
+                None
+            };
             schema.insert(
                 name.clone(),
                 NotionPropertySchema {
@@ -506,6 +515,7 @@ pub fn parse_notion_database(val: &Value, workspace_id: &str) -> Result<NotionDa
                     name: name.clone(),
                     prop_type,
                     options,
+                    relation_database_id,
                 },
             );
         }
@@ -1657,15 +1667,120 @@ pub(crate) fn inline_markdown_spans(input: &str) -> Vec<(std::ops::Range<usize>,
     spans
 }
 
+fn leading_indent_level(raw: &str) -> usize {
+    let mut spaces = 0usize;
+    for ch in raw.chars() {
+        match ch {
+            ' ' => spaces += 1,
+            '\t' => spaces += 2,
+            _ => break,
+        }
+    }
+    spaces / 2
+}
+
+fn split_markdown_table_row(line: &str) -> Vec<String> {
+    let inner = line.trim();
+    let inner = inner.strip_prefix('|').unwrap_or(inner);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            cur.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '|' {
+            cells.push(cur.trim().to_string());
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    if escaped {
+        cur.push('\\');
+    }
+    cells.push(cur.trim().to_string());
+    cells
+}
+
+fn is_markdown_table_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('|') {
+        return false;
+    }
+    let cells = split_markdown_table_row(trimmed);
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let t = cell.trim();
+            !t.is_empty()
+                && t.chars().all(|ch| ch == '-' || ch == ':')
+                && t.contains('-')
+        })
+}
+
+fn build_table_row_block(cells: &[String], width: usize) -> Value {
+    let mut notion_cells = Vec::with_capacity(width);
+    for idx in 0..width {
+        let cell_text = cells.get(idx).map(String::as_str).unwrap_or("");
+        notion_cells.push(Value::Array(parse_inline_markdown_rich_text(cell_text)));
+    }
+    json!({
+        "object": "block",
+        "type": "table_row",
+        "table_row": {
+            "cells": notion_cells
+        }
+    })
+}
+
+fn push_list_block(
+    blocks: &mut Vec<Value>,
+    active_list_root: &mut Option<(usize, usize)>,
+    indent: usize,
+    item: Value,
+) {
+    // Notion's Append block children endpoint accepts at most 2 levels of nesting per request
+    // (top-level block + direct `children`). Items deeper than the active root are attached as
+    // children of that root so deeper levels stay siblings at the deepest permitted level.
+    if let Some((root_idx, root_indent)) = *active_list_root {
+        if indent > root_indent {
+            if let Some(root) = blocks.get_mut(root_idx) {
+                if let Some(root_type) = root
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                {
+                    if let Some(obj) = root.get_mut(&root_type).and_then(Value::as_object_mut) {
+                        let entry = obj
+                            .entry("children".to_string())
+                            .or_insert_with(|| Value::Array(Vec::new()));
+                        if let Some(arr) = entry.as_array_mut() {
+                            arr.push(item);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    blocks.push(item);
+    *active_list_root = Some((blocks.len() - 1, indent));
+}
+
 /// Parses Markdown text into Notion REST API v1 block payloads (`heading_1/2/3`, `to_do`,
-/// `bulleted_list_item`, `numbered_list_item`, `code`, `quote`, `callout`, `toggle`, `divider`, `paragraph`).
+/// `bulleted_list_item`, `numbered_list_item`, `table`, `code`, `quote`, `callout`, `toggle`, `divider`, `paragraph`).
 pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
     let mut blocks = Vec::new();
     let lines: Vec<&str> = markdown.lines().collect();
     let mut i = 0usize;
+    let mut active_list_root: Option<(usize, usize)> = None;
 
     while i < lines.len() {
         let raw = lines[i];
+        let indent = leading_indent_level(raw);
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             i += 1;
@@ -1674,6 +1789,7 @@ pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
 
         // Fenced code block ```lang
         if let Some(lang_raw) = trimmed.strip_prefix("```") {
+            active_list_root = None;
             let language = normalize_notion_code_lang(lang_raw.trim());
             i += 1;
             let mut code_lines = Vec::new();
@@ -1695,8 +1811,37 @@ pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
             continue;
         }
 
+        // GFM Markdown table: header row starting with `|` followed by separator row `| --- | --- |`
+        if trimmed.starts_with('|')
+            && i + 1 < lines.len()
+            && is_markdown_table_separator(lines[i + 1])
+        {
+            active_list_root = None;
+            let header_cells = split_markdown_table_row(trimmed);
+            let width = header_cells.len().max(1);
+            let mut rows = vec![build_table_row_block(&header_cells, width)];
+            i += 2;
+            while i < lines.len() && lines[i].trim().starts_with('|') {
+                let row_cells = split_markdown_table_row(lines[i]);
+                rows.push(build_table_row_block(&row_cells, width));
+                i += 1;
+            }
+            blocks.push(json!({
+                "object": "block",
+                "type": "table",
+                "table": {
+                    "table_width": width,
+                    "has_column_header": true,
+                    "has_row_header": false,
+                    "children": rows
+                }
+            }));
+            continue;
+        }
+
         // Divider --- or ***
         if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            active_list_root = None;
             blocks.push(json!({
                 "object": "block",
                 "type": "divider",
@@ -1708,6 +1853,7 @@ pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
 
         // Headings
         if let Some(rest) = trimmed.strip_prefix("### ") {
+            active_list_root = None;
             blocks.push(json!({
                 "object": "block",
                 "type": "heading_3",
@@ -1717,6 +1863,7 @@ pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("## ") {
+            active_list_root = None;
             blocks.push(json!({
                 "object": "block",
                 "type": "heading_2",
@@ -1726,6 +1873,7 @@ pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("# ") {
+            active_list_root = None;
             blocks.push(json!({
                 "object": "block",
                 "type": "heading_1",
@@ -1740,14 +1888,19 @@ pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
             .strip_prefix("- [ ] ")
             .or_else(|| trimmed.strip_prefix("* [ ] "))
         {
-            blocks.push(json!({
-                "object": "block",
-                "type": "to_do",
-                "to_do": {
-                    "rich_text": parse_inline_markdown_rich_text(rest.trim()),
-                    "checked": false
-                }
-            }));
+            push_list_block(
+                &mut blocks,
+                &mut active_list_root,
+                indent,
+                json!({
+                    "object": "block",
+                    "type": "to_do",
+                    "to_do": {
+                        "rich_text": parse_inline_markdown_rich_text(rest.trim()),
+                        "checked": false
+                    }
+                }),
+            );
             i += 1;
             continue;
         }
@@ -1757,14 +1910,19 @@ pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
             .or_else(|| trimmed.strip_prefix("* [x] "))
             .or_else(|| trimmed.strip_prefix("* [X] "))
         {
-            blocks.push(json!({
-                "object": "block",
-                "type": "to_do",
-                "to_do": {
-                    "rich_text": parse_inline_markdown_rich_text(rest.trim()),
-                    "checked": true
-                }
-            }));
+            push_list_block(
+                &mut blocks,
+                &mut active_list_root,
+                indent,
+                json!({
+                    "object": "block",
+                    "type": "to_do",
+                    "to_do": {
+                        "rich_text": parse_inline_markdown_rich_text(rest.trim()),
+                        "checked": true
+                    }
+                }),
+            );
             i += 1;
             continue;
         }
@@ -1774,32 +1932,43 @@ pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
         {
-            blocks.push(json!({
-                "object": "block",
-                "type": "bulleted_list_item",
-                "bulleted_list_item": {
-                    "rich_text": parse_inline_markdown_rich_text(rest.trim())
-                }
-            }));
+            push_list_block(
+                &mut blocks,
+                &mut active_list_root,
+                indent,
+                json!({
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                        "rich_text": parse_inline_markdown_rich_text(rest.trim())
+                    }
+                }),
+            );
             i += 1;
             continue;
         }
 
         // Numbered list: 1. text
         if let Some(rest) = strip_numbered_prefix(trimmed) {
-            blocks.push(json!({
-                "object": "block",
-                "type": "numbered_list_item",
-                "numbered_list_item": {
-                    "rich_text": parse_inline_markdown_rich_text(rest.trim())
-                }
-            }));
+            push_list_block(
+                &mut blocks,
+                &mut active_list_root,
+                indent,
+                json!({
+                    "object": "block",
+                    "type": "numbered_list_item",
+                    "numbered_list_item": {
+                        "rich_text": parse_inline_markdown_rich_text(rest.trim())
+                    }
+                }),
+            );
             i += 1;
             continue;
         }
 
         // Quote / Callout / Toggle: `> 💡 text`, `> ▸ toggle`, `> quote`
         if let Some(rest) = trimmed.strip_prefix("> ") {
+            active_list_root = None;
             let inner = rest.trim();
             if let Some(toggle_text) = inner.strip_prefix("▸ ") {
                 blocks.push(json!({
@@ -1839,6 +2008,7 @@ pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
                     && (url.starts_with("http://") || url.starts_with("https://"))
                     && url::Url::parse(url).is_ok()
                 {
+                    active_list_root = None;
                     let alt = &trimmed[2..mid];
                     let caption = if alt.is_empty() {
                         vec![]
@@ -1861,6 +2031,7 @@ pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
         }
 
         // Default paragraph
+        active_list_root = None;
         blocks.push(json!({
             "object": "block",
             "type": "paragraph",
@@ -2593,5 +2764,121 @@ mod tests {
             incomplete_block_ids(&blocks),
             vec!["blk-nested-missing".to_string(), "blk-top-missing".to_string()]
         );
+    }
+
+    #[test]
+    fn database_schema_preserves_relation_database_id_and_omits_it_for_other_columns() {
+        let db_json = json!({
+            "object": "database",
+            "id": "dddddddd-dddd-dddd-dddd-ddddddddddd1",
+            "url": "https://www.notion.so/db-sprint",
+            "parent": { "type": "workspace", "workspace": true },
+            "title": [{ "plain_text": "Sprint Board" }],
+            "properties": {
+                "Task Title": { "id": "title", "type": "title", "title": {} },
+                "Project": {
+                    "id": "rel",
+                    "type": "relation",
+                    "relation": {
+                        "database_id": "dddddddd-dddd-dddd-dddd-ddddddddddd2",
+                        "type": "single_property"
+                    }
+                },
+                "Priority": {
+                    "id": "sel",
+                    "type": "select",
+                    "select": { "options": [{ "id": "1", "name": "High", "color": "red" }] }
+                }
+            }
+        });
+
+        let db = parse_notion_database(&db_json, "ws-1").unwrap();
+        assert_eq!(
+            db.schema["Project"].relation_database_id.as_deref(),
+            Some("dddddddd-dddd-dddd-dddd-ddddddddddd2")
+        );
+        assert_eq!(db.schema["Priority"].relation_database_id, None);
+
+        let serialized = serde_json::to_value(&db.schema).unwrap();
+        assert_eq!(
+            serialized["Project"]["relation_database_id"],
+            "dddddddd-dddd-dddd-dddd-ddddddddddd2"
+        );
+        assert!(serialized["Priority"].get("relation_database_id").is_none());
+    }
+
+    #[test]
+    fn markdown_table_converts_to_notion_table_and_table_rows() {
+        let md = "\
+| Area | Status | Owner |
+| --- | :---: | ---: |
+| **CLI** | Ready | Alice |
+| MCP | Audit | Bob | Extra |
+| Docs | Draft |
+
+| Not a table without separator |";
+        let blocks = markdown_to_notion_blocks(md);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "table");
+        assert_eq!(blocks[0]["table"]["table_width"], 3);
+        assert_eq!(blocks[0]["table"]["has_column_header"], true);
+        let rows = blocks[0]["table"]["children"].as_array().unwrap();
+        assert_eq!(rows.len(), 4); // header + 3 body rows
+        assert_eq!(rows[0]["type"], "table_row");
+        assert_eq!(rows[0]["table_row"]["cells"][0][0]["text"]["content"], "Area");
+        assert_eq!(rows[1]["table_row"]["cells"][0][0]["text"]["content"], "CLI");
+        assert_eq!(rows[1]["table_row"]["cells"][0][0]["annotations"]["bold"], true);
+        // Truncated extra cell to width 3
+        assert_eq!(rows[2]["table_row"]["cells"].as_array().unwrap().len(), 3);
+        // Padded missing cell to width 3
+        assert_eq!(rows[3]["table_row"]["cells"].as_array().unwrap().len(), 3);
+        assert_eq!(rows[3]["table_row"]["cells"][2][0]["text"]["content"], "");
+
+        // Pipe line without separator remains paragraph
+        assert_eq!(blocks[1]["type"], "paragraph");
+    }
+
+    #[test]
+    fn markdown_nested_lists_attach_children_with_two_level_cap_and_flat_control() {
+        // Nested list (2-space and tab indentation, including depth 3 clamped to level 2 sibling)
+        let nested_md = "\
+- Top item 1
+  - Nested bullet item level 2
+    - Level 3 clamped sibling
+\t- [x] Nested checked todo
+- Top item 2";
+        let nested = markdown_to_notion_blocks(nested_md);
+        assert_eq!(nested.len(), 2);
+        assert_eq!(nested[0]["type"], "bulleted_list_item");
+        let children = nested[0]["bulleted_list_item"]["children"]
+            .as_array()
+            .unwrap();
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0]["type"], "bulleted_list_item");
+        assert_eq!(
+            children[0]["bulleted_list_item"]["rich_text"][0]["text"]["content"],
+            "Nested bullet item level 2"
+        );
+        assert!(children[0]["bulleted_list_item"].get("children").is_none());
+        assert_eq!(
+            children[1]["bulleted_list_item"]["rich_text"][0]["text"]["content"],
+            "Level 3 clamped sibling"
+        );
+        assert_eq!(children[2]["type"], "to_do");
+        assert_eq!(children[2]["to_do"]["checked"], true);
+        assert!(nested[1]["bulleted_list_item"].get("children").is_none());
+
+        // Control: flat list produces identical top-level blocks without children keys
+        let flat_md = "- Alpha\n- Beta\n1. One\n- [ ] Task";
+        let flat = markdown_to_notion_blocks(flat_md);
+        assert_eq!(flat.len(), 4);
+        assert_eq!(flat[0]["type"], "bulleted_list_item");
+        assert!(flat[0]["bulleted_list_item"].get("children").is_none());
+        assert_eq!(flat[1]["type"], "bulleted_list_item");
+        assert!(flat[1]["bulleted_list_item"].get("children").is_none());
+        assert_eq!(flat[2]["type"], "numbered_list_item");
+        assert!(flat[2]["numbered_list_item"].get("children").is_none());
+        assert_eq!(flat[3]["type"], "to_do");
+        assert!(flat[3]["to_do"].get("children").is_none());
     }
 }

@@ -26,7 +26,7 @@
 | **Minimal-Chrome TUI** | Authentic Notion editorial aesthetic (`notion`): 1-line **Breadcrumb Bar**, collapsible **Workspace Sidebar (`[`)** with Favorites & nested tree, **Centered (~88 col) / Full Width (`w`) Page Canvas**, 10 canonical Notion pill colors, live interactive **`to_do` checkboxes (`Space`/`x`)** & **`toggle` blocks**, **Database Table (`1`) / Board Kanban (`2`) / List (`3`) views**, **Comments Peek Drawer (`C`)**, **Quick Find (`Ctrl+K`)**, **Multi-Workspace Switcher (`Ctrl+S`)**, and **5 curated palettes** (`Clean Dark`, `Warm Paper`, `Tokyo Night`, `Catppuccin`, `Nord`). |
 | **High-Res Terminal Images** | Native inline image previews for Notion-hosted & external media via **Kitty Graphics**, **iTerm2**, **Sixel**, and **24-bit Truecolor Half-Block (`▀`)** fallback (`v` HD modal & `notion download`). |
 | **Local SQLite FTS5 + IPC Daemon** | Workspace-scoped SQLite WAL + FTS5 cache (`pages`, `databases`, `blocks`, `comments`, `pages_fts`) with automatic `<3`-char Korean/CJK `LIKE` fallback, plus single-instance background sync IPC daemon (`notion daemon start`). |
-| **4-in-1 Agent Interface** | Same binary powers the **Interactive TUI**, scriptable **`--json` CLI**, local **HTTP JSON API** (`notion serve`, `:8791`), and **stdio MCP server** (`notion mcp`, **19 typed tools** with `confirm: true` archive guard). |
+| **4-in-1 Agent Interface** | Same binary powers the **Interactive TUI**, scriptable **`--json` CLI**, local **HTTP JSON API** (`notion serve`, `:8791`), and **stdio MCP server** (`notion mcp`, **20 typed tools** with `confirm: true` archive guard). |
 
 ---
 
@@ -92,10 +92,11 @@ notion pages export "Q4 Launch Plan" --out launch-plan.md
 notion blocks edit <block-id> --text "Release **verified**" --json
 notion blocks toggle <block-id>
 
-# Query & create Notion database items
+# Query & create Notion database items, list workspace users
 notion db list --json
 notion db query "Q4 Roadmap" --json
 notion db create-item "Q4 Roadmap" --title "Ship v1.0" --status "In Progress"
+notion users list --json
 notion comments list "Q4 Launch Plan" --json --limit 50 --cursor <next_cursor>
 notion comments add "Q4 Launch Plan" "Green light for launch!"
 notion download <url-or-block-id> --json
@@ -107,6 +108,8 @@ notion workspaces use work
 notion daemon start
 ```
 
+**Identifier resolution & `--json` exit contract:** UUIDs and Notion URLs pass through directly with zero extra lookups. Read commands accept exact or partial titles (preferring active pages), while write commands require a single exact title match among active pages (use `--unarchive` with a page ID or URL if an archived page is not in the local cache; pass a page ID or URL whenever duplicate or newly-created external titles may exist). Runtime failures under `--json` exit `1` and print `{"ok":false,"error":{"code":"...","message":"..."}}` to stdout (with `details.candidates` for ambiguous/missing titles); argument usage errors exit `2` with stderr usage text and empty stdout. On `--json`, treat exit `0` (and not `ok: false`) as success—some commands omit a top-level `ok` field, and `doctor --online --json` reports probe failures inside `online_probe.ok`.
+
 ### Local HTTP JSON API (`notion serve`)
 
 ```bash
@@ -116,7 +119,7 @@ curl -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:8791/api/v1/search?
 
 Full endpoint catalog and OpenAPI schema: **[docs/API.md](docs/API.md)** · **[docs/openapi.yaml](docs/openapi.yaml)**.
 
-### MCP Server (`notion mcp` — 19 Tools)
+### MCP Server (`notion mcp` — 20 Tools)
 
 ```json
 {

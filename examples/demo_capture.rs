@@ -655,6 +655,7 @@ fn build_demo_state() -> (AppState, UiState) {
             name: "Name".into(),
             prop_type: "title".into(),
             options: vec![],
+            relation_database_id: None,
         },
     );
     schema.insert(
@@ -669,6 +670,7 @@ fn build_demo_state() -> (AppState, UiState) {
                 opt("In Review", NotionColor::Purple),
                 opt("Done", NotionColor::Green),
             ],
+            relation_database_id: None,
         },
     );
     schema.insert(
@@ -682,6 +684,7 @@ fn build_demo_state() -> (AppState, UiState) {
                 opt("P1 Med", NotionColor::Orange),
                 opt("P2 Low", NotionColor::Yellow),
             ],
+            relation_database_id: None,
         },
     );
     schema.insert(
@@ -696,6 +699,7 @@ fn build_demo_state() -> (AppState, UiState) {
                 opt("API", NotionColor::Green),
                 opt("MCP", NotionColor::Pink),
             ],
+            relation_database_id: None,
         },
     );
     schema.insert(
@@ -705,6 +709,7 @@ fn build_demo_state() -> (AppState, UiState) {
             name: "Owner".into(),
             prop_type: "people".into(),
             options: vec![],
+            relation_database_id: None,
         },
     );
 

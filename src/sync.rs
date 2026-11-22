@@ -245,6 +245,17 @@ pub(crate) async fn sync_workspace_tree_summaries(
         .map(|(tree, _)| tree)
 }
 
+fn workspace_complete_key(workspace_id: &str) -> String {
+    format!("workspace-complete:{workspace_id}")
+}
+
+/// Returns true only after a full workspace sync has completed for `workspace_id`.
+pub fn workspace_cache_complete(storage: &Storage, workspace_id: &str) -> bool {
+    storage
+        .get_sync_cursor(&workspace_complete_key(workspace_id))
+        .is_some()
+}
+
 async fn sync_workspace_tree_summaries_with_options<F>(
     client: &NotionClient,
     storage: &Storage,
@@ -256,7 +267,7 @@ where
 {
     let workspace_id = client.auth().active_workspace_id().await;
     let scope_key = format!("workspace:{workspace_id}");
-    let complete_key = format!("workspace-complete:{workspace_id}");
+    let complete_key = workspace_complete_key(&workspace_id);
 
     let (stored_wm, complete) = {
         let st_wm = storage.clone();

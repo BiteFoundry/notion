@@ -856,15 +856,28 @@ async fn e2e_cli_hyphen_inputs_and_flags_against_mock_server() {
         .route(
             "/v1/pages/{id}",
             get(|AxumPath(id): AxumPath<String>| async move {
+                let (parent, properties) = if id == "10000000-0000-0000-0000-000000000010" {
+                    (
+                        json!({ "type": "workspace", "workspace": true }),
+                        json!({
+                            "title": { "type": "title", "title": [{ "plain_text": "Page 1" }] }
+                        }),
+                    )
+                } else {
+                    (
+                        json!({ "type": "database_id", "database_id": "db-1" }),
+                        json!({
+                            "Name": { "type": "title", "title": [{ "plain_text": "Row 1" }] }
+                        }),
+                    )
+                };
                 Json(json!({
                     "object": "page",
                     "id": id,
                     "url": format!("https://www.notion.so/{id}"),
-                    "parent": { "type": "database_id", "database_id": "db-1" },
+                    "parent": parent,
                     "archived": false,
-                    "properties": {
-                        "Name": { "type": "title", "title": [{ "plain_text": "Row 1" }] }
-                    }
+                    "properties": properties
                 }))
             })
             .patch(
@@ -2964,6 +2977,152 @@ async fn regression_notion_bug_08_hyphen_w_text_and_status_values() {
         .unwrap();
     assert!(!bad_out.status.success());
     assert!(state.take().is_empty());
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_pages_create_chunks_over_100_blocks_and_single_post_under_100() {
+    let state = CliMockState::default();
+    let app = Router::new()
+        .route(
+            "/v1/pages",
+            post(|State(st): State<CliMockState>, Json(body): Json<Value>| async move {
+                let count = body
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if count > 100 {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "object": "error",
+                            "status": 400,
+                            "code": "validation_error",
+                            "message": "body.children.length should be <= 100"
+                        })),
+                    )
+                        .into_response();
+                }
+                st.requests.lock().unwrap().push(RecordedWrite {
+                    method: "POST".into(),
+                    path: "/v1/pages".into(),
+                    body: body.clone(),
+                });
+                Json(json!({
+                    "object": "page",
+                    "id": "50000000-0000-0000-0000-000000000105",
+                    "url": "https://www.notion.so/50000000000000000000000000000105",
+                    "parent": body.get("parent").cloned().unwrap_or_else(|| json!({"type":"workspace"})),
+                    "archived": false,
+                    "properties": body.get("properties").cloned().unwrap_or_else(|| json!({}))
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/blocks/{id}/children",
+            patch(
+                |State(st): State<CliMockState>,
+                 AxumPath(id): AxumPath<String>,
+                 Json(body): Json<Value>| async move {
+                    st.requests.lock().unwrap().push(RecordedWrite {
+                        method: "PATCH".into(),
+                        path: format!("/v1/blocks/{id}/children"),
+                        body: body.clone(),
+                    });
+                    let mut created = Vec::new();
+                    if let Some(children) = body.get("children").and_then(Value::as_array) {
+                        for (i, ch) in children.iter().enumerate() {
+                            let mut blk = ch.clone();
+                            blk["id"] = json!(format!("blk-overflow-{i}"));
+                            blk["has_children"] = json!(false);
+                            created.push(blk);
+                        }
+                    }
+                    Json(json!({ "object": "list", "results": created }))
+                },
+            ),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_dir = tmp.path().join("cfg");
+    let data_dir = tmp.path().join("data");
+    let parent_uuid = "50000000-0000-0000-0000-000000000001";
+
+    // 105-block file -> POST(100) + PATCH(5)
+    let file_105 = tmp.path().join("105_blocks.md");
+    let content_105: String = (1..=105)
+        .map(|i| format!("Line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&file_105, &content_105).unwrap();
+
+    let out = notion_cli_cmd(&base_url, &cfg_dir, &data_dir)
+        .args([
+            "pages",
+            "create",
+            "--parent",
+            parent_uuid,
+            "--title",
+            "105 Blocks Page",
+            "--file",
+            file_105.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let reqs = state.take();
+    assert_eq!(reqs.len(), 2, "expected POST(100) + PATCH(5), got: {reqs:?}");
+    assert_eq!(reqs[0].method, "POST");
+    assert_eq!(reqs[0].path, "/v1/pages");
+    assert_eq!(reqs[0].body["children"].as_array().unwrap().len(), 100);
+    assert_eq!(reqs[1].method, "PATCH");
+    assert_eq!(
+        reqs[1].path,
+        "/v1/blocks/50000000-0000-0000-0000-000000000105/children"
+    );
+    assert_eq!(reqs[1].body["children"].as_array().unwrap().len(), 5);
+
+    // Control: 13-block file -> single POST(13)
+    let file_13 = tmp.path().join("13_blocks.md");
+    let content_13: String = (1..=13)
+        .map(|i| format!("Short line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&file_13, &content_13).unwrap();
+
+    let out13 = notion_cli_cmd(&base_url, &cfg_dir, &data_dir)
+        .args([
+            "pages",
+            "create",
+            "--parent",
+            parent_uuid,
+            "--title",
+            "13 Blocks Page",
+            "--file",
+            file_13.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(out13.status.success(), "{}", String::from_utf8_lossy(&out13.stderr));
+    let reqs13 = state.take();
+    assert_eq!(reqs13.len(), 1);
+    assert_eq!(reqs13[0].method, "POST");
+    assert_eq!(reqs13[0].body["children"].as_array().unwrap().len(), 13);
 
     server.abort();
 }

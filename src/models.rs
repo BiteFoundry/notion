@@ -221,6 +221,8 @@ pub struct NotionPropertySchema {
     pub name: String,
     pub prop_type: String,
     pub options: Vec<SelectOption>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relation_database_id: Option<String>,
 }
 
 /// Notion Page metadata + properties.
@@ -901,6 +903,44 @@ pub fn plain_rich_text_json(text: &str) -> Value {
         "type": "text",
         "text": { "content": text }
     }])
+}
+
+/// Structured application error carrying a machine-readable code and optional details.
+#[derive(Debug, Clone)]
+pub struct CodedError {
+    pub code: &'static str,
+    pub message: String,
+    pub details: Option<Value>,
+}
+
+impl std::fmt::Display for CodedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CodedError {}
+
+pub fn coded(code: &'static str, msg: impl Into<String>) -> anyhow::Error {
+    CodedError {
+        code,
+        message: msg.into(),
+        details: None,
+    }
+    .into()
+}
+
+pub fn coded_with_details(
+    code: &'static str,
+    msg: impl Into<String>,
+    details: Value,
+) -> anyhow::Error {
+    CodedError {
+        code,
+        message: msg.into(),
+        details: Some(details),
+    }
+    .into()
 }
 
 #[cfg(test)]

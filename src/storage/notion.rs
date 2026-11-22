@@ -29,6 +29,23 @@ pub(crate) struct CommentsSummary {
     pub error: Option<String>,
 }
 
+fn cacheable_synced_edited_time(last_edited_time: Option<&str>) -> Option<&str> {
+    let ts = last_edited_time?.trim();
+    if ts.is_empty() {
+        return None;
+    }
+    if let Ok(edited) = chrono::DateTime::parse_from_rfc3339(ts) {
+        let age_secs = chrono::Utc::now()
+            .signed_duration_since(edited.with_timezone(&chrono::Utc))
+            .num_seconds()
+            .abs();
+        if age_secs <= 90 {
+            return None;
+        }
+    }
+    Some(ts)
+}
+
 impl Storage {
     pub fn upsert_workspace(&self, profile: &WorkspaceProfile) -> Result<()> {
         let conn = self.writer();
@@ -148,10 +165,7 @@ impl Storage {
         let tx = conn.transaction()?;
         upsert_page_in_tx(&tx, page)?;
         replace_page_blocks_in_tx(&tx, &page.workspace_id, &page.id, blocks)?;
-        let body_synced = page
-            .last_edited_time
-            .as_deref()
-            .filter(|s| !s.trim().is_empty());
+        let body_synced = cacheable_synced_edited_time(page.last_edited_time.as_deref());
         tx.execute(
             "UPDATE pages SET body_synced_edited_time = ?1 WHERE workspace_id = ?2 AND id = ?3",
             params![body_synced, page.workspace_id, page.id],
@@ -270,11 +284,11 @@ impl Storage {
                 params![comments_fetched, detail.page.workspace_id, detail.page.id],
             )?;
         }
-        let synced_edited = detail
-            .page
-            .last_edited_time
-            .as_deref()
-            .filter(|s| !s.trim().is_empty() && detail.comments_error.is_none());
+        let synced_edited = if detail.comments_error.is_none() {
+            cacheable_synced_edited_time(detail.page.last_edited_time.as_deref())
+        } else {
+            None
+        };
         tx.execute(
             "UPDATE pages SET detail_synced_edited_time = ?1, comments_error = ?2
              WHERE workspace_id = ?3 AND id = ?4",
@@ -620,6 +634,19 @@ impl Storage {
     pub fn load_page_blocks(&self, workspace_id: &str, page_id: &str) -> Result<Vec<NotionBlock>> {
         let conn = self.reader();
         load_page_blocks(&conn, workspace_id, page_id)
+    }
+
+    pub(crate) fn has_cached_block(&self, workspace_id: &str, block_id: &str) -> bool {
+        let conn = self.reader();
+        conn.query_row(
+            "SELECT 1 FROM blocks WHERE workspace_id = ?1 AND id = ?2 LIMIT 1",
+            params![workspace_id, block_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
     }
 
     pub(crate) fn load_cached_children(
