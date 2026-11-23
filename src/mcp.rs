@@ -163,7 +163,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "list_users",
-            "description": "List Notion workspace users with their IDs, names, types, and emails.",
+            "description": "List Notion workspace users with their IDs, names, types, and emails. Cost: reads every user on each call, one request per 100 users.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -174,7 +174,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "search_pages",
-            "description": "Search Notion pages and databases using local SQLite FTS5 (with Korean <3 char LIKE fallback) or remote Notion Search API.",
+            "description": "Search Notion pages and databases using local SQLite FTS5 (with Korean <3 char LIKE fallback) or remote Notion Search API. Cost: no network request when the synced local cache has hits; remote:true, or an empty or unsynced cache, calls Notion search.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
@@ -188,7 +188,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_page",
-            "description": "Fetch a Notion page. Compact by default: id, title, last_edited_time, Markdown, incomplete_blocks, comments_state, omitted counts and a hint; compact never requests comments and reports only what the cache knows. Pass compact:false for properties, block tree, comments and media. Full details carry up to 2000 comments; use list_comments with cursor for the rest.",
+            "description": "Fetch a Notion page. Compact by default: id, title, last_edited_time, Markdown, incomplete_blocks, comments_state, omitted counts and a hint; compact never requests comments and reports only what the cache knows. Pass compact:false for properties, block tree, comments and media. Full details carry up to 2000 comments; use list_comments with cursor for the rest. Cost: one page request; the block tree (one request per 100 blocks plus one per block with children) is fetched only when the page changed, is not cached, or refresh:true. compact:false also fetches comments.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
@@ -202,7 +202,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_page_blocks",
-            "description": "List the recursive block tree for a Notion page or block ID. Offline reads report a cache miss when no children have been fetched. Returns has_more/next_cursor and incomplete_blocks.",
+            "description": "List the recursive block tree for a Notion page or block ID. Offline reads report a cache miss when no children have been fetched. Returns has_more/next_cursor and incomplete_blocks. Cost: one request per 100 blocks plus one per block with children; use limit and cursor on long pages. offline:true makes none.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
@@ -216,7 +216,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "create_page",
-            "description": "Create a new Notion page under a parent page or database from Markdown content.",
+            "description": "Create a new Notion page under a parent page or database from Markdown content. Cost: one write request per 100 blocks.",
             "inputSchema": {
                 "type": "object",
                 "required": ["parent_id", "title"],
@@ -246,7 +246,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "append_blocks",
-            "description": "Append Markdown or slash-style blocks (/h1, /todo, /callout, /code, /quote, /toggle) to a Notion page or block. Returns compact {ok, appended, block_ids} by default; pass compact:false for full block objects.",
+            "description": "Append Markdown or slash-style blocks (/h1, /todo, /callout, /code, /quote, /toggle) to a Notion page or block. Returns compact {ok, appended, block_ids} by default; pass compact:false for full block objects. Cost: one write request per 100 blocks, then a read of the target's block tree to refresh the cache.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page", "markdown"],
@@ -298,7 +298,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "list_databases",
-            "description": "List accessible Notion databases with schemas.",
+            "description": "List accessible Notion databases with schemas. Cost: served from the cache once the workspace has synced; refresh:true or an unsynced cache runs a workspace sync.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -311,7 +311,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "query_database",
-            "description": "Query rows of a Notion database with optional Notion API JSON filter and sorts. filter and sorts are rejected with offline:true.",
+            "description": "Query rows of a Notion database with optional Notion API JSON filter and sorts. filter and sorts are rejected with offline:true. Cost: one request per 100 rows up to limit; offline:true makes none.",
             "inputSchema": {
                 "type": "object",
                 "required": ["database"],
@@ -356,7 +356,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "list_comments",
-            "description": "List comments on a Notion page. With offline:true, comments that were never fetched are a tool error.",
+            "description": "List comments on a Notion page. With offline:true, comments that were never fetched are a tool error. Cost: one request per 100 comments unless offline:true.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
@@ -383,7 +383,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "download_media",
-            "description": "Download a Notion-hosted or external media URL or image/file/pdf block ID to local disk.",
+            "description": "Download a Notion-hosted or external media URL or image/file/pdf block ID to local disk. Cost: downloads the whole file to disk; large files take proportionally longer.",
             "inputSchema": {
                 "type": "object",
                 "required": ["target"],
@@ -395,11 +395,11 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "sync_now",
-            "description": "Synchronize Notion workspace pages and databases into the local SQLite WAL + FTS5 cache immediately. Streams every search batch into the cache; returns fetched_count and complete.",
+            "description": "Synchronize Notion workspace pages and databases into the local SQLite WAL + FTS5 cache immediately. Streams every search batch into the cache; returns fetched_count, complete and full. Cost: one Notion search request per 100 objects. Incremental by default and usually 1-2 requests; full:true rescans the whole workspace and can take minutes on large workspaces.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "full": { "type": "boolean", "default": false, "description": "true rescans the whole workspace instead of stopping at the last sync point; slower, finds pages older than the last sync" }
+                    "full": { "type": "boolean", "default": false, "description": "Rescan the whole workspace, ignoring the incremental watermark. Slow on large workspaces; use only when a page shared long ago is missing." }
                 }
             }
         }),
@@ -731,6 +731,31 @@ mod tests {
             "sync_now",
         ] {
             assert!(names.contains(&expected), "Missing MCP tool: {expected}");
+        }
+        for costed in [
+            "sync_now",
+            "get_page",
+            "get_page_blocks",
+            "search_pages",
+            "query_database",
+            "list_databases",
+            "list_users",
+            "list_comments",
+            "create_page",
+            "append_blocks",
+            "download_media",
+        ] {
+            let tool = tools.iter().find(|t| t["name"] == costed).unwrap();
+            assert!(
+                tool["description"].as_str().unwrap().contains("Cost:"),
+                "{costed} must state its request cost"
+            );
+        }
+        let sync_now = tools.iter().find(|t| t["name"] == "sync_now").unwrap();
+        assert_eq!(sync_now["inputSchema"]["properties"]["full"]["type"], "boolean");
+        for tool in &tools {
+            let len = tool["description"].as_str().unwrap_or("").chars().count();
+            assert!(len < 600, "{} description is {len} characters", tool["name"]);
         }
         for tool in &tools {
             let desc = tool["description"].as_str().unwrap_or("");
