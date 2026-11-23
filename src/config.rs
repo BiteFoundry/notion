@@ -220,8 +220,50 @@ impl WorkspaceProfile {
     }
 }
 
+/// A field value that came from an environment variable or a command-line flag, kept next to
+/// the value the config file holds so that saving does not write the override into the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Overridden<T> {
+    applied: T,
+    persisted: T,
+}
+
+impl<T: Clone + PartialEq> Overridden<T> {
+    /// Replaces `field` with `applied` and remembers what the file held.
+    fn apply(slot: &mut Option<Self>, field: &mut T, applied: T) {
+        // A second override of the same field keeps the first persisted value.
+        let persisted = match slot.take() {
+            Some(earlier) if earlier.applied == *field => earlier.persisted,
+            _ => field.clone(),
+        };
+        *field = applied.clone();
+        *slot = Some(Self { applied, persisted });
+    }
+
+    /// Puts the file's value back unless the field was changed after the override.
+    fn restore(slot: &Option<Self>, field: &mut T) {
+        if let Some(overridden) = slot {
+            if *field == overridden.applied {
+                *field = overridden.persisted.clone();
+            }
+        }
+    }
+}
+
+/// Per-run overrides of [`AppConfig`] fields. Never written to the config file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransientOverrides {
+    active_workspace: Option<Overridden<String>>,
+    api_base_url: Option<Overridden<String>>,
+    oauth_client_id: Option<Overridden<String>>,
+    github_repo: Option<Overridden<String>>,
+    cli_cache_ttl_secs: Option<Overridden<u64>>,
+    auto_daemon: Option<Overridden<bool>>,
+    image_protocol: Option<Overridden<ImageProtocolPreference>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default = "AppConfig::file_defaults")]
 pub struct AppConfig {
     /// Active workspace profile slug.
     pub active_workspace: String,
@@ -259,76 +301,122 @@ pub struct AppConfig {
     pub density: DensityMode,
     /// TUI color theme preset.
     pub theme: ThemePreset,
+    /// Values overridden for this run by environment variables or `--workspace`.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub transient: TransientOverrides,
 }
 
 impl Default for AppConfig {
+    /// The defaults with the process environment's overrides applied, as [`AppConfig::load`]
+    /// gives when there is no config file.
     fn default() -> Self {
+        let mut cfg = Self::file_defaults();
+        cfg.apply_env(&process_env);
+        cfg
+    }
+}
+
+impl AppConfig {
+    /// The value of every field a config file does not set. Reads no environment variable.
+    fn file_defaults() -> Self {
         Self {
-            active_workspace: first_non_empty_env(&["NOTION_WORKSPACE"])
-                .unwrap_or_else(|| "default".to_string()),
+            active_workspace: "default".to_string(),
             workspaces: Vec::new(),
-            api_base_url: first_non_empty_env(&["NOTION_API_BASE_URL"])
-                .unwrap_or_else(|| DEFAULT_NOTION_API_BASE_URL.to_string()),
-            oauth_client_id: first_non_empty_env(&["NOTION_OAUTH_CLIENT_ID"]).unwrap_or_default(),
-            github_repo: first_non_empty_env(&["NOTION_GITHUB_REPO"])
-                .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_string()),
+            api_base_url: DEFAULT_NOTION_API_BASE_URL.to_string(),
+            oauth_client_id: String::new(),
+            github_repo: DEFAULT_GITHUB_REPO.to_string(),
             notify: true,
             show_sidebar: true,
             page_width: PageWidthMode::Centered,
             inline_images: true,
             show_inline_hrefs: false,
-            image_protocol: first_non_empty_env(&["NOTION_IMAGE_PROTOCOL"])
-                .and_then(|s| ImageProtocolPreference::parse_str(&s))
-                .unwrap_or_default(),
+            image_protocol: ImageProtocolPreference::default(),
             download_dir: String::new(),
             active_poll_ms: DEFAULT_ACTIVE_POLL_MS,
             sync_poll_ms: DEFAULT_SYNC_POLL_MS,
-            cli_cache_ttl_secs: std::env::var("NOTION_CLI_CACHE_SECS")
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0),
-            auto_daemon: std::env::var("NOTION_AUTO_DAEMON")
-                .ok()
-                .and_then(|s| parse_env_bool(&s))
-                .unwrap_or(false),
+            cli_cache_ttl_secs: 0,
+            auto_daemon: false,
             density: DensityMode::default(),
             theme: ThemePreset::default(),
+            transient: TransientOverrides::default(),
         }
     }
-}
 
-impl AppConfig {
+    /// Loads the config file and applies the environment's overrides for this run.
     pub fn load() -> Self {
-        let Ok(mut cfg) = Self::load_from(&config_file_path()) else {
-            return Self::default();
+        Self::load_with(&config_file_path(), process_env)
+    }
+
+    /// [`AppConfig::load`] with the file and the environment reader given. A file that is
+    /// missing or does not parse counts as empty; the overrides apply either way.
+    pub fn load_with(path: &Path, env: impl Fn(&str) -> Option<String>) -> Self {
+        let mut cfg = Self::load_from(path).unwrap_or_else(|_| Self::file_defaults());
+        cfg.apply_env(&env);
+        cfg
+    }
+
+    fn apply_env(&mut self, env: &dyn Fn(&str) -> Option<String>) {
+        let non_empty = |key: &str| {
+            env(key)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
         };
-        if let Some(ws) = first_non_empty_env(&["NOTION_WORKSPACE"]) {
-            cfg.active_workspace = ws;
+        let transient = &mut self.transient;
+        if let Some(ws) = non_empty("NOTION_WORKSPACE") {
+            Overridden::apply(&mut transient.active_workspace, &mut self.active_workspace, ws);
         }
-        if let Some(url) = first_non_empty_env(&["NOTION_API_BASE_URL"]) {
-            cfg.api_base_url = url;
+        if let Some(url) = non_empty("NOTION_API_BASE_URL") {
+            Overridden::apply(&mut transient.api_base_url, &mut self.api_base_url, url);
         }
-        if let Some(cid) = first_non_empty_env(&["NOTION_OAUTH_CLIENT_ID"]) {
-            cfg.oauth_client_id = cid;
+        if let Some(cid) = non_empty("NOTION_OAUTH_CLIENT_ID") {
+            Overridden::apply(&mut transient.oauth_client_id, &mut self.oauth_client_id, cid);
         }
-        if let Some(repo) = first_non_empty_env(&["NOTION_GITHUB_REPO"]) {
-            cfg.github_repo = repo;
+        if let Some(repo) = non_empty("NOTION_GITHUB_REPO") {
+            Overridden::apply(&mut transient.github_repo, &mut self.github_repo, repo);
         }
-        if let Ok(ttl) = std::env::var("NOTION_CLI_CACHE_SECS") {
-            if let Ok(parsed) = ttl.trim().parse::<u64>() {
-                cfg.cli_cache_ttl_secs = parsed;
-            }
+        if let Some(ttl) = env("NOTION_CLI_CACHE_SECS").and_then(|s| s.trim().parse::<u64>().ok()) {
+            Overridden::apply(&mut transient.cli_cache_ttl_secs, &mut self.cli_cache_ttl_secs, ttl);
         }
-        if let Ok(ad) = std::env::var("NOTION_AUTO_DAEMON") {
-            if let Some(parsed) = parse_env_bool(&ad) {
-                cfg.auto_daemon = parsed;
-            }
+        if let Some(auto) = env("NOTION_AUTO_DAEMON").and_then(|s| parse_env_bool(&s)) {
+            Overridden::apply(&mut transient.auto_daemon, &mut self.auto_daemon, auto);
         }
-        if let Some(proto) = first_non_empty_env(&["NOTION_IMAGE_PROTOCOL"]) {
-            if let Some(parsed) = ImageProtocolPreference::parse_str(&proto) {
-                cfg.image_protocol = parsed;
-            }
+        if let Some(proto) =
+            non_empty("NOTION_IMAGE_PROTOCOL").and_then(|s| ImageProtocolPreference::parse_str(&s))
+        {
+            Overridden::apply(&mut transient.image_protocol, &mut self.image_protocol, proto);
         }
+    }
+
+    /// Uses `name` as the active workspace for this run only (`--workspace`). Saving the config
+    /// keeps the file's own active workspace.
+    pub fn override_workspace(&mut self, name: impl Into<String>) {
+        Overridden::apply(
+            &mut self.transient.active_workspace,
+            &mut self.active_workspace,
+            name.into(),
+        );
+    }
+
+    /// Makes `name` the active workspace for good: the next save writes it, even when it is
+    /// the same name a run-only override gave.
+    pub fn set_active_workspace(&mut self, name: impl Into<String>) {
+        self.active_workspace = name.into();
+        self.transient.active_workspace = None;
+    }
+
+    /// The config as the file should hold it: overridden fields are back at the file's value
+    /// unless they were changed after the override.
+    fn persisted(&self) -> Self {
+        let mut cfg = self.clone();
+        let t = &self.transient;
+        Overridden::restore(&t.active_workspace, &mut cfg.active_workspace);
+        Overridden::restore(&t.api_base_url, &mut cfg.api_base_url);
+        Overridden::restore(&t.oauth_client_id, &mut cfg.oauth_client_id);
+        Overridden::restore(&t.github_repo, &mut cfg.github_repo);
+        Overridden::restore(&t.cli_cache_ttl_secs, &mut cfg.cli_cache_ttl_secs);
+        Overridden::restore(&t.auto_daemon, &mut cfg.auto_daemon);
+        Overridden::restore(&t.image_protocol, &mut cfg.image_protocol);
         cfg
     }
 
@@ -345,7 +433,7 @@ impl AppConfig {
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
         ensure_parent(path)?;
-        let raw = toml::to_string_pretty(self).context("Failed to serialize config")?;
+        let raw = toml::to_string_pretty(&self.persisted()).context("Failed to serialize config")?;
         write_atomic(path, raw.as_bytes())
     }
 
@@ -411,7 +499,7 @@ impl AppConfig {
             self.workspaces.push(profile.clone());
         }
         if make_active || self.active_workspace.trim().is_empty() {
-            self.active_workspace = profile.name;
+            self.set_active_workspace(profile.name);
         }
     }
 
@@ -420,11 +508,12 @@ impl AppConfig {
         self.workspaces
             .retain(|w| !w.name.eq_ignore_ascii_case(name.trim()));
         if self.active_workspace.eq_ignore_ascii_case(name.trim()) {
-            self.active_workspace = self
+            let next = self
                 .workspaces
                 .first()
                 .map(|w| w.name.clone())
                 .unwrap_or_else(|| "default".to_string());
+            self.set_active_workspace(next);
         }
         self.workspaces.len() != before
     }
@@ -644,6 +733,10 @@ impl DraftStore {
     }
 }
 
+fn process_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
 fn first_non_empty_env(keys: &[&str]) -> Option<String> {
     for &key in keys {
         if let Ok(val) = std::env::var(key) {
@@ -760,6 +853,119 @@ mod tests {
         assert_eq!(loaded.page_width, PageWidthMode::Full);
         assert_eq!(loaded.theme, ThemePreset::WarmPaper);
         assert_eq!(loaded.find_workspace("Acme HQ").unwrap().name, "acme");
+    }
+
+    fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| vars.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string())
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn env_overrides_apply_without_a_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = AppConfig::load_with(
+            &path,
+            env_of(&[
+                ("NOTION_API_BASE_URL", " http://127.0.0.1:9000/v1 "),
+                ("NOTION_WORKSPACE", "ci"),
+                ("NOTION_CLI_CACHE_SECS", "30"),
+                ("NOTION_AUTO_DAEMON", "true"),
+                ("NOTION_IMAGE_PROTOCOL", "halfblock"),
+            ]),
+        );
+        assert_eq!(cfg.api_base_url, "http://127.0.0.1:9000/v1");
+        assert_eq!(cfg.active_workspace, "ci");
+        assert_eq!(cfg.cli_cache_ttl_secs, 30);
+        assert!(cfg.auto_daemon);
+        assert_eq!(cfg.image_protocol, ImageProtocolPreference::parse_str("halfblock").unwrap());
+
+        // Saving the first config of a fresh install must not turn the overrides into settings.
+        cfg.save_to(&path).unwrap();
+        let reloaded = AppConfig::load_with(&path, no_env);
+        assert_eq!(reloaded.api_base_url, DEFAULT_NOTION_API_BASE_URL);
+        assert_eq!(reloaded.active_workspace, "default");
+        assert_eq!(reloaded.cli_cache_ttl_secs, 0);
+        assert!(!reloaded.auto_daemon);
+        assert_eq!(reloaded.image_protocol, ImageProtocolPreference::default());
+
+        // Unusable values are ignored, as before.
+        let ignored = AppConfig::load_with(
+            &dir.path().join("none.toml"),
+            env_of(&[("NOTION_WORKSPACE", "  "), ("NOTION_CLI_CACHE_SECS", "soon")]),
+        );
+        assert_eq!(ignored.active_workspace, "default");
+        assert_eq!(ignored.cli_cache_ttl_secs, 0);
+    }
+
+    #[test]
+    fn overrides_are_not_saved_but_deliberate_changes_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "active_workspace = \"home\"\noauth_client_id = \"file-client\"\ngithub_repo = \"me/fork\"\n",
+        )
+        .unwrap();
+        let env = [
+            ("NOTION_WORKSPACE", "ci"),
+            ("NOTION_OAUTH_CLIENT_ID", "env-client"),
+            ("NOTION_GITHUB_REPO", "ci/repo"),
+        ];
+
+        // Saved while overridden (a TUI preference toggle, say): the file keeps its own values.
+        let mut cfg = AppConfig::load_with(&path, env_of(&env));
+        assert_eq!(cfg.active_workspace, "ci");
+        cfg.notify = false;
+        cfg.save_to(&path).unwrap();
+        let reloaded = AppConfig::load_with(&path, no_env);
+        assert_eq!(reloaded.active_workspace, "home");
+        assert_eq!(reloaded.oauth_client_id, "file-client");
+        assert_eq!(reloaded.github_repo, "me/fork");
+        assert!(!reloaded.notify, "the real change is saved");
+
+        // A field changed after the override is saved.
+        let mut cfg = AppConfig::load_with(&path, env_of(&env));
+        cfg.active_workspace = "other".into();
+        cfg.save_to(&path).unwrap();
+        assert_eq!(AppConfig::load_with(&path, no_env).active_workspace, "other");
+
+        // --workspace is an override too, on top of the environment's.
+        let mut cfg = AppConfig::load_with(&path, env_of(&env));
+        cfg.override_workspace("flag");
+        assert_eq!(cfg.active_workspace, "flag");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(AppConfig::load_with(&path, no_env).active_workspace, "other");
+
+        // Choosing the overridden name on purpose makes it the saved one.
+        let mut cfg = AppConfig::load_with(&path, env_of(&env));
+        cfg.set_active_workspace("ci");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(AppConfig::load_with(&path, no_env).active_workspace, "ci");
+
+        let mut cfg = AppConfig::load_with(&path, no_env);
+        cfg.override_workspace("fresh");
+        cfg.upsert_workspace(
+            WorkspaceProfile { name: "fresh".into(), ..WorkspaceProfile::default() },
+            true,
+        );
+        cfg.save_to(&path).unwrap();
+        assert_eq!(AppConfig::load_with(&path, no_env).active_workspace, "fresh");
+    }
+
+    #[test]
+    fn save_without_overrides_writes_every_field_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = AppConfig::load_with(&path, no_env);
+        cfg.active_workspace = "home".into();
+        cfg.cli_cache_ttl_secs = 12;
+        cfg.save_to(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), toml::to_string_pretty(&cfg).unwrap());
+        assert_eq!(AppConfig::load_with(&path, no_env), cfg);
     }
 
     #[test]

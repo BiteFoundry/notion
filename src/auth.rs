@@ -130,7 +130,8 @@ struct CredentialFileStore {
 #[derive(Clone)]
 pub struct AuthManager {
     config: Arc<RwLock<AppConfig>>,
-    active_workspace_override: Option<String>,
+    /// The `--workspace` given at launch. Shared by clones and cleared by a workspace switch.
+    active_workspace_override: Arc<std::sync::RwLock<Option<String>>>,
     http: reqwest::Client,
     cached_cred: Arc<RwLock<Option<StoredCredential>>>,
     ephemeral: bool,
@@ -147,7 +148,7 @@ impl AuthManager {
         };
         Ok(Self {
             config: Arc::new(RwLock::new(config)),
-            active_workspace_override: workspace_override,
+            active_workspace_override: Arc::new(std::sync::RwLock::new(workspace_override)),
             http,
             cached_cred: Arc::new(RwLock::new(loaded)),
             ephemeral: false,
@@ -171,47 +172,72 @@ impl AuthManager {
         };
         Self {
             config: Arc::new(RwLock::new(config)),
-            active_workspace_override: None,
+            active_workspace_override: Arc::default(),
             http,
             cached_cred: Arc::new(RwLock::new(Some(cred))),
             ephemeral: true,
         }
     }
 
-    pub async fn active_workspace_name(&self) -> String {
-        let cfg = self.config.read().await;
-        cfg.effective_workspace_name(self.active_workspace_override.as_deref())
+    fn workspace_override(&self) -> Option<String> {
+        self.active_workspace_override
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
+    /// The `NOTION_TOKEN` that takes precedence over the saved login, if one is set.
+    fn env_token(&self) -> Option<String> {
+        if self.ephemeral {
+            return None;
+        }
+        std::env::var("NOTION_TOKEN")
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+    }
+
+    pub async fn active_workspace_name(&self) -> String {
+        let cfg = self.config.read().await;
+        cfg.effective_workspace_name(self.workspace_override().as_deref())
+    }
+
+    /// The ID the local cache is partitioned by.
+    ///
+    /// A `NOTION_TOKEN` that differs from the saved login's token may belong to another
+    /// workspace, so it gets a partition of its own, named by a hash of the token. Without a
+    /// saved login, or with the same token, the ID is the saved or profile one.
     pub async fn active_workspace_id(&self) -> String {
+        let env_token = self.env_token();
         if let Some(cred) = self.cached_cred.read().await.as_ref() {
+            if let Some(token) = env_token.as_deref().filter(|token| *token != cred.access_token) {
+                return env_token_partition(token);
+            }
             if !cred.workspace_id.trim().is_empty() {
                 return cred.workspace_id.clone();
             }
         }
         let cfg = self.config.read().await;
-        let name = cfg.effective_workspace_name(self.active_workspace_override.as_deref());
+        let name = cfg.effective_workspace_name(self.workspace_override().as_deref());
         cfg.find_workspace(&name)
             .map(|p| p.effective_workspace_id().to_string())
             .unwrap_or(name)
     }
 
     pub async fn current_credential(&self) -> Option<StoredCredential> {
-        if let Ok(env_tok) = std::env::var("NOTION_TOKEN") {
-            let trimmed = env_tok.trim();
-            if !trimmed.is_empty() && !self.ephemeral {
-                let ws = self.active_workspace_name().await;
-                return Some(StoredCredential {
-                    workspace_profile: ws.clone(),
-                    access_token: trimmed.to_string(),
-                    workspace_id: ws.clone(),
-                    workspace_name: ws,
-                    workspace_icon: None,
-                    bot_id: None,
-                    bot_name: None,
-                    auth_mode: "env".to_string(),
-                });
-            }
+        if let Some(token) = self.env_token() {
+            let ws = self.active_workspace_name().await;
+            return Some(StoredCredential {
+                workspace_profile: ws.clone(),
+                access_token: token,
+                // The same ID the cache uses, so token and partition always agree.
+                workspace_id: self.active_workspace_id().await,
+                workspace_name: ws,
+                workspace_icon: None,
+                bot_id: None,
+                bot_name: None,
+                auth_mode: "env".to_string(),
+            });
         }
         if let Some(cred) = self.cached_cred.read().await.clone() {
             return Some(cred);
@@ -247,11 +273,16 @@ impl AuthManager {
         }
         {
             let mut cfg = self.config.write().await;
-            cfg.active_workspace = trimmed.clone();
+            cfg.set_active_workspace(trimmed.clone());
             if !self.ephemeral {
                 let _ = cfg.save();
             }
         }
+        // The launch override would keep naming the workspace that was just left.
+        *self
+            .active_workspace_override
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         let loaded = if self.ephemeral {
             self.cached_cred.read().await.clone()
         } else {
@@ -698,6 +729,14 @@ pub(crate) fn generate_random_hex(num_bytes: usize) -> String {
     hex::encode(bytes)
 }
 
+/// Cache partition for an environment token: `env-` and the first 48 bits of its SHA-256.
+/// The token itself never reaches a path or a log.
+fn env_token_partition(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(Sha256::digest(token.as_bytes()));
+    format!("env-{}", &digest[..12])
+}
+
 fn build_auth_http_client() -> Result<reqwest::Client> {
     crate::http::client_builder()?
         .timeout(Duration::from_secs(30))
@@ -848,6 +887,95 @@ mod tests {
         routing::{get, post},
         Json, Router,
     };
+
+    fn saved_login(token: &str, workspace_id: &str) -> StoredCredential {
+        StoredCredential {
+            workspace_profile: "work".into(),
+            access_token: token.into(),
+            workspace_id: workspace_id.into(),
+            workspace_name: "Work".into(),
+            workspace_icon: None,
+            bot_id: None,
+            bot_name: None,
+            auth_mode: "integration".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn env_token_gets_its_own_cache_partition_only_when_it_differs_from_the_saved_login() {
+        let _lock = TEST_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_dir = dir.path().to_string_lossy().to_string();
+        let _guard = EnvVarGuard::set(&[
+            ("NOTION_CONFIG_DIR", Some(&cfg_dir)),
+            ("NOTION_DISABLE_KEYRING", Some("1")),
+            ("NOTION_TOKEN", Some("ntn_env_token_x")),
+        ]);
+        let mut cfg = AppConfig::default();
+        cfg.active_workspace = "work".into();
+        let auth = AuthManager::new(cfg, None).unwrap();
+
+        // No saved login: the profile name, as before.
+        assert_eq!(auth.active_workspace_id().await, "work");
+        let cred = auth.current_credential().await.unwrap();
+        assert_eq!(cred.access_token, "ntn_env_token_x");
+        assert_eq!(cred.workspace_id, "work");
+        assert_eq!(cred.auth_mode, "env");
+
+        // A saved login with the same token: its workspace ID, as before.
+        *auth.cached_cred.write().await = Some(saved_login("ntn_env_token_x", "ws-saved-1"));
+        assert_eq!(auth.active_workspace_id().await, "ws-saved-1");
+        assert_eq!(auth.current_credential().await.unwrap().workspace_id, "ws-saved-1");
+
+        // A saved login with another token: the env token gets a partition of its own.
+        *auth.cached_cred.write().await = Some(saved_login("ntn_saved_token_y", "ws-saved-1"));
+        let partition_x = auth.active_workspace_id().await;
+        assert!(partition_x.starts_with("env-"), "{partition_x}");
+        assert_eq!(partition_x.len(), "env-".len() + 12);
+        assert!(partition_x[4..].chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!partition_x.contains("token"), "the token must not appear in the ID");
+        assert_eq!(auth.active_workspace_id().await, partition_x, "stable across calls");
+        let cred = auth.current_credential().await.unwrap();
+        assert_eq!(cred.access_token, "ntn_env_token_x");
+        assert_eq!(cred.workspace_id, partition_x, "token and partition agree");
+
+        // Another env token: another partition.
+        std::env::set_var("NOTION_TOKEN", "ntn_env_token_z");
+        let partition_z = auth.active_workspace_id().await;
+        assert!(partition_z.starts_with("env-"));
+        assert_ne!(partition_z, partition_x);
+
+        // No env token: the saved login's workspace.
+        std::env::remove_var("NOTION_TOKEN");
+        assert_eq!(auth.active_workspace_id().await, "ws-saved-1");
+        assert_eq!(auth.access_token().await.unwrap(), "ntn_saved_token_y");
+    }
+
+    #[tokio::test]
+    async fn switching_workspace_clears_the_launch_override_on_every_clone() {
+        let _lock = TEST_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_dir = dir.path().to_string_lossy().to_string();
+        let _guard = EnvVarGuard::set(&[
+            ("NOTION_CONFIG_DIR", Some(&cfg_dir)),
+            ("NOTION_DISABLE_KEYRING", Some("1")),
+            ("NOTION_TOKEN", None),
+            ("NOTION_WORKSPACE", None),
+        ]);
+        let mut cfg = AppConfig::default();
+        cfg.active_workspace = "home".into();
+        let auth = AuthManager::new(cfg, Some("a".into())).unwrap();
+        let clone = auth.clone();
+        assert_eq!(auth.active_workspace_name().await, "a");
+        assert_eq!(clone.active_workspace_id().await, "a");
+
+        auth.switch_workspace("b").await.unwrap();
+        assert_eq!(auth.active_workspace_name().await, "b");
+        assert_eq!(clone.active_workspace_name().await, "b");
+        assert_eq!(clone.active_workspace_id().await, "b");
+        let saved = AppConfig::load_from(&crate::config::config_file_path()).unwrap();
+        assert_eq!(saved.active_workspace, "b");
+    }
 
     #[tokio::test]
     async fn test_integration_token_and_oauth_exchange_against_mock_server() {

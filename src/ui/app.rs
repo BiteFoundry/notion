@@ -446,6 +446,12 @@ pub struct AppState {
     pub storage: Storage,
     pub sync_ctrl: SyncController,
     pub ui_tx: mpsc::UnboundedSender<UiMsg>,
+    /// Tells the sync supervisor to rebind to another workspace's cache. Unset when the app
+    /// runs without a supervisor.
+    pub workspace_switch_tx: Option<mpsc::UnboundedSender<String>>,
+    /// The workspace switched to in this session. Tree updates of any other workspace are
+    /// late results of the previous one and are dropped.
+    pub expected_workspace_id: Option<String>,
     pub workspace_id: String,
     pub workspace_name: String,
     pub current_user: Option<NotionUser>,
@@ -490,6 +496,8 @@ impl AppState {
             storage,
             sync_ctrl,
             ui_tx,
+            workspace_switch_tx: None,
+            expected_workspace_id: None,
             workspace_id,
             workspace_name,
             current_user: None,
@@ -1124,6 +1132,13 @@ impl AppState {
                 pages,
                 databases,
             } => {
+                if self
+                    .expected_workspace_id
+                    .as_ref()
+                    .is_some_and(|expected| *expected != workspace_id)
+                {
+                    return false;
+                }
                 self.workspace_id = workspace_id;
                 self.pages = pages;
                 self.databases = databases;
@@ -1548,7 +1563,8 @@ impl AppState {
                 ui.tasks.finish("workspace", None);
                 self.workspace_name = name.clone();
                 self.workspace_id = workspace_id.clone();
-                self.config.active_workspace = name.clone();
+                self.expected_workspace_id = Some(workspace_id.clone());
+                self.config.set_active_workspace(name.clone());
                 if let Ok(new_storage) = Storage::open(&crate::config::db_path(Some(&workspace_id))) {
                     self.storage = new_storage;
                 }
@@ -1561,8 +1577,16 @@ impl AppState {
                 self.block_owner_pages.clear();
                 self.child_page_positions.clear();
                 self.nav_stack.clear();
+                // The sync engine must not keep polling a page of the workspace just left.
+                self.sync_ctrl.set_focus(FocusTarget::default());
                 self.load_cached_initial();
-                self.sync_ctrl.request(SyncCommand::RefreshAll);
+                let rebinding = self
+                    .workspace_switch_tx
+                    .as_ref()
+                    .is_some_and(|tx| tx.send(workspace_id.clone()).is_ok());
+                if !rebinding {
+                    self.sync_ctrl.request(SyncCommand::RefreshAll);
+                }
                 ui.success(format!("Switched workspace -> {name}"));
             }
             UiMsg::ImageRendered {

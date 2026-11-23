@@ -903,7 +903,7 @@ pub async fn run_from_env() -> Result<()> {
 pub async fn run_cli(cli: Cli) -> Result<()> {
     let mut config = AppConfig::load();
     if let Some(ref ws) = cli.workspace {
-        config.active_workspace = ws.clone();
+        config.override_workspace(ws.clone());
     }
     let workspace_override = cli.workspace.clone();
 
@@ -1272,7 +1272,7 @@ async fn handle_workspaces_cmd(mut config: AppConfig, action: WorkspacesCommand)
             let Some(found) = config.find_workspace(&name).cloned() else {
                 bail!("Workspace profile '{name}' not found. Run `notion workspaces list`.");
             };
-            config.active_workspace = found.name.clone();
+            config.set_active_workspace(found.name.clone());
             config.save()?;
             if as_json {
                 print_json(&json!({ "ok": true, "active_workspace": found.name, "profile": found }))?;

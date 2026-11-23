@@ -4685,4 +4685,73 @@ mod tests {
 
         server_handle.abort();
     }
+    #[tokio::test]
+    async fn tree_updates_of_the_previous_workspace_are_dropped_after_a_switch() {
+        use crate::models::{CoreEvent, NotionPageSummary};
+        use crate::sync::SyncCommand;
+        use crate::ui::app::UiMsg;
+
+        let _lock = crate::config::TEST_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let _guard = crate::config::EnvVarGuard::set(&[("NOTION_DATA_DIR", Some(&data_dir))]);
+        let (mut app, mut ui_state) = make_test_app_and_ui();
+        let (focus_tx, focus_rx) = tokio::sync::watch::channel(FocusTarget {
+            page_id: Some("page-root".into()),
+            database_id: None,
+        });
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+
+        let tree = |workspace_id: &str, page_id: &str| CoreEvent::WorkspaceTreeUpdated {
+            workspace_id: workspace_id.into(),
+            pages: vec![NotionPageSummary {
+                id: page_id.into(),
+                title: page_id.into(),
+                ..Default::default()
+            }],
+            databases: Vec::new(),
+        };
+        let page_ids = |app: &AppState| app.pages.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+
+        // Before any switch a tree update names the workspace, whatever it is.
+        assert!(app.handle_core_event(&mut ui_state, tree("A", "page-a")));
+        assert_eq!(app.workspace_id, "A");
+        assert_eq!(page_ids(&app), vec!["page-a"]);
+
+        // Without a supervisor the switch asks the running engine for a full refresh.
+        while cmd_rx.try_recv().is_ok() {}
+        app.handle_ui_msg(
+            &mut ui_state,
+            UiMsg::WorkspaceSwitched { name: "b".into(), workspace_id: "B".into() },
+        );
+        assert!(matches!(cmd_rx.try_recv(), Ok(SyncCommand::RefreshAll)));
+        assert_eq!(app.workspace_id, "B");
+        assert_eq!(app.config.active_workspace, "b");
+        assert_eq!(*focus_rx.borrow(), FocusTarget::default(), "the old page is no longer polled");
+        assert!(page_ids(&app).is_empty(), "the new workspace's cache is empty");
+
+        // A sync of the previous workspace that finishes late changes nothing.
+        assert!(!app.handle_core_event(&mut ui_state, tree("A", "page-late")));
+        assert_eq!(app.workspace_id, "B");
+        assert!(page_ids(&app).is_empty());
+
+        // The new workspace's tree is applied.
+        assert!(app.handle_core_event(&mut ui_state, tree("B", "page-b")));
+        assert_eq!(app.workspace_id, "B");
+        assert_eq!(page_ids(&app), vec!["page-b"]);
+
+        // With a supervisor the switch is handed to it and the old engine gets no refresh.
+        let (switch_tx, mut switch_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.workspace_switch_tx = Some(switch_tx);
+        while cmd_rx.try_recv().is_ok() {}
+        app.handle_ui_msg(
+            &mut ui_state,
+            UiMsg::WorkspaceSwitched { name: "c".into(), workspace_id: "C".into() },
+        );
+        assert_eq!(switch_rx.try_recv().unwrap(), "C");
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(!app.handle_core_event(&mut ui_state, tree("B", "page-b")));
+        assert_eq!(app.workspace_id, "C");
+    }
 }

@@ -879,6 +879,42 @@ fn handle_terminal_event(
     LoopStep::Continue
 }
 
+/// Opens the cache at `cache_db` and starts a local sync engine on it with a full refresh
+/// requested. This is the step that moves sync to another workspace: the engine it replaces
+/// keeps the storage it was started with, so it must be shut down, not reused.
+///
+/// Must be called inside a Tokio runtime.
+pub fn rebind_sync(
+    config: AppConfig,
+    client: NotionClient,
+    cache_db: &std::path::Path,
+    core_tx: mpsc::UnboundedSender<CoreEvent>,
+) -> Result<(SyncController, Storage)> {
+    let storage = Storage::open(cache_db)?;
+    let ctrl = sync::spawn_sync_engine(config, client, storage.clone(), core_tx);
+    ctrl.request(SyncCommand::RefreshAll);
+    Ok((ctrl, storage))
+}
+
+/// How one binding of the sync supervisor to a workspace ended.
+enum BindingEnd {
+    Shutdown,
+    /// The user switched to the workspace with this ID.
+    Switch(String),
+}
+
+/// Waits for the next workspace switch; of several queued ones only the last matters.
+/// Never resolves once the sender is gone.
+async fn next_switch(switch_rx: &mut mpsc::UnboundedReceiver<String>) -> String {
+    let Some(mut workspace_id) = switch_rx.recv().await else {
+        return std::future::pending().await;
+    };
+    while let Ok(later) = switch_rx.try_recv() {
+        workspace_id = later;
+    }
+    workspace_id
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_sync_supervisor(
     config: AppConfig,
@@ -889,9 +925,10 @@ fn spawn_sync_supervisor(
     ui_tx: mpsc::UnboundedSender<UiMsg>,
     mut proxy_focus_rx: watch::Receiver<FocusTarget>,
     mut proxy_nudge_rx: mpsc::UnboundedReceiver<SyncCommand>,
+    mut switch_rx: mpsc::UnboundedReceiver<String>,
 ) {
     tokio::spawn(async move {
-        let ws_id = auth.active_workspace_id().await;
+        let mut ws_id = auth.active_workspace_id().await;
         if core_tx.is_closed() {
             return;
         }
@@ -902,64 +939,129 @@ fn spawn_sync_supervisor(
             return;
         }
 
-        let mut fell_back = false;
-        if let Some(mut conn) = crate::daemon::try_connect_tui(&config, Some(&ws_id)).await {
-            let _ = ui_tx.send(UiMsg::DaemonAttached {
-                pid: conn.status.pid,
-                sync_busy: conn.status.sync_busy,
-            });
-            let init_focus = proxy_focus_rx.borrow_and_update().clone();
-            if init_focus != FocusTarget::default() {
-                conn.sync_ctrl.set_focus(init_focus.clone());
-                if let Some(page_id) = init_focus.page_id {
-                    conn.sync_ctrl.request(SyncCommand::RefreshPage { page_id });
-                } else if let Some(database_id) = init_focus.database_id {
-                    conn.sync_ctrl
-                        .request(SyncCommand::RefreshDatabase { database_id });
-                }
-            }
-            loop {
-                tokio::select! {
-                    ev = conn.events_rx.recv() => {
-                        match ev {
-                            Some(core_ev) => {
-                                if core_tx.send(core_ev).is_err() {
-                                    return;
-                                }
-                            }
-                            None => {
-                                fell_back = true;
-                                break;
-                            }
-                        }
-                    }
-                    cmd = proxy_nudge_rx.recv() => {
-                        match cmd {
-                            None | Some(SyncCommand::Shutdown) => return,
-                            Some(cmd) => conn.sync_ctrl.request(cmd),
-                        }
-                    }
-                    changed = proxy_focus_rx.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
-                        conn.sync_ctrl.set_focus(proxy_focus_rx.borrow_and_update().clone());
-                    }
-                }
+        // The cache the TUI was started on. After a switch the new workspace's cache is opened.
+        let mut launch_storage = Some(storage);
+        loop {
+            let end = run_sync_binding(
+                &config,
+                &client,
+                launch_storage.take(),
+                &ws_id,
+                &core_tx,
+                &ui_tx,
+                &mut proxy_focus_rx,
+                &mut proxy_nudge_rx,
+                &mut switch_rx,
+            )
+            .await;
+            match end {
+                BindingEnd::Shutdown => return,
+                BindingEnd::Switch(next) => ws_id = next,
             }
         }
+    });
+}
 
-        if core_tx.is_closed() {
-            return;
+/// Runs sync for one workspace, through the daemon when one serves it and through a local
+/// engine otherwise, until the TUI shuts down or switches workspace. `launch_storage` is the
+/// cache opened at startup; `None` means this binding follows a switch.
+#[allow(clippy::too_many_arguments)]
+async fn run_sync_binding(
+    config: &AppConfig,
+    client: &NotionClient,
+    launch_storage: Option<Storage>,
+    ws_id: &str,
+    core_tx: &mpsc::UnboundedSender<CoreEvent>,
+    ui_tx: &mpsc::UnboundedSender<UiMsg>,
+    proxy_focus_rx: &mut watch::Receiver<FocusTarget>,
+    proxy_nudge_rx: &mut mpsc::UnboundedReceiver<SyncCommand>,
+    switch_rx: &mut mpsc::UnboundedReceiver<String>,
+) -> BindingEnd {
+    let after_switch = launch_storage.is_none();
+    let mut fell_back = false;
+    if let Some(mut conn) = crate::daemon::try_connect_tui(config, Some(ws_id)).await {
+        let _ = ui_tx.send(UiMsg::DaemonAttached {
+            pid: conn.status.pid,
+            sync_busy: conn.status.sync_busy,
+        });
+        if after_switch {
+            conn.sync_ctrl.request(SyncCommand::RefreshAll);
         }
-
-        let local_ctrl = sync::spawn_sync_engine(config, client, storage, core_tx);
-        if fell_back {
-            let _ = ui_tx.send(UiMsg::DaemonDetached);
-        } else {
-            let _ = ui_tx.send(UiMsg::StartLocalBootstrap);
+        let init_focus = proxy_focus_rx.borrow_and_update().clone();
+        if init_focus != FocusTarget::default() {
+            conn.sync_ctrl.set_focus(init_focus.clone());
+            if let Some(page_id) = init_focus.page_id {
+                conn.sync_ctrl.request(SyncCommand::RefreshPage { page_id });
+            } else if let Some(database_id) = init_focus.database_id {
+                conn.sync_ctrl
+                    .request(SyncCommand::RefreshDatabase { database_id });
+            }
         }
+        loop {
+            tokio::select! {
+                ev = conn.events_rx.recv() => {
+                    match ev {
+                        Some(core_ev) => {
+                            if core_tx.send(core_ev).is_err() {
+                                return BindingEnd::Shutdown;
+                            }
+                        }
+                        None => {
+                            fell_back = true;
+                            break;
+                        }
+                    }
+                }
+                cmd = proxy_nudge_rx.recv() => {
+                    match cmd {
+                        None | Some(SyncCommand::Shutdown) => return BindingEnd::Shutdown,
+                        Some(cmd) => conn.sync_ctrl.request(cmd),
+                    }
+                }
+                changed = proxy_focus_rx.changed() => {
+                    if changed.is_err() {
+                        return BindingEnd::Shutdown;
+                    }
+                    conn.sync_ctrl.set_focus(proxy_focus_rx.borrow_and_update().clone());
+                }
+                // Dropping the connection detaches from the daemon.
+                next = next_switch(switch_rx) => return BindingEnd::Switch(next),
+            }
+        }
+    }
 
+    if core_tx.is_closed() {
+        return BindingEnd::Shutdown;
+    }
+
+    let local_ctrl = match launch_storage {
+        Some(storage) => {
+            let ctrl =
+                sync::spawn_sync_engine(config.clone(), client.clone(), storage, core_tx.clone());
+            if fell_back {
+                let _ = ui_tx.send(UiMsg::DaemonDetached);
+            } else {
+                let _ = ui_tx.send(UiMsg::StartLocalBootstrap);
+            }
+            Some(ctrl)
+        }
+        None => {
+            let cache_db = crate::config::db_path(Some(ws_id));
+            match rebind_sync(config.clone(), client.clone(), &cache_db, core_tx.clone()) {
+                Ok((ctrl, _storage)) => {
+                    if fell_back {
+                        let _ = ui_tx.send(UiMsg::DaemonDetached);
+                    }
+                    Some(ctrl)
+                }
+                // Without the new cache there is nothing safe to sync into: syncing on the
+                // previous storage would write this workspace's pages into the other one's file.
+                Err(_) => None,
+            }
+        }
+    };
+
+    if let Some(local_ctrl) = &local_ctrl {
         let cur_focus = proxy_focus_rx.borrow_and_update().clone();
         if cur_focus != FocusTarget::default() {
             local_ctrl.set_focus(cur_focus.clone());
@@ -971,28 +1073,44 @@ fn spawn_sync_supervisor(
                 }
             }
         }
+    }
 
-        loop {
-            tokio::select! {
-                cmd = proxy_nudge_rx.recv() => {
-                    match cmd {
-                        None | Some(SyncCommand::Shutdown) => {
-                            local_ctrl.request(SyncCommand::Shutdown);
-                            break;
+    let stop_engine = || {
+        if let Some(ctrl) = &local_ctrl {
+            ctrl.request(SyncCommand::Shutdown);
+        }
+    };
+    loop {
+        tokio::select! {
+            cmd = proxy_nudge_rx.recv() => {
+                match cmd {
+                    None | Some(SyncCommand::Shutdown) => {
+                        stop_engine();
+                        return BindingEnd::Shutdown;
+                    }
+                    Some(cmd) => {
+                        if let Some(ctrl) = &local_ctrl {
+                            ctrl.request(cmd);
                         }
-                        Some(cmd) => local_ctrl.request(cmd),
                     }
-                }
-                changed = proxy_focus_rx.changed() => {
-                    if changed.is_err() {
-                        local_ctrl.request(SyncCommand::Shutdown);
-                        break;
-                    }
-                    local_ctrl.set_focus(proxy_focus_rx.borrow_and_update().clone());
                 }
             }
+            changed = proxy_focus_rx.changed() => {
+                if changed.is_err() {
+                    stop_engine();
+                    return BindingEnd::Shutdown;
+                }
+                let focus = proxy_focus_rx.borrow_and_update().clone();
+                if let Some(ctrl) = &local_ctrl {
+                    ctrl.set_focus(focus);
+                }
+            }
+            next = next_switch(switch_rx) => {
+                stop_engine();
+                return BindingEnd::Switch(next);
+            }
         }
-    });
+    }
 }
 
 pub async fn run(
@@ -1013,6 +1131,7 @@ pub async fn run(
     let (proxy_focus_tx, proxy_focus_rx) = watch::channel(FocusTarget::default());
     let (proxy_nudge_tx, proxy_nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
     let sync_ctrl = SyncController::from_channels(proxy_focus_tx, proxy_nudge_tx);
+    let (switch_tx, switch_rx) = mpsc::unbounded_channel::<String>();
 
     let mut ui = UiState::from_config(&config);
     if let Ok(sz) = terminal.size() {
@@ -1029,6 +1148,9 @@ pub async fn run(
         sync_ctrl,
         ui_tx.clone(),
     );
+    // The cache was opened by this ID; the profile-derived default can differ from it.
+    app.workspace_id = auth.active_workspace_id().await;
+    app.workspace_switch_tx = Some(switch_tx);
     app.load_cached_initial();
     draw_frame(&mut terminal, &mut app, &mut ui, &mut guard)?;
 
@@ -1041,6 +1163,7 @@ pub async fn run(
         ui_tx,
         proxy_focus_rx,
         proxy_nudge_rx,
+        switch_rx,
     );
 
     let mut events = EventStream::new();

@@ -4880,3 +4880,63 @@ async fn regression_n03_long_text_is_chunked_on_every_write_path() {
     assert_eq!(env.mock.count("PATCH", &format!("/v1/blocks/{AUDIT_PAGE_A}/children")), 0);
     env.server.abort();
 }
+
+/// Waits for a workspace tree update that contains `page_id`.
+async fn audit_wait_for_tree(
+    core_rx: &mut tokio::sync::mpsc::UnboundedReceiver<notion_cli::models::CoreEvent>,
+    page_id: &str,
+) -> Vec<String> {
+    let wait = async {
+        loop {
+            match core_rx.recv().await {
+                Some(notion_cli::models::CoreEvent::WorkspaceTreeUpdated { pages, .. })
+                    if pages.iter().any(|p| p.id == page_id) =>
+                {
+                    return pages.into_iter().map(|p| p.id).collect();
+                }
+                Some(_) => {}
+                None => panic!("sync engine stopped before syncing {page_id}"),
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(20), wait)
+        .await
+        .unwrap_or_else(|_| panic!("no workspace tree with {page_id} within 20 s"))
+}
+
+#[tokio::test]
+async fn regression_n01_rebind_sync_writes_the_new_workspace_into_its_own_cache() {
+    let env = start_audit_env().await;
+    let workspace = json!({ "type": "workspace", "workspace": true });
+    env.mock.add_page(audit_page(AUDIT_PAGE_A, "Workspace A Home", workspace.clone(), "2026-11-20T02:00:00.000Z"));
+    let dir = tempfile::tempdir().unwrap();
+    let db_a = dir.path().join("ws-a").join("cache.db");
+    let db_b = dir.path().join("ws-b").join("cache.db");
+    let ws_id = env.auth.active_workspace_id().await;
+    let cached_ids = |storage: &Storage| -> Vec<String> {
+        storage.list_pages(&ws_id, true).unwrap().into_iter().map(|p| p.id).collect()
+    };
+    let (core_tx, mut core_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let (engine_a, storage_a) =
+        notion_cli::tui::rebind_sync(env.cfg.clone(), env.client.clone(), &db_a, core_tx.clone()).unwrap();
+    assert_eq!(audit_wait_for_tree(&mut core_rx, AUDIT_PAGE_A).await, vec![AUDIT_PAGE_A]);
+    assert_eq!(cached_ids(&storage_a), vec![AUDIT_PAGE_A]);
+
+    // The user switches workspace: the old engine stops and the API now shows other pages.
+    engine_a.request(sync::SyncCommand::Shutdown);
+    env.mock.pages.lock().unwrap().clear();
+    env.mock.add_page(audit_page(AUDIT_PAGE_B, "Workspace B Home", workspace, "2026-11-21T02:00:00.000Z"));
+    let (engine_b, storage_b) =
+        notion_cli::tui::rebind_sync(env.cfg.clone(), env.client.clone(), &db_b, core_tx.clone()).unwrap();
+    assert_eq!(audit_wait_for_tree(&mut core_rx, AUDIT_PAGE_B).await, vec![AUDIT_PAGE_B]);
+
+    assert_eq!(cached_ids(&storage_b), vec![AUDIT_PAGE_B]);
+    assert_eq!(
+        cached_ids(&Storage::open(&db_a).unwrap()),
+        vec![AUDIT_PAGE_A],
+        "the first workspace's cache file is left as it was"
+    );
+    engine_b.request(sync::SyncCommand::Shutdown);
+    env.server.abort();
+}
