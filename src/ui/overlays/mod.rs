@@ -526,18 +526,18 @@ mod tests {
         assert_eq!(ctx.handle(&wheel(-3), &app, &ui), OverlayOutcome::Handled);
         assert!(matches!(&ctx, Overlay::ContextMenu(m) if m.selected == 0));
 
-        // 2. CommandPalette (6 pages + 15 workspace commands = 21 items)
+        // 2. CommandPalette (6 pages + 16 workspace commands = 22 items)
         let mut palette = CommandPalette::new();
         assert_eq!(palette.handle(&wheel(3), &app, &ui), OverlayOutcome::Handled);
         assert_eq!(palette.selected, 3);
         assert_eq!(palette.handle(&Action::PageDown, &app, &ui), OverlayOutcome::Handled);
         assert_eq!(palette.selected, 8);
         assert_eq!(palette.handle(&wheel(100), &app, &ui), OverlayOutcome::Handled);
-        assert_eq!(palette.selected, 20);
+        assert_eq!(palette.selected, 21);
         assert_eq!(palette.handle(&wheel(3), &app, &ui), OverlayOutcome::Handled);
-        assert_eq!(palette.selected, 20);
+        assert_eq!(palette.selected, 21);
         assert_eq!(palette.handle(&wheel(-3), &app, &ui), OverlayOutcome::Handled);
-        assert_eq!(palette.selected, 17);
+        assert_eq!(palette.selected, 18);
         assert_eq!(palette.handle(&wheel(-100), &app, &ui), OverlayOutcome::Handled);
         assert_eq!(palette.selected, 0);
         assert_eq!(palette.handle(&wheel(-3), &app, &ui), OverlayOutcome::Handled);

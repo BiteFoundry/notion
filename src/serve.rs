@@ -854,9 +854,20 @@ async fn add_comment_handler(
     Ok(Json(json!({ "ok": true, "comment": comment })))
 }
 
-async fn sync_handler(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
+#[derive(Debug, Default, Deserialize)]
+struct SyncParams {
+    /// `?full=true` rescans the whole workspace instead of stopping at the last sync point.
+    #[serde(default)]
+    full: bool,
+}
+
+async fn sync_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<SyncParams>,
+) -> Result<Json<Value>, ApiError> {
+    let full = params.full;
     let (workspace_id, pages, databases, outcome) =
-        sync::sync_workspace_tree_with_options(&state.client, &state.storage, false, |_, _, _| {})
+        sync::sync_workspace_tree_with_options(&state.client, &state.storage, full, |_, _, _| {})
             .await
             .map_err(ApiError::from_anyhow)?;
     Ok(Json(json!({
@@ -866,6 +877,7 @@ async fn sync_handler(State(state): State<Arc<ApiState>>) -> Result<Json<Value>,
         "databases_count": databases.len(),
         "fetched_count": outcome.fetched,
         "complete": true,
+        "full": full,
     })))
 }
 

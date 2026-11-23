@@ -209,6 +209,12 @@ paths:
   /api/v1/sync:
     post:
       summary: Trigger immediate workspace sync into SQLite WAL + FTS5
+      parameters:
+        - name: full
+          in: query
+          required: false
+          description: true rescans the whole workspace instead of stopping at the last sync point
+          schema: { type: boolean, default: false }
       responses:
         "200":
           description: Sync summary

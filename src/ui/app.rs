@@ -464,6 +464,8 @@ pub struct AppState {
     pub active_page_detail: Option<NotionPageDetail>,
     pub active_database_id: Option<String>,
     pub active_database_rows: Vec<NotionPage>,
+    /// The last sync read only the first rows of the active database.
+    pub active_database_rows_truncated: bool,
     pub nav_stack: Vec<NavTarget>,
     pub syncing: bool,
     pub sync_summary: String,
@@ -510,6 +512,7 @@ impl AppState {
             active_page_detail: None,
             active_database_id: None,
             active_database_rows: Vec::new(),
+            active_database_rows_truncated: false,
             nav_stack: Vec::new(),
             syncing: false,
             sync_summary: "Ready".to_string(),
@@ -659,6 +662,7 @@ impl AppState {
             .storage
             .list_database_rows(&self.workspace_id, database_id)
             .unwrap_or_default();
+        self.active_database_rows_truncated = false;
         self.sync_ctrl.set_focus(FocusTarget {
             page_id: None,
             database_id: Some(database_id.to_string()),
@@ -1253,6 +1257,7 @@ impl AppState {
                 database_id,
                 database,
                 rows,
+                rows_truncated,
             } => {
                 let mut changed = false;
                 if let Some(db) = database {
@@ -1275,6 +1280,10 @@ impl AppState {
                             .all(|(a, b)| crate::sync::page_semantically_equal(a, b));
                     if !rows_same {
                         self.active_database_rows = rows;
+                        changed = true;
+                    }
+                    if self.active_database_rows_truncated != rows_truncated {
+                        self.active_database_rows_truncated = rows_truncated;
                         changed = true;
                     }
                 }
@@ -1574,6 +1583,7 @@ impl AppState {
                 ui.cursor_pos = None;
                 self.active_database_id = None;
                 self.active_database_rows.clear();
+                self.active_database_rows_truncated = false;
                 self.block_owner_pages.clear();
                 self.child_page_positions.clear();
                 self.nav_stack.clear();

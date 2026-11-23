@@ -94,6 +94,7 @@ impl CommandPalette {
             ("Toggle Comments Peek Drawer", "C", Action::ToggleCommentsDrawer),
             ("Switch Notion Workspace", "Ctrl+S", Action::OpenOverlay(OverlayKind::WorkspaceSwitcher)),
             ("Sync Workspace Now", "Ctrl+R", Action::RefreshAll),
+            ("Full Resync Workspace (slow, finds older pages)", "", Action::FullResync),
             ("Extract Links from Page", "u", Action::OpenLinkExtractor),
             ("Preview Page Images (HD)", "v", Action::OpenImagePreview),
             ("Open File Picker (zoxide)", "Ctrl+F", Action::OpenFilePicker),

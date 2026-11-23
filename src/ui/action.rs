@@ -116,6 +116,8 @@ pub enum Action {
     OpenDatabaseById(String),
     SwitchWorkspace(String),
     RefreshAll,
+    /// Rescans the whole workspace, ignoring the last sync point, then reloads the tree.
+    FullResync,
     OpenActiveInBrowser,
     OpenUrl(String),
     OpenMediaUrl {
@@ -1239,6 +1241,35 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::RefreshAll => {
             app.sync_ctrl.request(SyncCommand::RefreshAll);
             ui.info("Syncing Notion workspace...");
+        }
+        Action::FullResync => {
+            // Runs here rather than as a SyncCommand so a daemon of an older version keeps
+            // understanding every command this TUI sends.
+            let client = app.client.clone();
+            let storage = app.storage.clone();
+            let sync_ctrl = app.sync_ctrl.clone();
+            let ui_tx = app.ui_tx.clone();
+            ui.tasks.begin("full resync");
+            ui.info("Rescanning the whole workspace...");
+            tokio::spawn(async move {
+                match crate::sync::sync_workspace_tree_with_options(&client, &storage, true, |_, _, _| {})
+                    .await
+                {
+                    Ok((_, _, _, outcome)) => {
+                        sync_ctrl.request(SyncCommand::RefreshTree);
+                        let _ = ui_tx.send(UiMsg::TaskDone {
+                            label: "full resync".into(),
+                            toast: format!("Full resync read {} items", outcome.fetched),
+                        });
+                    }
+                    Err(err) => {
+                        let _ = ui_tx.send(UiMsg::TaskFailed {
+                            label: "full resync".into(),
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            });
         }
         Action::OpenActiveInBrowser => {
             let url = match app.active_view {

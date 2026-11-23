@@ -54,6 +54,6 @@ Errors return `{ "ok": false, "error": "..." }` and preserve the upstream Notion
 | `POST` | `/api/v1/databases/{id}/items` | Create a new database item (`{ title, status?, properties?, body? }`) |
 | `GET` | `/api/v1/pages/{id}/comments?offline=false` | List page comments. Offline reads return HTTP 404 when comments have not been fetched or the last fetch failed. |
 | `POST` | `/api/v1/pages/{id}/comments` | Add a comment or discussion reply (`{ text, discussion_id? }`) |
-| `POST` | `/api/v1/sync` | Synchronize workspace pages & databases into SQLite WAL + FTS5 immediately (`{ ok, workspace_id, pages_count, databases_count, fetched_count, complete }`) |
+| `POST` | `/api/v1/sync?full=false` | Synchronize workspace pages & databases into SQLite WAL + FTS5 immediately (`{ ok, workspace_id, pages_count, databases_count, fetched_count, complete, full }`). `?full=true` rescans the whole workspace instead of stopping at the last sync point. |
 
 See [`docs/openapi.yaml`](openapi.yaml) for full schemas.

@@ -396,7 +396,12 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "sync_now",
             "description": "Synchronize Notion workspace pages and databases into the local SQLite WAL + FTS5 cache immediately. Streams every search batch into the cache; returns fetched_count and complete.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "full": { "type": "boolean", "default": false, "description": "true rescans the whole workspace instead of stopping at the last sync point; slower, finds pages older than the last sync" }
+                }
+            }
         }),
     ]
 }
@@ -673,8 +678,9 @@ async fn dispatch_tool(
             Ok(serde_json::to_value(res)?)
         }
         "sync_now" => {
+            let full = opt_bool("full", false);
             let (ws_id, pages, databases, outcome) =
-                sync::sync_workspace_tree_with_options(client, storage, false, |_, _, _| {})
+                sync::sync_workspace_tree_with_options(client, storage, full, |_, _, _| {})
                     .await?;
             Ok(json!({
                 "ok": true,
@@ -683,6 +689,7 @@ async fn dispatch_tool(
                 "databases_count": databases.len(),
                 "fetched_count": outcome.fetched,
                 "complete": true,
+                "full": full,
             }))
         }
         other => bail!("Unknown MCP tool: {other}"),

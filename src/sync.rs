@@ -797,16 +797,26 @@ async fn fetch_and_save_forced_page_detail(
 
 
 /// Syncs a database schema and all its rows into SQLite (in parallel).
+/// Rows the TUI reads from a database on every background poll.
+pub const TUI_DATABASE_ROW_LIMIT: usize = 250;
+/// Rows read when the user asks for a database refresh. Reading the whole database lets the
+/// archived-row reconcile run; a poll must not do this, it would exhaust the API rate limit.
+pub const EXPLICIT_DATABASE_ROW_LIMIT: usize = 5000;
+
+/// Reads up to `max_rows` rows of a database into the cache. The returned flag is `true` when the
+/// database has more rows than were read; cached rows are then left as they are, because a row
+/// that was not read cannot be told apart from an archived one.
 pub async fn sync_database_rows(
     client: &NotionClient,
     storage: &Storage,
     database_id: &str,
-) -> Result<(Option<NotionDatabase>, Vec<NotionPage>)> {
+    max_rows: usize,
+) -> Result<(Option<NotionDatabase>, Vec<NotionPage>, bool)> {
     let ws_id = client.auth().active_workspace_id().await;
     let norm_db_id = crate::models::normalize_notion_id(database_id);
     let (db_res, rows_res) = tokio::join!(
         client.get_database(&norm_db_id),
-        client.query_database_all_with_meta(&norm_db_id, None, None, 250, None),
+        client.query_database_all_with_meta(&norm_db_id, None, None, max_rows, None),
     );
     let db = db_res.ok();
     let (rows, has_more, _) = rows_res?;
@@ -825,7 +835,7 @@ pub async fn sync_database_rows(
         Ok(())
     })
     .await??;
-    Ok((db, rows))
+    Ok((db, rows, has_more))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -871,6 +881,7 @@ enum ActiveOutcome {
         database_id: String,
         database: Option<NotionDatabase>,
         rows: Vec<NotionPage>,
+        rows_truncated: bool,
         changed: bool,
     },
     Err,
@@ -1077,6 +1088,8 @@ pub fn spawn_sync_engine(
         let mut profile_loaded = false;
         let mut last_tree_digest: Option<TreeDigest> = None;
         let mut next_active_id: u64 = 0;
+        // Database the user asked to refresh; its next fetch reads the whole database.
+        let explicit_db_refresh: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
         let start_active = |target: ActiveTarget,
                             mode: DetailSyncMode,
@@ -1167,13 +1180,20 @@ pub fn spawn_sync_engine(
             let tx = event_tx.clone();
             let done_tx = active_done_tx.clone();
             let target_spawn = target.clone();
+            let explicit = explicit_db_refresh.lock().unwrap().take();
+            let db_max_rows = match (&target, explicit) {
+                (ActiveTarget::Database(did), Some(asked)) if *did == asked => {
+                    EXPLICIT_DATABASE_ROW_LIMIT
+                }
+                _ => TUI_DATABASE_ROW_LIMIT,
+            };
             let handle = tokio::spawn(async move {
                 let outcome = match target_spawn {
                     ActiveTarget::Page(ref pid) => {
                         run_page_refresh(&c, &s, &tx, pid, mode, emit_unchanged).await
                     }
                     ActiveTarget::Database(ref did) => {
-                        run_db_refresh(&c, &s, &tx, did, emit_unchanged).await
+                        run_db_refresh(&c, &s, &tx, did, db_max_rows, emit_unchanged).await
                     }
                 };
                 let _ = done_tx.send(ActiveDone {
@@ -1291,6 +1311,7 @@ pub fn spawn_sync_engine(
                             {
                                 let _ = focus_rx.borrow_and_update();
                             }
+                            *explicit_db_refresh.lock().unwrap() = Some(database_id.clone());
                             start_active(
                                 ActiveTarget::Database(database_id),
                                 DetailSyncMode::Force,
@@ -1409,6 +1430,8 @@ pub fn spawn_sync_engine(
                                     );
                                 }
                                 SyncCommand::RefreshDatabase { database_id } => {
+                                    *explicit_db_refresh.lock().unwrap() =
+                                        Some(database_id.clone());
                                     start_active(
                                         ActiveTarget::Database(database_id),
                                         DetailSyncMode::Force,
@@ -1475,6 +1498,7 @@ pub fn spawn_sync_engine(
                             database_id,
                             database,
                             rows,
+                            rows_truncated,
                             changed,
                         } => {
                             if !will_run_pending_same_target && (upgraded_emit || changed) {
@@ -1482,6 +1506,7 @@ pub fn spawn_sync_engine(
                                     database_id,
                                     database,
                                     rows,
+                                    rows_truncated,
                                 });
                             }
                             (true, 2)
@@ -1730,6 +1755,7 @@ async fn run_db_refresh(
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
     database_id: &str,
+    max_rows: usize,
     emit_unchanged: bool,
 ) -> ActiveOutcome {
     let prev_cached = if !emit_unchanged {
@@ -1750,8 +1776,8 @@ async fn run_db_refresh(
         None
     };
 
-    match sync_database_rows(client, storage, database_id).await {
-        Ok((database, rows)) => {
+    match sync_database_rows(client, storage, database_id, max_rows).await {
+        Ok((database, rows, rows_truncated)) => {
             let changed = match prev_cached {
                 Some((prev_db, Some(prev_rows))) => {
                     let db_same = match (&prev_db, &database) {
@@ -1772,6 +1798,7 @@ async fn run_db_refresh(
                 database_id: database_id.to_string(),
                 database,
                 rows,
+                rows_truncated,
                 changed,
             }
         }

@@ -1923,14 +1923,22 @@ fn draw_database_view(
         .map(|d| format!("{}  {}", d.display_icon(), d.display_title()))
         .unwrap_or_else(|| "🗂  Database".to_string());
     let desc = db.map(|d| d.description.as_str()).unwrap_or("");
+    let mut title_line = vec![Span::styled(
+        title,
+        Style::default()
+            .fg(theme.fg_primary)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if app.active_database_rows_truncated {
+        let limit = crate::sync::TUI_DATABASE_ROW_LIMIT;
+        title_line.push(Span::styled(
+            format!("   {limit}+ rows · showing first {limit}"),
+            theme.muted_style(),
+        ));
+    }
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(
-                title,
-                Style::default()
-                    .fg(theme.fg_primary)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Line::from(title_line),
             Line::from(Span::styled(desc.to_string(), theme.muted_style())),
         ]),
         rows_layout[0],

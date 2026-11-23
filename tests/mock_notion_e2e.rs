@@ -4940,3 +4940,198 @@ async fn regression_n01_rebind_sync_writes_the_new_workspace_into_its_own_cache(
     engine_b.request(sync::SyncCommand::Shutdown);
     env.server.abort();
 }
+
+/// Adds `count` rows to the audit mock database, named `Row 0001` and so on.
+fn audit_add_rows(env: &AuditEnv, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|i| {
+            let id = format!("a11d0000-0000-4000-8001-{i:012x}");
+            env.mock.add_page(audit_page(
+                &id,
+                &format!("Row {i:04}"),
+                json!({ "type": "database_id", "database_id": AUDIT_DB }),
+                "2026-11-20T02:00:00.000Z",
+            ));
+            id
+        })
+        .collect()
+}
+
+async fn audit_wait_for_rows(
+    core_rx: &mut tokio::sync::mpsc::UnboundedReceiver<notion_cli::models::CoreEvent>,
+) -> (usize, bool) {
+    let wait = async {
+        loop {
+            match core_rx.recv().await {
+                Some(notion_cli::models::CoreEvent::DatabaseRowsUpdated { rows, rows_truncated, .. }) => {
+                    return (rows.len(), rows_truncated);
+                }
+                Some(_) => {}
+                None => panic!("sync engine stopped before reading the database"),
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(20), wait)
+        .await
+        .expect("no DatabaseRowsUpdated within 20 s")
+}
+
+#[tokio::test]
+async fn regression_n04_large_database_reports_truncation_and_reconciles_on_refresh() {
+    let env = start_audit_env().await;
+    env.mock.databases.lock().unwrap().push(audit_database(
+        AUDIT_DB,
+        "Big Table",
+        "2026-11-20T02:00:00.000Z",
+    ));
+    let ids = audit_add_rows(&env, 321);
+    let stale = ids[0].clone();
+    let ws_id = env.auth.active_workspace_id().await;
+    let cached = |storage: &Storage| -> Vec<String> {
+        storage.list_database_rows(&ws_id, AUDIT_DB).unwrap().into_iter().map(|p| p.id).collect()
+    };
+
+    // Cache every row, then archive one in Notion.
+    let (_, rows, more) =
+        sync::sync_database_rows(&env.client, &env.storage, AUDIT_DB, sync::EXPLICIT_DATABASE_ROW_LIMIT)
+            .await
+            .unwrap();
+    assert_eq!((rows.len(), more), (321, false));
+    env.mock.pages.lock().unwrap().iter_mut().find(|p| p["id"] == stale.as_str()).unwrap()["archived"] =
+        json!(true);
+
+    // (a) A poll reads the first 250 rows, reports more, and leaves the cache alone.
+    let (_, rows, more) =
+        sync::sync_database_rows(&env.client, &env.storage, AUDIT_DB, sync::TUI_DATABASE_ROW_LIMIT)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 250);
+    assert!(more, "320 rows exceed the poll limit");
+    assert!(cached(&env.storage).contains(&stale), "a partial read must not archive unseen rows");
+
+    // (b) A full read sees the end of the database and archives the stale row.
+    let (_, rows, more) =
+        sync::sync_database_rows(&env.client, &env.storage, AUDIT_DB, sync::EXPLICIT_DATABASE_ROW_LIMIT)
+            .await
+            .unwrap();
+    assert_eq!((rows.len(), more), (320, false));
+    let after = cached(&env.storage);
+    assert_eq!(after.len(), 320);
+    assert!(!after.contains(&stale), "the archived row leaves the cache");
+
+    // The engine polls with the small limit and reads everything when the user refreshes.
+    let storage = Storage::open_in_memory().unwrap();
+    let (core_tx, mut core_rx) = tokio::sync::mpsc::unbounded_channel();
+    let engine = sync::spawn_sync_engine(env.cfg.clone(), env.client.clone(), storage, core_tx);
+    engine.set_focus(sync::FocusTarget { page_id: None, database_id: Some(AUDIT_DB.into()) });
+    assert_eq!(audit_wait_for_rows(&mut core_rx).await, (250, true));
+    env.mock.clear_requests();
+    engine.request(sync::SyncCommand::RefreshDatabase { database_id: AUDIT_DB.into() });
+    assert_eq!(audit_wait_for_rows(&mut core_rx).await, (320, false));
+    assert_eq!(env.mock.count("POST", &format!("/v1/databases/{AUDIT_DB}/query")), 4);
+    engine.request(sync::SyncCommand::Shutdown);
+
+    // The TUI header says the table is cut off.
+    let (focus_tx, _focus_rx) = tokio::sync::watch::channel(sync::FocusTarget::default());
+    let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let ctrl = sync::SyncController::from_channels(focus_tx, cmd_tx);
+    let mut ui_state = UiState::from_config(&env.cfg);
+    let mut app = AppState::new(env.cfg.clone(), env.auth.clone(), env.client.clone(), env.storage.clone(), ctrl, ui_tx);
+    app.load_cached_initial();
+    app.open_database(AUDIT_DB, &mut ui_state, false);
+    let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+    let screen = |terminal: &mut Terminal<TestBackend>, app: &mut AppState, ui_state: &mut UiState| -> String {
+        terminal.draw(|f| { ui::draw(f, app, ui_state); }).unwrap();
+        terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect()
+    };
+    assert!(!screen(&mut terminal, &mut app, &mut ui_state).contains("showing first"));
+    let first: Vec<_> = env.storage.list_database_rows(&ws_id, AUDIT_DB).unwrap().into_iter().take(250).collect();
+    assert!(app.handle_core_event(
+        &mut ui_state,
+        notion_cli::models::CoreEvent::DatabaseRowsUpdated {
+            database_id: AUDIT_DB.into(),
+            database: None,
+            rows: first,
+            rows_truncated: true,
+        },
+    ));
+    assert!(screen(&mut terminal, &mut app, &mut ui_state).contains("250+ rows · showing first 250"));
+    env.server.abort();
+}
+
+#[tokio::test]
+async fn regression_n08_full_flag_reaches_mcp_and_http() {
+    let env = start_audit_env().await;
+    let workspace = json!({ "type": "workspace", "workspace": true });
+    // 100 pages with distinct edit times: the first search batch reaches past the watermark.
+    for i in 0..100 {
+        env.mock.add_page(audit_page(
+            &format!("a11d0000-0000-4000-8008-{i:012x}"),
+            &format!("Recent {i:03}"),
+            workspace.clone(),
+            &format!("2026-11-20T03:{:02}:{:02}.000Z", i / 60, i % 60),
+        ));
+    }
+    let ws_id = env.auth.active_workspace_id().await;
+    let cached = |id: &str| env.storage.get_page(&ws_id, id).unwrap().is_some();
+    sync::sync_workspace_tree(&env.client, &env.storage).await.unwrap();
+
+    // A page shared with the integration later, edited before the last sync: it ranks 101st.
+    let older = "a11d0000-0000-4000-8008-0000000000a1";
+    env.mock.add_page(audit_page(older, "Old Shared Page", workspace.clone(), "2026-10-01T00:00:00.000Z"));
+    let call = |args: Value| {
+        mcp::handle_request_value(
+            &env.cfg,
+            &env.auth,
+            &env.client,
+            &env.storage,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "sync_now", "arguments": args }
+            }),
+        )
+    };
+
+    // (a) An incremental sync stops at the watermark.
+    let resp = call(json!({})).await.unwrap();
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    assert_eq!(resp["result"]["structuredContent"]["full"], false);
+    assert!(!cached(older), "incremental sync stops before the older page");
+
+    // (b) full=true reads past it.
+    let resp = call(json!({ "full": true })).await.unwrap();
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    assert_eq!(resp["result"]["structuredContent"]["full"], true);
+    assert_eq!(resp["result"]["structuredContent"]["fetched_count"], 101);
+    assert!(cached(older), "full sync finds the older page");
+
+    // HTTP: another older page, then the same two calls.
+    let oldest = "a11d0000-0000-4000-8008-0000000000a2";
+    env.mock.add_page(audit_page(oldest, "Oldest Shared Page", workspace, "2026-09-01T00:00:00.000Z"));
+    let (api, api_server) = start_audit_api(&env, Some("local-secret"), serve::ServeOptions::default()).await;
+    let http = reqwest::Client::new();
+    let post = |url: String| http.post(url).header("x-api-key", "local-secret").send();
+
+    // (d) The body-less call keeps working and stays incremental.
+    let plain = post(format!("{api}/api/v1/sync")).await.unwrap();
+    assert_eq!(plain.status(), StatusCode::OK);
+    let body: Value = plain.json().await.unwrap();
+    assert_eq!((body["ok"].clone(), body["full"].clone()), (json!(true), json!(false)), "{body}");
+    assert!(!cached(oldest));
+
+    // (c) ?full=true rescans.
+    let full = post(format!("{api}/api/v1/sync?full=true")).await.unwrap();
+    assert_eq!(full.status(), StatusCode::OK);
+    let body: Value = full.json().await.unwrap();
+    assert_eq!(body["full"], true, "{body}");
+    assert_eq!(body["fetched_count"], 102);
+    assert!(cached(oldest), "?full=true finds the oldest page");
+
+    let bad = post(format!("{api}/api/v1/sync?full=maybe")).await.unwrap();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    api_server.abort();
+    env.server.abort();
+}

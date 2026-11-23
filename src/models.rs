@@ -828,6 +828,9 @@ pub enum CoreEvent {
         database_id: String,
         database: Option<NotionDatabase>,
         rows: Vec<NotionPage>,
+        /// The database has more rows than `rows` holds. Absent in events from older daemons.
+        #[serde(default)]
+        rows_truncated: bool,
     },
     CommentsUpdated {
         page_id: String,
@@ -1084,6 +1087,15 @@ mod tests {
                 page_id,
                 "page: {input}"
             );
+        }
+    }
+
+    #[test]
+    fn test_database_rows_event_without_truncation_flag_parses() {
+        let json = r#"{"type":"database_rows_updated","data":{"database_id":"db-1","database":null,"rows":[]}}"#;
+        match serde_json::from_str::<CoreEvent>(json).unwrap() {
+            CoreEvent::DatabaseRowsUpdated { rows_truncated, .. } => assert!(!rows_truncated),
+            other => panic!("unexpected event {other:?}"),
         }
     }
 
