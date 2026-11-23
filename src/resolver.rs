@@ -8,7 +8,8 @@ use serde_json::{json, Value};
 
 use crate::{
     models::{
-        coded_with_details, extract_id_from_notion_url, normalize_notion_id, NotionDatabase,
+        coded_with_details, extract_id_from_notion_url, extract_page_id_from_notion_url,
+        normalize_notion_id, NotionDatabase,
         NotionPage,
     },
     notion::{NotionClient, SearchFilterObject},
@@ -251,7 +252,7 @@ pub async fn resolve_page_id_for_write(
     if trimmed.is_empty() {
         return Err(anyhow!("Page identifier cannot be empty"));
     }
-    if let Some(id) = extract_id_from_notion_url(trimmed) {
+    if let Some(id) = extract_page_id_from_notion_url(trimmed) {
         return Ok(id);
     }
     if looks_like_notion_uuid(trimmed) {
@@ -468,7 +469,7 @@ pub async fn resolve_page_id(
     if trimmed.is_empty() {
         return Err(anyhow!("Page identifier cannot be empty"));
     }
-    if let Some(id) = extract_id_from_notion_url(trimmed) {
+    if let Some(id) = extract_page_id_from_notion_url(trimmed) {
         return Ok(id);
     }
     if looks_like_notion_uuid(trimmed) {

@@ -875,26 +875,64 @@ pub fn normalize_notion_id(raw: &str) -> String {
     }
 }
 
-/// Extracts a Notion 32-hex page/database ID from a full `notion.so` URL if provided.
-pub fn extract_id_from_notion_url(input: &str) -> Option<String> {
+/// Splits a Notion URL into its path and query parts (fragment dropped); `None` for other hosts.
+fn notion_url_path_and_query(input: &str) -> Option<(&str, &str)> {
     let trimmed = input.trim();
     if !trimmed.contains("notion.so") && !trimmed.contains("notion.site") {
         return None;
     }
-    let no_query = trimmed.split('?').next().unwrap_or(trimmed);
-    let no_frag = no_query.split('#').next().unwrap_or(no_query);
-    let last_seg = no_frag.rsplit('/').next().unwrap_or("");
-    let candidate = last_seg.rsplit('-').next().unwrap_or(last_seg);
-    let hex_only: String = candidate
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect::<String>()
-        .to_ascii_lowercase();
+    let no_frag = trimmed.split('#').next().unwrap_or(trimmed);
+    Some(no_frag.split_once('?').unwrap_or((no_frag, "")))
+}
+
+/// Reads the ID at the end of one URL path segment: `Title-<32hex>`, a bare `<32hex>`,
+/// or a hyphenated UUID with or without a title slug (`Title-8-4-4-4-12`).
+///
+/// The ID is matched as whole hyphen-separated tokens, so letters of a title slug that happen
+/// to be hex digits are never absorbed into a shorter, malformed ID.
+fn id_from_segment(seg: &str) -> Option<String> {
+    let tokens: Vec<&str> = seg.split('-').collect();
+    let last = tokens.last().copied().unwrap_or("");
+    let hex_only: String = last.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if hex_only.len() == 32 {
-        Some(normalize_notion_id(&hex_only))
-    } else {
-        None
+        return Some(normalize_notion_id(&hex_only));
     }
+    const UUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    if tokens.len() < UUID_GROUPS.len() {
+        return None;
+    }
+    let tail = &tokens[tokens.len() - UUID_GROUPS.len()..];
+    let is_uuid = tail
+        .iter()
+        .zip(UUID_GROUPS)
+        .all(|(tok, len)| tok.len() == len && tok.chars().all(|c| c.is_ascii_hexdigit()));
+    is_uuid.then(|| normalize_notion_id(&tail.concat()))
+}
+
+/// Extracts the Notion 32-hex page/database ID from the path of a `notion.so` URL if provided.
+///
+/// Query parameters are ignored, so for a peek URL (`<database>?v=<view>&p=<row>`) this returns
+/// the database. Page commands use [`extract_page_id_from_notion_url`].
+pub fn extract_id_from_notion_url(input: &str) -> Option<String> {
+    let (path, _query) = notion_url_path_and_query(input)?;
+    let last_seg = path.rsplit('/').find(|seg| !seg.is_empty())?;
+    id_from_segment(last_seg)
+}
+
+/// Like [`extract_id_from_notion_url`], but a valid `p=<id>` query parameter (the page opened
+/// in side or center peek) wins over the path. `v=` (view) and `pvs=` are never returned.
+pub fn extract_page_id_from_notion_url(input: &str) -> Option<String> {
+    let (_path, query) = notion_url_path_and_query(input)?;
+    let peeked = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(key, _)| *key == "p")
+        .find_map(|(_, value)| {
+            let compact: String = value.chars().filter(|c| *c != '-').collect();
+            (compact.len() == 32 && compact.chars().all(|c| c.is_ascii_hexdigit()))
+                .then(|| normalize_notion_id(&compact))
+        });
+    peeked.or_else(|| extract_id_from_notion_url(input))
 }
 
 /// Compares two byte strings without stopping at the first difference (for secrets and API keys).
@@ -975,6 +1013,86 @@ mod tests {
             ),
             Some("12345678-90ab-cdef-1234-567890abcdef".to_string())
         );
+    }
+
+    #[test]
+    fn test_extract_id_peek_trailing_slash_and_hyphenated() {
+        const A: &str = "1234567890abcdef1234567890abcdef";
+        const B: &str = "abcdefabcdefabcdefabcdefabcdef12";
+        const V: &str = "00000000000000000000000000000099";
+        let a = Some("12345678-90ab-cdef-1234-567890abcdef".to_string());
+        let b = Some("abcdefab-cdef-abcd-efab-cdefabcdef12".to_string());
+
+        // (input, path ID, page ID)
+        let cases: Vec<(String, Option<String>, Option<String>)> = vec![
+            (
+                format!("https://www.notion.so/acme/Spec-{A}?pvs=4"),
+                a.clone(),
+                a.clone(),
+            ),
+            (
+                format!("https://www.notion.so/acme/Spec-{A}/"),
+                a.clone(),
+                a.clone(),
+            ),
+            (
+                "https://www.notion.so/12345678-90ab-cdef-1234-567890abcdef".to_string(),
+                a.clone(),
+                a.clone(),
+            ),
+            (
+                "https://www.notion.so/acme/Spec-12345678-90ab-cdef-1234-567890abcdef#block"
+                    .to_string(),
+                a.clone(),
+                a.clone(),
+            ),
+            (
+                format!("https://www.notion.so/{A}?v={V}&p={B}&pm=s"),
+                a.clone(),
+                b.clone(),
+            ),
+            (
+                format!("https://www.notion.so/{A}?v={V}&p=abcdefab-cdef-abcd-efab-cdefabcdef12"),
+                a.clone(),
+                b.clone(),
+            ),
+            (
+                format!("https://www.notion.so/{A}?p=not-an-id"),
+                a.clone(),
+                a.clone(),
+            ),
+            (
+                format!("https://www.notion.so/{A}?v={V}"),
+                a.clone(),
+                a.clone(),
+            ),
+            // `pvs=` and other keys ending in "p" are not the peek parameter.
+            (
+                format!("https://www.notion.so/{A}?pvs={B}&xp={B}"),
+                a.clone(),
+                a.clone(),
+            ),
+            // A slug that itself ends in hex characters still yields the last 32.
+            (
+                format!("https://www.notion.so/acme/Decade-abc-{A}"),
+                a.clone(),
+                a.clone(),
+            ),
+            // Scheme-less input keeps working.
+            (format!("notion.so/acme/Spec-{A}"), a.clone(), a.clone()),
+            (format!("https://example.com/{A}"), None, None),
+            ("https://www.notion.so/acme/".to_string(), None, None),
+            ("https://www.notion.so".to_string(), None, None),
+            (format!("https://www.notion.so/Spec-{}", &A[..31]), None, None),
+        ];
+        for (input, path_id, page_id) in cases {
+            assert_eq!(extract_id_from_notion_url(&input), path_id, "path: {input}");
+            assert_eq!(
+                extract_page_id_from_notion_url(&input),
+                page_id,
+                "page: {input}"
+            );
+        }
     }
 
     #[test]

@@ -4588,3 +4588,72 @@ async fn regression_s01_serve_rejects_cross_origin_and_foreign_host() {
     cors_server.abort();
     env.server.abort();
 }
+
+#[tokio::test]
+async fn regression_n14_peek_url_archives_row_not_parent() {
+    let env = start_audit_env().await;
+    env.mock.databases.lock().unwrap().push(audit_database(
+        AUDIT_DB,
+        "Sprint Tasks",
+        "2026-11-20T02:00:00.000Z",
+    ));
+    for (id, title) in [(AUDIT_PAGE_A, "Row A"), (AUDIT_PAGE_B, "Row B")] {
+        env.mock.add_page(audit_page(
+            id,
+            title,
+            json!({ "type": "database_id", "database_id": AUDIT_DB }),
+            "2026-11-20T02:00:00.000Z",
+        ));
+    }
+    let compact = |id: &str| id.replace('-', "");
+    let view = "00000000000000000000000000000099";
+
+    // A side-peek URL: the path is the database, p= is the row that is open.
+    let peek = format!(
+        "https://www.notion.so/acme/{}?v={view}&p={}&pm=s",
+        compact(AUDIT_DB),
+        compact(AUDIT_PAGE_B)
+    );
+    let archived = notion_cli::cli::op_archive_page(&env.client, &env.storage, &peek, true)
+        .await
+        .unwrap();
+    assert_eq!(archived.id, AUDIT_PAGE_B);
+    let patches = env.mock.requests_matching("PATCH", "/v1/pages/");
+    assert_eq!(patches.len(), 1, "{patches:?}");
+    assert_eq!(patches[0].path, format!("/v1/pages/{AUDIT_PAGE_B}"));
+    assert_eq!(patches[0].body, json!({ "archived": true }));
+    assert_eq!(env.mock.page(AUDIT_PAGE_B).unwrap()["archived"], true);
+    assert_eq!(env.mock.page(AUDIT_PAGE_A).unwrap()["archived"], false);
+    assert_eq!(env.mock.count("POST", "/v1/search"), 0, "URL input needs no lookup");
+
+    // Database commands given the same URL still target the database in the path.
+    env.mock.clear_requests();
+    let rows = notion_cli::cli::op_query_database(
+        &env.client,
+        &env.storage,
+        &peek,
+        None,
+        None,
+        20,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.items.len(), 1, "the archived row is gone, the other remains");
+    assert_eq!(env.mock.count("POST", &format!("/v1/databases/{AUDIT_DB}/query")), 1);
+
+    // Trailing slash and hyphenated UUID forms resolve to the page in the path.
+    env.mock.clear_requests();
+    for url in [
+        format!("https://www.notion.so/acme/Row-A-{}/", compact(AUDIT_PAGE_A)),
+        format!("https://www.notion.so/acme/Row-A-{AUDIT_PAGE_A}?pvs=4#top"),
+    ] {
+        let page = notion_cli::cli::op_archive_page(&env.client, &env.storage, &url, true)
+            .await
+            .unwrap();
+        assert_eq!(page.id, AUDIT_PAGE_A, "{url}");
+    }
+    assert_eq!(env.mock.count("PATCH", &format!("/v1/pages/{AUDIT_PAGE_A}")), 2);
+    env.server.abort();
+}
