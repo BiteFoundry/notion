@@ -1,5 +1,7 @@
 pub mod notion;
 
+pub(crate) use notion::is_markdown_table_separator;
+
 pub use notion::{
     apply_optimistic_markdown_to_detail, block_comparison_key, blocks_to_editor_markdown,
     blocks_to_markdown, blocks_to_plain_text, collect_media_refs, has_column_blocks,

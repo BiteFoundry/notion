@@ -1388,8 +1388,10 @@ fn render_blocks_md_with_options(
             NotionBlockKind::Table { .. } => {
                 for (row_idx, row) in blk.children.iter().enumerate() {
                     if let NotionBlockKind::TableRow { cells } = &row.kind {
-                        let cols: Vec<String> =
-                            cells.iter().map(|c| rich_text_to_markdown(c)).collect();
+                        let cols: Vec<String> = cells
+                            .iter()
+                            .map(|c| escape_table_cell(&rich_text_to_markdown(c)))
+                            .collect();
                         out.push(format!("{indent}| {} |", cols.join(" | ")));
                         if row_idx == 0 {
                             let sep: Vec<&str> = vec!["---"; cols.len().max(1)];
@@ -1400,7 +1402,10 @@ fn render_blocks_md_with_options(
                 out.push(String::new());
             }
             NotionBlockKind::TableRow { cells } => {
-                let cols: Vec<String> = cells.iter().map(|c| rich_text_to_markdown(c)).collect();
+                let cols: Vec<String> = cells
+                    .iter()
+                    .map(|c| escape_table_cell(&rich_text_to_markdown(c)))
+                    .collect();
                 out.push(format!("{indent}| {} |", cols.join(" | ")));
             }
             NotionBlockKind::Image { url, caption, .. } => {
@@ -1679,6 +1684,11 @@ fn leading_indent_level(raw: &str) -> usize {
     spaces / 2
 }
 
+/// Keeps a cell on one table row: `|` would start a new cell and a newline a new row.
+fn escape_table_cell(cell: &str) -> String {
+    cell.replace('|', "\\|").replace("\r\n", "<br>").replace('\n', "<br>")
+}
+
 fn split_markdown_table_row(line: &str) -> Vec<String> {
     let inner = line.trim();
     let inner = inner.strip_prefix('|').unwrap_or(inner);
@@ -1706,7 +1716,7 @@ fn split_markdown_table_row(line: &str) -> Vec<String> {
     cells
 }
 
-fn is_markdown_table_separator(line: &str) -> bool {
+pub(crate) fn is_markdown_table_separator(line: &str) -> bool {
     let trimmed = line.trim();
     if !trimmed.starts_with('|') {
         return false;
@@ -2567,6 +2577,39 @@ pub fn apply_optimistic_markdown_to_detail(detail: &mut NotionPageDetail, edited
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_cells_with_pipes_and_newlines_round_trip() {
+        let row = |cells: &[&str]| NotionBlock {
+            id: format!("row-{}", cells[0]),
+            block_type: "table_row".into(),
+            kind: NotionBlockKind::TableRow {
+                cells: cells.iter().map(|c| vec![RichTextSpan::plain(*c)]).collect(),
+            },
+            ..Default::default()
+        };
+        let table = NotionBlock {
+            id: "tbl".into(),
+            block_type: "table".into(),
+            has_children: true,
+            kind: NotionBlockKind::Table {
+                table_width: 2,
+                has_column_header: true,
+                has_row_header: false,
+            },
+            children: vec![row(&["Key", "Value"]), row(&["a|b", "line 1\nline 2"])],
+            ..Default::default()
+        };
+        let md = blocks_to_markdown(&[table]);
+        assert!(md.contains("| a\\|b | line 1<br>line 2 |"), "{md}");
+        let parsed = markdown_to_notion_blocks(&md);
+        assert_eq!(parsed.len(), 1, "{parsed:?}");
+        let rows = parsed[0]["table"]["children"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let cells = rows[1]["table_row"]["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 2, "the pipe stays inside one cell");
+        assert_eq!(cells[0][0]["text"]["content"], "a|b");
+    }
 
     #[test]
     fn test_markdown_to_notion_blocks_and_back() {

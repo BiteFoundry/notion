@@ -7,8 +7,8 @@ use crate::{
     models::{normalize_notion_id, NotionBlock, NotionBlockKind, NotionPageDetail, RichTextKind, RichTextSpan},
     notion::NotionClient,
     parser::{
-        blocks_to_editor_markdown, has_column_blocks, is_preserved_anchor_block,
-        markdown_to_notion_blocks,
+        blocks_to_editor_markdown, has_column_blocks, is_markdown_table_separator,
+        is_preserved_anchor_block, markdown_to_notion_blocks,
         notion::{
             block_inline_markdown, inline_markdown_spans, markdown_edit_ranges_with_options,
             rich_text_to_markdown,
@@ -1121,11 +1121,21 @@ fn parse_drafts(lines: &[&str]) -> Result<Vec<Draft>> {
                 }
             }
         }
+        // A GFM table (header, separator, rows) is one `table` block, not a paragraph per line.
+        let is_table = line.trim().starts_with('|')
+            && lines.get(i).is_some_and(|next| is_markdown_table_separator(next));
+        if is_table {
+            i += 1;
+            while i < lines.len() && lines[i].trim().starts_with('|') {
+                i += 1;
+            }
+        }
         let head = lines[start..i].join("\n");
         let mut payloads = markdown_to_notion_blocks(&head);
         ensure!(payloads.len() == 1, "Cannot parse an edited Markdown block");
         let child_start = i;
-        while i < lines.len() && (lines[i].trim().is_empty() || lines[i].starts_with("  ")) {
+        // A table's rows are its children; it takes no indented child blocks.
+        while !is_table && i < lines.len() && (lines[i].trim().is_empty() || lines[i].starts_with("  ")) {
             i += 1;
         }
         let child_lines: Vec<_> = lines[child_start..i]
@@ -1430,6 +1440,33 @@ mod tests {
             "page",
             None,
         )
+    }
+
+    #[test]
+    fn parse_drafts_groups_a_typed_table_into_one_block() {
+        let drafts = parse_drafts(&["| A | B |", "| --- | --- |", "| 1 | 2 |", "| 3 | 4 |"]).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].kind(), "table");
+        assert_eq!(drafts[0].payload["table"]["table_width"], 2);
+        let rows = drafts[0].payload["table"]["children"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r["type"] == "table_row"));
+        let payload = parse_drafts(&["| A | B |", "| --- | --- |", "| 1 | 2 |"]).unwrap().remove(0).into_payload().unwrap();
+        assert_eq!(payload["table"]["children"].as_array().unwrap().len(), 2, "rows survive into_payload");
+
+        // A lone pipe line is a paragraph, as before.
+        let lone = parse_drafts(&["| a | b |"]).unwrap();
+        assert_eq!(lone.len(), 1);
+        assert_eq!(lone[0].kind(), "paragraph");
+
+        // A table followed by a paragraph is two blocks.
+        let two = parse_drafts(&["| A | B |", "| --- | --- |", "| 1 | 2 |", "", "After"]).unwrap();
+        assert_eq!(two.iter().map(Draft::kind).collect::<Vec<_>>(), vec!["table", "paragraph"]);
+
+        // A table inside a fenced code block stays code.
+        let code = parse_drafts(&["```", "| A | B |", "| --- | --- |", "```"]).unwrap();
+        assert_eq!(code.len(), 1);
+        assert_eq!(code[0].kind(), "code");
     }
 
     #[test]

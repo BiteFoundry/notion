@@ -5312,3 +5312,56 @@ async fn regression_n13_stale_retry_refuses_to_overwrite_remote_edit() {
     assert_eq!(detail.blocks.len(), 2);
     env.server.abort();
 }
+
+#[tokio::test]
+async fn regression_n12_editor_inserts_real_table() {
+    let env = start_audit_env().await;
+    let workspace = json!({ "type": "workspace", "workspace": true });
+    env.mock.add_page(audit_page(AUDIT_PAGE_A, "Notes", workspace, "2026-11-20T02:00:00.000Z"));
+    env.mock.set_children(AUDIT_PAGE_A, vec![audit_block("b1200000-0000-4000-8000-000000000001", "paragraph", "Intro")]);
+
+    // A table typed into the editor becomes one table block.
+    let edited = "Intro\n\n| Name | Score |\n| --- | --- |\n| Ann | 3 |\n| Bo | 5 |";
+    notion_cli::cli::op_diff_sync_page_markdown(&env.client, &env.storage, AUDIT_PAGE_A, edited, None)
+        .await
+        .unwrap();
+    let appends = env.mock.requests_matching("PATCH", &format!("/v1/blocks/{AUDIT_PAGE_A}/children"));
+    assert_eq!(appends.len(), 1, "{appends:?}");
+    let sent = appends[0].body["children"].as_array().unwrap();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["type"], "table");
+    let rows = sent[0]["table"]["children"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r["type"] == "table_row"));
+    let pipe_paragraphs = env
+        .mock
+        .children_of(AUDIT_PAGE_A)
+        .iter()
+        .filter(|b| b["type"] == "paragraph" && audit_joined(&b["paragraph"]["rich_text"]).starts_with('|'))
+        .count();
+    assert_eq!(pipe_paragraphs, 0);
+
+    // 150 rows: 100 go with the table, the other 50 are appended to it. The mock rejects
+    // more than 100 children in one request, as Notion does.
+    env.mock.clear_requests();
+    let mut big = String::from("| N | Square |\n| --- | --- |");
+    for n in 1..150 {
+        big.push_str(&format!("\n| {n} | {} |", n * n));
+    }
+    let created = notion_cli::cli::op_append_blocks(&env.client, &env.storage, AUDIT_PAGE_A, &big)
+        .await
+        .unwrap();
+    assert_eq!(created.len(), 1);
+    let table_id = created[0].id.clone();
+    let appends = env.mock.requests_matching("PATCH", "/v1/blocks/");
+    let appends: Vec<_> = appends.into_iter().filter(|r| r.path.ends_with("/children")).collect();
+    assert_eq!(appends.len(), 2, "{:?}", appends.iter().map(|r| &r.path).collect::<Vec<_>>());
+    assert_eq!(appends[0].path, format!("/v1/blocks/{AUDIT_PAGE_A}/children"));
+    assert_eq!(appends[0].body["children"][0]["table"]["children"].as_array().unwrap().len(), 100);
+    assert_eq!(appends[1].path, format!("/v1/blocks/{table_id}/children"));
+    assert_eq!(appends[1].body["children"].as_array().unwrap().len(), 50);
+    let stored = env.mock.children_of(&table_id);
+    assert_eq!(stored.len(), 150);
+    assert_eq!(audit_joined(&stored[149]["table_row"]["cells"][0]), "149");
+    env.server.abort();
+}

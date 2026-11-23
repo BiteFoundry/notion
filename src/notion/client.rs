@@ -887,6 +887,22 @@ impl NotionClient {
         let Value::Array(children) = children else {
             unreachable!("chunk_payload keeps the JSON shape");
         };
+        // Notion takes at most 100 children per block in one request, and a table's rows are its
+        // children: send a long table with its first 100 rows and append the rest to it below.
+        let mut children = children;
+        let mut overflow_rows: Vec<(usize, Vec<Value>)> = Vec::new();
+        for (idx, child) in children.iter_mut().enumerate() {
+            if child["type"] != "table" {
+                continue;
+            }
+            if let Some(rows) = child
+                .pointer_mut("/table/children")
+                .and_then(Value::as_array_mut)
+                .filter(|rows| rows.len() > MAX_APPEND_BATCH_SIZE)
+            {
+                overflow_rows.push((idx, rows.split_off(MAX_APPEND_BATCH_SIZE)));
+            }
+        }
         let id = normalize_notion_id(block_id);
         let mut created = Vec::new();
         let mut cursor_after = after
@@ -926,6 +942,12 @@ impl NotionClient {
                 created.push(parsed);
             }
             cursor_after = created.last().map(|block| block.id.clone());
+        }
+        for (idx, rows) in overflow_rows {
+            let table_id = created[idx].id.clone();
+            Box::pin(self.insert_block_children(&table_id, None, false, rows))
+                .await
+                .with_context(|| format!("Table {table_id} was created, but appending rows 101+ failed"))?;
         }
         Ok(created)
     }
