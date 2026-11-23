@@ -1,9 +1,14 @@
 //! Captures 8 real `ratatui::TestBackend` frames (120x34) from `notion_cli::ui::draw`
 //! with 100% fictional English demo data and invokes the shared studio-grade GIF renderer.
+//!
+//! The renderer is not part of this repository. Point the example at it with:
+//! - `DEMO_RENDERER_SCRIPT`: path to `render_tui_gif.py`
+//!   (default `<repo>/scripts/render_tui_gif.py`)
+//! - `DEMO_PREVIEW_DIR`: where preview PNGs go (default `<repo>/target/demo-previews/notion`)
 
 use std::{
     collections::BTreeMap,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -37,8 +42,34 @@ use tokio::sync::{mpsc, watch};
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 34;
 
-const RENDERER_SCRIPT: &str = r"C:\Users\user\.gemini\antigravity-cli\brain\f9e7f082-6ac8-4e73-9827-8af29ccd4ff4\scratch\render_tui_gif.py";
-const PREVIEW_DIR: &str = r"C:\Users\user\.gemini\antigravity-cli\brain\f9e7f082-6ac8-4e73-9827-8af29ccd4ff4\scratch\gif-previews\notion";
+/// A non-empty environment variable as a path.
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `DEMO_RENDERER_SCRIPT`, else `<repo>/scripts/render_tui_gif.py`.
+fn renderer_script() -> PathBuf {
+    env_path("DEMO_RENDERER_SCRIPT").unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("render_tui_gif.py")
+    })
+}
+
+/// `DEMO_PREVIEW_DIR`, else `<repo>/target/demo-previews/notion`; created if missing.
+fn preview_dir() -> PathBuf {
+    let dir = env_path("DEMO_PREVIEW_DIR").unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("demo-previews")
+            .join("notion")
+    });
+    std::fs::create_dir_all(&dir)
+        .unwrap_or_else(|err| panic!("create preview dir {}: {err}", dir.display()));
+    dir
+}
 
 fn color_to_json(c: Color) -> Value {
     match c {
@@ -1015,12 +1046,21 @@ async fn main() {
         std::fs::create_dir_all(parent).expect("create assets dir");
     }
 
+    let script = renderer_script();
+    if !script.exists() {
+        eprintln!(
+            "Renderer script not found at {}. Set DEMO_RENDERER_SCRIPT to render_tui_gif.py.\nFrames were kept at {}.",
+            script.display(),
+            temp_json.display()
+        );
+        std::process::exit(1);
+    }
     let status = Command::new("python")
-        .arg(RENDERER_SCRIPT)
+        .arg(&script)
         .arg(&temp_json)
         .arg(&output_gif)
         .arg("--preview-png")
-        .arg(PREVIEW_DIR)
+        .arg(preview_dir())
         .status()
         .expect("invoke render_tui_gif.py");
 
