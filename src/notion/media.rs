@@ -218,26 +218,54 @@ fn file_name_from_url(url: &str) -> Option<String> {
     }
 }
 
+/// Longest file name written, in bytes; most file systems allow 255.
+const MAX_FILE_NAME_BYTES: usize = 200;
+
+/// Makes a downloaded file name safe on every OS. ASCII keeps only letters, digits, `.`, `-`,
+/// `_` and space; other characters are kept (so Korean, Japanese and Chinese names survive)
+/// except controls, bidirectional overrides, line separators and full-width slashes.
 fn sanitize_filename(raw: &str, mime: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .trim()
-        .to_string();
+    let keep = |c: char| {
+        if c.is_ascii() {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ')
+        } else {
+            !(c.is_control()
+                || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{FF0F}' | '\u{FF3C}'))
+        }
+    };
+    let cleaned: String = raw.chars().map(|c| if keep(c) { c } else { '_' }).collect();
+    // Windows rejects names that end in a dot or a space.
+    let cleaned = cleaned.trim().trim_end_matches(['.', ' ']).to_string();
     let mut name = if cleaned.is_empty() {
         "notion-media".to_string()
     } else {
         cleaned
     };
+    // Windows device names are reserved with any extension; keep synced folders portable.
+    let stem = name.split('.').next().unwrap_or_default().trim_end();
+    let reserved = matches!(stem.to_ascii_uppercase().as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && stem.is_ascii()
+            && ["COM", "LPT"].iter().any(|p| stem[..3].eq_ignore_ascii_case(p))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+    if reserved {
+        name.insert(0, '_');
+    }
     if !name.contains('.') {
         name.push_str(ext_for_mime(mime));
+    }
+    if name.len() > MAX_FILE_NAME_BYTES {
+        let ext = name
+            .rfind('.')
+            .map(|dot| name[dot..].to_string())
+            .filter(|ext| ext.len() <= 20)
+            .unwrap_or_default();
+        let mut cut = MAX_FILE_NAME_BYTES - ext.len();
+        while !name.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        name = format!("{}{ext}", name[..cut].trim_end_matches(['.', ' ']));
     }
     name
 }
@@ -441,6 +469,30 @@ pub fn ext_for_mime(mime: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_filename_keeps_cjk_names_and_ascii_rules() {
+        let pdf = "application/pdf";
+        assert_eq!(sanitize_filename("2026년_회의록.pdf", pdf), "2026년_회의록.pdf");
+        assert_eq!(sanitize_filename("議事録 最終.docx", pdf), "議事録 最終.docx");
+        assert_eq!(sanitize_filename("report (1).pdf", pdf), "report _1_.pdf");
+        assert_eq!(sanitize_filename("a/b\\c:d.png", pdf), "a_b_c_d.png");
+        assert_eq!(sanitize_filename("evil\u{202E}gpj.exe", pdf), "evil_gpj.exe");
+        assert_eq!(sanitize_filename("line\u{2028}break\u{FF0F}x.txt", pdf), "line_break_x.txt");
+        assert_eq!(sanitize_filename("CON.txt", pdf), "_CON.txt");
+        assert_eq!(sanitize_filename("nul", "image/png"), "_nul.png");
+        assert_eq!(sanitize_filename("com7.log", pdf), "_com7.log");
+        assert_eq!(sanitize_filename("COM0.log", pdf), "COM0.log");
+        assert_eq!(sanitize_filename("console.txt", pdf), "console.txt");
+        assert_eq!(sanitize_filename("a가.txt", pdf), "a가.txt", "a 4-byte non-ASCII stem is not a device name");
+        assert_eq!(sanitize_filename("name. ", "image/png"), "name.png");
+        assert_eq!(sanitize_filename("", "image/png"), "notion-media.png");
+        let long = format!("{}.pdf", "가".repeat(300));
+        let cut = sanitize_filename(&long, pdf);
+        assert!(cut.len() <= MAX_FILE_NAME_BYTES, "{}", cut.len());
+        assert!(cut.ends_with(".pdf"));
+        assert!(cut.starts_with("가가"));
+    }
 
     #[test]
     fn test_html_and_svg_mime_sniffing_never_misclassified_as_raster_or_bin() {

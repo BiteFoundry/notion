@@ -5365,3 +5365,37 @@ async fn regression_n12_editor_inserts_real_table() {
     assert_eq!(audit_joined(&stored[149]["table_row"]["cells"][0]), "149");
     env.server.abort();
 }
+
+#[tokio::test]
+async fn regression_n19_download_keeps_korean_filename() {
+    let env = start_audit_env().await;
+    let workspace = json!({ "type": "workspace", "workspace": true });
+    env.mock.add_page(audit_page(AUDIT_PAGE_A, "Minutes", workspace, "2026-11-20T02:00:00.000Z"));
+    env.mock.media.lock().unwrap().insert("minutes.pdf".into(), b"%PDF-1.4 minutes".to_vec());
+    let base = env.cfg.api_base_url.trim_end_matches("/v1").to_string();
+    let file_block = "f1900000-0000-4000-8000-000000000001";
+    env.mock.set_children(
+        AUDIT_PAGE_A,
+        vec![json!({
+            "object": "block",
+            "id": file_block,
+            "type": "file",
+            "has_children": false,
+            "file": {
+                "type": "external",
+                "external": { "url": format!("{base}/media/minutes.pdf") },
+                "name": "2026년_회의록.pdf",
+                "caption": []
+            }
+        })],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let dl = media::download_media_target(&env.cfg, &env.client, file_block, Some(dir.path()))
+        .await
+        .unwrap();
+    assert_eq!(dl.file_name, "2026년_회의록.pdf");
+    let path = dir.path().join("2026년_회의록.pdf");
+    assert!(path.exists(), "{}", dl.path);
+    assert_eq!(std::fs::read(&path).unwrap(), b"%PDF-1.4 minutes");
+    env.server.abort();
+}
