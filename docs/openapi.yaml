@@ -1,14 +1,43 @@
 openapi: 3.1.0
 info:
   title: "@bitefoundry/notion Local HTTP API"
-  version: 0.1.0
-  description: Local HTTP JSON API exposed by `notion serve` (default `127.0.0.1:8791`).
+  version: 0.4.1
+  description: |
+    Local HTTP JSON API exposed by `notion serve` (default `127.0.0.1:8791`).
+
+    Every `/api/v1/*` route requires the API key as `Authorization: Bearer <key>` or
+    `x-api-key: <key>`. The key comes from `--api-key` or `NOTION_SERVE_API_KEY`; when neither
+    is set on a loopback bind, a random key is generated for the run and printed once to stderr.
+    `--allow-keyless` (loopback only) disables the key.
+
+    Every route, `/health` included, answers `403` with `{"ok":false,"error":"Forbidden host"}`
+    when the `Host` header is not a loopback name, the bind address or an `--allowed-host` value,
+    and with `{"ok":false,"error":"Forbidden origin"}` for a browser request from an origin that
+    was not opted in with `--cors-origin`. No CORS headers are sent without `--cors-origin`.
 servers:
   - url: http://127.0.0.1:8791
+security:
+  - bearerAuth: []
+  - apiKeyHeader: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: x-api-key
+  responses:
+    Unauthorized:
+      description: Missing or wrong API key (`{"ok":false,"error":"Unauthorized"}`)
+    Forbidden:
+      description: Foreign `Host` header or browser origin that was not opted in
 paths:
   /health:
     get:
       summary: Health check
+      security: []
       responses:
         "200":
           description: Service status

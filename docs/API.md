@@ -3,12 +3,34 @@
 Start the local HTTP JSON API server (default `127.0.0.1:8791`):
 
 ```bash
+# No key given: a random key is generated for this run and printed once to stderr.
 notion serve --port 8791
-# Optional API key protection (required when binding non-loopback hosts):
+# Your own key, from the flag or from NOTION_SERVE_API_KEY (keeps it out of the process list):
+notion serve --port 8791 --api-key "$NOTION_LOCAL_API_KEY"
+NOTION_SERVE_API_KEY="$NOTION_LOCAL_API_KEY" notion serve
+# A non-loopback bind always needs a key:
 notion serve --host 0.0.0.0 --port 8791 --api-key "$NOTION_LOCAL_API_KEY"
 ```
 
-When `--api-key` is configured, pass `x-api-key: <key>` or `Authorization: Bearer <key>` on all `/api/v1/*` routes.
+## Authentication and browser access
+
+Pass `x-api-key: <key>` or `Authorization: Bearer <key>` on all `/api/v1/*` routes. `GET /health` needs no key.
+
+| Flag | Effect |
+|---|---|
+| `--api-key <key>` | Key to require. Falls back to the `NOTION_SERVE_API_KEY` environment variable. |
+| _(no key)_ | On `127.0.0.1` / `::1` a 32-byte random key is generated and printed once to stderr as `API key (generated, valid for this run): <key>`. It is never written to disk. On any other bind address the server refuses to start. |
+| `--allow-keyless` | Serve `/api/v1/*` without a key. Loopback binds only; prints a warning to stderr. |
+| `--allowed-host <name>` | Accept one more `Host` header name (repeatable). |
+| `--cors-origin <origin>` | Allow one exact browser origin such as `https://app.example.com` (repeatable). No wildcard. |
+
+The server is closed to web pages by default:
+
+- **No CORS headers** are sent unless `--cors-origin` is given, so a page on another origin cannot read a response or pass a preflight. With `--cors-origin`, only the listed origins get `Access-Control-Allow-Origin`, for `GET`, `POST`, `PATCH` and the headers `content-type`, `authorization`, `x-api-key`. The key is still required.
+- **`Host` allowlist** (DNS-rebinding protection): on a loopback bind the `Host` header must name `127.0.0.1`, `localhost`, `[::1]`, the bind address, or an `--allowed-host` value; the port is ignored. Anything else returns `403 {"ok":false,"error":"Forbidden host"}`. On a non-loopback bind the check runs only when `--allowed-host` is given.
+- **Cross-site requests**: a request with an `Origin` header that is not an allowed origin, or with `Sec-Fetch-Site: cross-site` / `same-site` and no allowed origin, returns `403 {"ok":false,"error":"Forbidden origin"}` before it reaches Notion.
+
+Command-line clients (`curl`, scripts, agents) send none of those headers and are unaffected.
 
 Errors return `{ "ok": false, "error": "..." }` and preserve the upstream Notion API HTTP status code (such as `401`, `403`, `404`, `409`, or `429`) when a request fails upstream.
 

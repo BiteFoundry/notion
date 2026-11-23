@@ -117,6 +117,8 @@ notion serve --host 127.0.0.1 --port 8791 --api-key "$API_TOKEN"
 curl -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:8791/api/v1/search?q=Roadmap"
 ```
 
+`/api/v1/*` always needs a key: pass `--api-key` or set `NOTION_SERVE_API_KEY`, otherwise a random key is generated for the run and printed once to stderr (`--allow-keyless` turns it off on loopback binds). Browsers are locked out by default: there are no CORS headers unless you pass `--cors-origin <origin>`, and requests with a foreign `Host` header are rejected (`--allowed-host <name>` adds one).
+
 Full endpoint catalog and OpenAPI schema: **[docs/API.md](docs/API.md)** · **[docs/openapi.yaml](docs/openapi.yaml)**.
 
 ### MCP Server (`notion mcp` — 20 Tools)

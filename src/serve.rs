@@ -15,13 +15,13 @@
 //! - `GET /api/v1/pages/{id}/comments`, `POST /api/v1/pages/{id}/comments`
 //! - `POST /api/v1/sync`
 
-use std::{net::IpAddr, sync::Arc};
+use std::{collections::HashSet, net::IpAddr, sync::Arc};
 
 use anyhow::{bail, Context, Result};
 use axum::{
     body::Body,
     extract::{Path as AxumPath, Query, State},
-    http::{HeaderMap, Request, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
@@ -30,7 +30,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
     auth::AuthManager,
@@ -47,6 +47,221 @@ pub struct ApiState {
     pub client: NotionClient,
     pub storage: Storage,
     pub api_key: Option<String>,
+}
+
+/// Environment variable read when `--api-key` is not passed (keeps the key out of the process list).
+pub const SERVE_API_KEY_ENV: &str = "NOTION_SERVE_API_KEY";
+
+/// Request-guard settings for the HTTP API router.
+///
+/// The default allows only loopback `Host` names and no browser origins, which is what
+/// `build_router` uses.
+#[derive(Debug, Clone)]
+pub struct ServeOptions {
+    /// Extra `Host` names accepted besides `127.0.0.1`, `localhost` and `::1` (port ignored).
+    pub allowed_hosts: Vec<String>,
+    /// Exact browser origins (`scheme://host[:port]`) that may call the API cross-origin.
+    pub cors_origins: Vec<String>,
+    /// When false the `Host` header is not checked (non-loopback bind without `--allowed-host`).
+    pub enforce_host: bool,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            allowed_hosts: Vec::new(),
+            cors_origins: Vec::new(),
+            enforce_host: true,
+        }
+    }
+}
+
+/// Runtime inputs of `notion serve` that come from the command line.
+#[derive(Debug, Clone, Default)]
+pub struct ServeArgs {
+    pub api_key: Option<String>,
+    pub allow_keyless: bool,
+    pub allowed_hosts: Vec<String>,
+    pub cors_origins: Vec<String>,
+}
+
+/// How `/api/v1/*` is protected for one `notion serve` run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyMode {
+    /// Key passed with `--api-key` or `NOTION_SERVE_API_KEY`.
+    Provided(String),
+    /// No key was given on a loopback bind: a random key valid for this run.
+    Generated(String),
+    /// `--allow-keyless` on a loopback bind.
+    Keyless,
+}
+
+impl KeyMode {
+    fn into_key(self) -> Option<String> {
+        match self {
+            KeyMode::Provided(key) | KeyMode::Generated(key) => Some(key),
+            KeyMode::Keyless => None,
+        }
+    }
+}
+
+/// Decides the API key for a run. Pure so it can be tested without binding a socket.
+pub fn resolve_serve_key(
+    flag: Option<&str>,
+    env: Option<&str>,
+    allow_keyless: bool,
+    is_loopback: bool,
+    host: &str,
+) -> Result<KeyMode> {
+    let given = [flag, env]
+        .into_iter()
+        .flatten()
+        .find(|key| !key.trim().is_empty());
+    if let Some(key) = given {
+        return Ok(KeyMode::Provided(key.to_string()));
+    }
+    if !is_loopback {
+        bail!("Refusing to bind non-loopback address {host} without --api-key");
+    }
+    if allow_keyless {
+        return Ok(KeyMode::Keyless);
+    }
+    Ok(KeyMode::Generated(crate::auth::generate_random_hex(32)))
+}
+
+/// Lowercased host name of a `Host` header value without its port; `None` when malformed.
+fn host_name_of(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.contains(['/', '@', '?', '#', ' ', '\\']) {
+        return None;
+    }
+    let host = if let Some(rest) = value.strip_prefix('[') {
+        let (inner, after) = rest.split_once(']')?;
+        if !(after.is_empty() || is_port_suffix(after)) {
+            return None;
+        }
+        inner
+    } else {
+        match value.rsplit_once(':') {
+            Some((name, port)) if !name.contains(':') => {
+                if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                name
+            }
+            // A bare IPv6 literal such as `::1` (no brackets, so no port).
+            Some(_) => value,
+            None => value,
+        }
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+fn is_port_suffix(after: &str) -> bool {
+    after
+        .strip_prefix(':')
+        .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Canonical `scheme://host[:port]` form of an origin; `None` for anything else (`null`, paths, `*`).
+fn normalize_origin(value: &str) -> Option<String> {
+    let value = value.trim();
+    let parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    if !matches!(parsed.path(), "" | "/") || parsed.query().is_some() || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    Some(parsed.origin().ascii_serialization())
+}
+
+struct RequestGuard {
+    allowed_hosts: HashSet<String>,
+    allowed_origins: HashSet<String>,
+    enforce_host: bool,
+}
+
+impl RequestGuard {
+    fn new(options: &ServeOptions) -> Self {
+        let mut allowed_hosts: HashSet<String> = ["127.0.0.1", "localhost", "::1"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        allowed_hosts.extend(options.allowed_hosts.iter().filter_map(|h| host_name_of(h)));
+        Self {
+            allowed_hosts,
+            allowed_origins: options
+                .cors_origins
+                .iter()
+                .filter_map(|o| normalize_origin(o))
+                .collect(),
+            enforce_host: options.enforce_host,
+        }
+    }
+
+    fn host_allowed(&self, host: Option<&str>) -> bool {
+        if !self.enforce_host {
+            return true;
+        }
+        host.and_then(host_name_of)
+            .is_some_and(|name| self.allowed_hosts.contains(&name))
+    }
+
+    fn origin_allowed(&self, origin: &str) -> bool {
+        normalize_origin(origin).is_some_and(|o| self.allowed_origins.contains(&o))
+    }
+}
+
+fn forbidden(message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "ok": false, "error": message })),
+    )
+        .into_response()
+}
+
+/// Rejects DNS-rebinding (`Host`) and cross-site browser requests (`Origin`, `Sec-Fetch-Site`)
+/// before any handler runs. Runs for every route, `/health` included.
+async fn origin_host_guard(
+    State(guard): State<Arc<RequestGuard>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let headers = req.headers();
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    if !guard.host_allowed(host) {
+        return forbidden("Forbidden host");
+    }
+    match headers.get(header::ORIGIN) {
+        Some(origin) => {
+            if !origin.to_str().is_ok_and(|o| guard.origin_allowed(o)) {
+                return forbidden("Forbidden origin");
+            }
+        }
+        None => {
+            // Browsers omit `Origin` on some no-CORS requests but still send `Sec-Fetch-Site`.
+            let site = headers
+                .get("sec-fetch-site")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_ascii_lowercase());
+            if matches!(site.as_deref(), Some("cross-site" | "same-site")) {
+                return forbidden("Forbidden origin");
+            }
+        }
+    }
+    next.run(req).await
 }
 
 #[derive(Debug)]
@@ -197,6 +412,12 @@ fn default_limit() -> usize {
 }
 
 pub fn build_router(state: Arc<ApiState>) -> Router {
+    build_router_with(state, ServeOptions::default())
+}
+
+/// `build_router` with explicit `Host` / origin settings (used by `notion serve`).
+pub fn build_router_with(state: Arc<ApiState>, options: ServeOptions) -> Router {
+    let guard = Arc::new(RequestGuard::new(&options));
     let protected = Router::new()
         .route("/api/v1/whoami", get(whoami_handler))
         .route("/api/v1/workspaces", get(workspaces_handler))
@@ -230,15 +451,28 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             auth_middleware,
         ));
 
-    Router::new()
+    let mut app = Router::new()
         .route("/health", get(health_handler))
-        .merge(protected)
-        .layer(
+        .merge(protected);
+    // No CORS headers at all unless an origin was opted in with `--cors-origin`.
+    if !guard.allowed_origins.is_empty() {
+        let origins: Vec<HeaderValue> = guard
+            .allowed_origins
+            .iter()
+            .filter_map(|o| HeaderValue::from_str(o).ok())
+            .collect();
+        app = app.layer(
             CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+                .allow_origin(AllowOrigin::list(origins))
+                .allow_methods([Method::GET, Method::POST, Method::PATCH])
+                .allow_headers([
+                    header::CONTENT_TYPE,
+                    header::AUTHORIZATION,
+                    HeaderName::from_static("x-api-key"),
+                ]),
+        );
+    }
+    app.layer(middleware::from_fn_with_state(guard, origin_host_guard))
         .with_state(state)
 }
 
@@ -249,23 +483,66 @@ pub async fn run(
     storage: Storage,
     host: &str,
     port: u16,
-    api_key: Option<String>,
+    args: ServeArgs,
 ) -> Result<()> {
     let ip: IpAddr = host
         .parse()
         .with_context(|| format!("Invalid bind host IP: {host}"))?;
-    if !ip.is_loopback() && api_key.as_deref().unwrap_or("").trim().is_empty() {
-        bail!("Refusing to bind non-loopback address {host} without --api-key");
+    let env_key = std::env::var(SERVE_API_KEY_ENV).ok();
+    let key_mode = resolve_serve_key(
+        args.api_key.as_deref(),
+        env_key.as_deref(),
+        args.allow_keyless,
+        ip.is_loopback(),
+        host,
+    )?;
+    for origin in &args.cors_origins {
+        if normalize_origin(origin).is_none() {
+            bail!("Invalid --cors-origin {origin:?}: expected an exact origin such as https://app.example.com (no path, no wildcard)");
+        }
+    }
+    for allowed in &args.allowed_hosts {
+        if host_name_of(allowed).is_none() {
+            bail!("Invalid --allowed-host {allowed:?}: expected a host name or IP address");
+        }
+    }
+    let mut allowed_hosts = args.allowed_hosts.clone();
+    allowed_hosts.push(host.to_string());
+    let options = ServeOptions {
+        // A wildcard bind such as 0.0.0.0 cannot enumerate its valid names, and that mode
+        // always requires a key, so the Host check there is opt-in through --allowed-host.
+        enforce_host: ip.is_loopback() || !args.allowed_hosts.is_empty(),
+        allowed_hosts,
+        cors_origins: args.cors_origins,
+    };
+    // All notices go to stderr; the generated key is shown once and never stored.
+    match &key_mode {
+        KeyMode::Provided(_) => {}
+        KeyMode::Generated(key) => {
+            eprintln!("API key (generated, valid for this run): {key}");
+            eprintln!(
+                "Send it as `Authorization: Bearer <key>` or `x-api-key: <key>`. Pass --api-key or set {SERVE_API_KEY_ENV} to choose your own; --allow-keyless turns the key off."
+            );
+        }
+        KeyMode::Keyless => {
+            eprintln!(
+                "Warning: --allow-keyless is set; any local process can call this API without a key."
+            );
+        }
     }
     let state = Arc::new(ApiState {
         config,
         auth,
         client,
         storage,
-        api_key: api_key.filter(|k| !k.trim().is_empty()),
+        api_key: key_mode.into_key(),
     });
-    let app = build_router(state);
-    let addr = format!("{host}:{port}");
+    let app = build_router_with(state, options);
+    let addr = if ip.is_ipv6() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("Failed to bind HTTP API server on {addr}"))?;
@@ -291,7 +568,10 @@ async fn auth_middleware(
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.strip_prefix("Bearer "))
             });
-        if got != Some(expected.as_str()) {
+        let matches = got.is_some_and(|key| {
+            crate::models::constant_time_eq(key.as_bytes(), expected.as_bytes())
+        });
+        if !matches {
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "ok": false, "error": "Unauthorized" })),
@@ -587,4 +867,130 @@ async fn sync_handler(State(state): State<Arc<ApiState>>) -> Result<Json<Value>,
         "fetched_count": outcome.fetched,
         "complete": true,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_name_parsing_accepts_loopback_forms_and_rejects_lookalikes() {
+        assert_eq!(host_name_of("127.0.0.1:8791").as_deref(), Some("127.0.0.1"));
+        assert_eq!(host_name_of("localhost").as_deref(), Some("localhost"));
+        assert_eq!(host_name_of("LOCALHOST:80").as_deref(), Some("localhost"));
+        assert_eq!(host_name_of("localhost.").as_deref(), Some("localhost"));
+        assert_eq!(host_name_of("[::1]:8791").as_deref(), Some("::1"));
+        assert_eq!(host_name_of("[::1]").as_deref(), Some("::1"));
+        assert_eq!(host_name_of("::1").as_deref(), Some("::1"));
+        assert_eq!(host_name_of(""), None);
+        assert_eq!(host_name_of("   "), None);
+        assert_eq!(host_name_of("127.0.0.1:"), None);
+        assert_eq!(host_name_of("127.0.0.1:80a"), None);
+        assert_eq!(host_name_of("[::1]evil"), None);
+        assert_eq!(host_name_of("user@127.0.0.1"), None);
+        assert_eq!(host_name_of("127.0.0.1/evil"), None);
+
+        let guard = RequestGuard::new(&ServeOptions::default());
+        for ok in ["127.0.0.1:8791", "localhost", "[::1]:8791", "localhost:1"] {
+            assert!(guard.host_allowed(Some(ok)), "{ok}");
+        }
+        for bad in [
+            "evil.example",
+            "127.0.0.1.evil.example",
+            "localhost.evil.example:8791",
+            "evil.example:8791",
+            "",
+        ] {
+            assert!(!guard.host_allowed(Some(bad)), "{bad}");
+        }
+        assert!(!guard.host_allowed(None));
+    }
+
+    #[test]
+    fn host_guard_honours_allowed_hosts_and_opt_out() {
+        let guard = RequestGuard::new(&ServeOptions {
+            allowed_hosts: vec!["notion.internal".into(), "10.0.0.5".into()],
+            ..ServeOptions::default()
+        });
+        assert!(guard.host_allowed(Some("notion.internal:8791")));
+        assert!(guard.host_allowed(Some("10.0.0.5")));
+        assert!(guard.host_allowed(Some("127.0.0.1:8791")));
+        assert!(!guard.host_allowed(Some("other.internal")));
+
+        let open = RequestGuard::new(&ServeOptions {
+            enforce_host: false,
+            ..ServeOptions::default()
+        });
+        assert!(open.host_allowed(Some("anything.example")));
+        assert!(open.host_allowed(None));
+    }
+
+    #[test]
+    fn origins_match_exactly_and_never_by_prefix_or_wildcard() {
+        let guard = RequestGuard::new(&ServeOptions {
+            cors_origins: vec!["https://app.example.com".into(), "*".into()],
+            ..ServeOptions::default()
+        });
+        assert!(guard.origin_allowed("https://app.example.com"));
+        assert!(guard.origin_allowed("HTTPS://APP.EXAMPLE.COM"));
+        assert!(guard.origin_allowed("https://app.example.com:443"));
+        assert!(!guard.origin_allowed("http://app.example.com"));
+        assert!(!guard.origin_allowed("https://app.example.com.evil.example"));
+        assert!(!guard.origin_allowed("https://app.example.com:8443"));
+        assert!(!guard.origin_allowed("null"));
+        assert!(!guard.origin_allowed("*"));
+        assert_eq!(normalize_origin("https://app.example.com/path"), None);
+        assert_eq!(normalize_origin("*"), None);
+
+        let none = RequestGuard::new(&ServeOptions::default());
+        assert!(!none.origin_allowed("http://127.0.0.1:8791"));
+    }
+
+    #[test]
+    fn serve_key_resolution_covers_loopback_and_remote_binds() {
+        // Non-loopback without a key always fails, with or without --allow-keyless.
+        for keyless in [false, true] {
+            let err = resolve_serve_key(None, None, keyless, false, "0.0.0.0").unwrap_err();
+            assert!(err.to_string().contains("Refusing to bind non-loopback"));
+        }
+        assert!(resolve_serve_key(Some("  "), Some(""), false, false, "0.0.0.0").is_err());
+        assert_eq!(
+            resolve_serve_key(Some("k1"), None, false, false, "0.0.0.0").unwrap(),
+            KeyMode::Provided("k1".into())
+        );
+
+        // Loopback without a key generates 32 random bytes (64 hex characters).
+        let KeyMode::Generated(first) =
+            resolve_serve_key(None, None, false, true, "127.0.0.1").unwrap()
+        else {
+            panic!("expected a generated key");
+        };
+        let KeyMode::Generated(second) =
+            resolve_serve_key(None, Some(" "), false, true, "127.0.0.1").unwrap()
+        else {
+            panic!("expected a generated key");
+        };
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+
+        // --allow-keyless only applies on loopback and only when no key was given.
+        assert_eq!(
+            resolve_serve_key(None, None, true, true, "127.0.0.1").unwrap(),
+            KeyMode::Keyless
+        );
+        assert_eq!(
+            resolve_serve_key(Some("k2"), None, true, true, "127.0.0.1").unwrap(),
+            KeyMode::Provided("k2".into())
+        );
+        // The flag wins over the environment variable.
+        assert_eq!(
+            resolve_serve_key(Some("flag"), Some("env"), false, true, "127.0.0.1").unwrap(),
+            KeyMode::Provided("flag".into())
+        );
+        assert_eq!(
+            resolve_serve_key(None, Some("env"), false, true, "127.0.0.1").unwrap(),
+            KeyMode::Provided("env".into())
+        );
+    }
 }

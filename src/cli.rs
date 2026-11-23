@@ -476,8 +476,18 @@ pub enum Command {
         host: String,
         #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
         port: u16,
+        /// API key required on `/api/v1/*` (or set `NOTION_SERVE_API_KEY`); generated per run when omitted
         #[arg(long)]
         api_key: Option<String>,
+        /// Serve without an API key (loopback binds only)
+        #[arg(long, alias = "no-auth")]
+        allow_keyless: bool,
+        /// Extra `Host` header name to accept besides loopback names (repeatable)
+        #[arg(long, value_name = "HOST")]
+        allowed_host: Vec<String>,
+        /// Exact browser origin allowed to call the API with CORS, e.g. `https://app.example.com` (repeatable)
+        #[arg(long, alias = "allowed-origin", value_name = "ORIGIN")]
+        cors_origin: Vec<String>,
     },
     /// Run stdio JSON-RPC 2.0 MCP server
     #[command(visible_alias = "mcp-server")]
@@ -1119,9 +1129,18 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             host,
             port,
             api_key,
+            allow_keyless,
+            allowed_host,
+            cors_origin,
         } => {
             let (auth, client, storage) = open_runtime(&config, workspace_override).await?;
-            serve::run(config, auth, client, storage, &host, port, api_key).await
+            let args = serve::ServeArgs {
+                api_key,
+                allow_keyless,
+                allowed_hosts: allowed_host,
+                cors_origins: cors_origin,
+            };
+            serve::run(config, auth, client, storage, &host, port, args).await
         }
         Command::Mcp => {
             let (auth, client, storage) = open_runtime(&config, workspace_override).await?;

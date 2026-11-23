@@ -897,6 +897,18 @@ pub fn extract_id_from_notion_url(input: &str) -> Option<String> {
     }
 }
 
+/// Compares two byte strings without stopping at the first difference (for secrets and API keys).
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Helper to build a Notion API rich_text array payload from plain text.
 pub fn plain_rich_text_json(text: &str) -> Value {
     serde_json::json!([{
@@ -963,6 +975,14 @@ mod tests {
             ),
             Some("12345678-90ab-cdef-1234-567890abcdef".to_string())
         );
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secret1"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     #[test]

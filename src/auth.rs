@@ -688,7 +688,7 @@ pub fn sanitize_profile_slug(raw: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-fn generate_random_hex(num_bytes: usize) -> String {
+pub(crate) fn generate_random_hex(num_bytes: usize) -> String {
     let mut bytes = vec![0u8; num_bytes];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)

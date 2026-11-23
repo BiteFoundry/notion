@@ -3798,3 +3798,793 @@ async fn regression_notion_bug_05_code_block_single_edit_preserves_literal_text(
     api_server.abort();
     mock_server.abort();
 }
+
+// ---------------------------------------------------------------------------------------------
+// v0.4.1 audit regressions (S-01, N-01 .. N-19)
+//
+// AuditMock is a stateful Notion mock that records every request and enforces the request
+// limits that matter for these regressions: at most 2,000 UTF-16 units per text span, at most
+// 100 items per rich_text array and at most 100 children per parent in one request.
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct AuditRequest {
+    method: String,
+    path: String,
+    query: String,
+    body: Value,
+}
+
+#[derive(Clone, Default)]
+struct AuditMock {
+    pages: Arc<Mutex<Vec<Value>>>,
+    databases: Arc<Mutex<Vec<Value>>>,
+    children: Arc<Mutex<std::collections::HashMap<String, Vec<Value>>>>,
+    comments: Arc<Mutex<Vec<Value>>>,
+    media: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    requests: Arc<Mutex<Vec<AuditRequest>>>,
+    next_id: Arc<AtomicUsize>,
+}
+
+fn audit_text(text: &str) -> Value {
+    json!([{ "type": "text", "text": { "content": text }, "plain_text": text }])
+}
+
+fn audit_page(id: &str, title: &str, parent: Value, last_edited: &str) -> Value {
+    let title_key = if parent.get("database_id").is_some() { "Name" } else { "title" };
+    json!({
+        "object": "page",
+        "id": id,
+        "url": format!("https://www.notion.so/{}", id.replace('-', "")),
+        "parent": parent,
+        "archived": false,
+        "last_edited_time": last_edited,
+        "properties": { title_key: { "id": "title", "type": "title", "title": audit_text(title) } }
+    })
+}
+
+fn audit_database(id: &str, title: &str, last_edited: &str) -> Value {
+    json!({
+        "object": "database",
+        "id": id,
+        "url": format!("https://www.notion.so/{}", id.replace('-', "")),
+        "parent": { "type": "workspace", "workspace": true },
+        "title": audit_text(title),
+        "description": [],
+        "last_edited_time": last_edited,
+        "properties": {
+            "Name": { "id": "title", "type": "title", "title": {} },
+            "Notes": { "id": "nt", "type": "rich_text", "rich_text": {} },
+            "Done": { "id": "dn", "type": "checkbox", "checkbox": {} }
+        }
+    })
+}
+
+fn audit_block(id: &str, kind: &str, text: &str) -> Value {
+    json!({
+        "object": "block",
+        "id": id,
+        "type": kind,
+        "has_children": false,
+        kind: { "rich_text": audit_text(text) }
+    })
+}
+
+fn audit_error(status: StatusCode, code: &str, message: impl Into<String>) -> axum::response::Response {
+    (
+        status,
+        Json(json!({
+            "object": "error",
+            "status": status.as_u16(),
+            "code": code,
+            "message": message.into()
+        })),
+    )
+        .into_response()
+}
+
+fn audit_not_found(what: &str, id: &str) -> axum::response::Response {
+    audit_error(
+        StatusCode::NOT_FOUND,
+        "object_not_found",
+        format!("Could not find {what} with ID: {id}."),
+    )
+}
+
+/// Returns the first Notion request-limit violation in a write body.
+fn audit_limit_violation(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(content) = map.get("text").and_then(|t| t.get("content")).and_then(Value::as_str) {
+                let units = content.encode_utf16().count();
+                if units > 2000 {
+                    return Some(format!(
+                        "text.content.length should be <= 2000, instead was {units}."
+                    ));
+                }
+            }
+            for (key, child) in map {
+                if let Some(items) = child.as_array() {
+                    let cap_applies = matches!(key.as_str(), "rich_text" | "title" | "caption" | "children");
+                    if cap_applies && items.len() > 100 {
+                        return Some(format!(
+                            "{key}.length should be <= 100, instead was {}.",
+                            items.len()
+                        ));
+                    }
+                }
+                if let Some(found) = audit_limit_violation(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(audit_limit_violation),
+        _ => None,
+    }
+}
+
+/// Mirrors Notion echoing plain_text for every text span it stores.
+fn audit_fill_plain_text(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let content = map
+                .get("text")
+                .and_then(|t| t.get("content"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(content) = content {
+                map.entry("type").or_insert_with(|| json!("text"));
+                map.insert("plain_text".into(), json!(content));
+            }
+            for child in map.values_mut() {
+                audit_fill_plain_text(child);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(audit_fill_plain_text),
+        _ => {}
+    }
+}
+
+fn audit_title_of(object: &Value) -> String {
+    let spans = if object["object"] == "database" {
+        object.get("title").and_then(Value::as_array).cloned()
+    } else {
+        object["properties"].as_object().and_then(|props| {
+            props
+                .values()
+                .find(|p| p["type"] == "title")
+                .and_then(|p| p["title"].as_array().cloned())
+        })
+    };
+    spans
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| s["plain_text"].as_str())
+        .collect()
+}
+
+fn audit_paginate(items: Vec<Value>, page_size: usize, cursor: Option<&str>) -> Value {
+    let start = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0).min(items.len());
+    let end = (start + page_size.clamp(1, 100)).min(items.len());
+    let has_more = end < items.len();
+    json!({
+        "object": "list",
+        "results": items[start..end],
+        "has_more": has_more,
+        "next_cursor": if has_more { json!(end.to_string()) } else { Value::Null }
+    })
+}
+
+impl AuditMock {
+    fn new_id(&self, prefix: &str) -> String {
+        let n = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+        format!("{prefix}0000-0000-4000-8000-{n:012x}")
+    }
+
+    fn add_page(&self, page: Value) {
+        self.pages.lock().unwrap().push(page);
+    }
+
+    fn set_children(&self, parent: &str, blocks: Vec<Value>) {
+        self.children.lock().unwrap().insert(parent.to_string(), blocks);
+    }
+
+    fn children_of(&self, parent: &str) -> Vec<Value> {
+        self.children.lock().unwrap().get(parent).cloned().unwrap_or_default()
+    }
+
+    fn page(&self, id: &str) -> Option<Value> {
+        self.pages.lock().unwrap().iter().find(|p| p["id"] == id).cloned()
+    }
+
+    fn requests_matching(&self, method: &str, path_prefix: &str) -> Vec<AuditRequest> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == method && r.path.starts_with(path_prefix))
+            .cloned()
+            .collect()
+    }
+
+    fn count(&self, method: &str, path_prefix: &str) -> usize {
+        self.requests_matching(method, path_prefix).len()
+    }
+
+    fn clear_requests(&self) {
+        self.requests.lock().unwrap().clear();
+    }
+
+    fn block_exists(&self, id: &str) -> bool {
+        self.children
+            .lock()
+            .unwrap()
+            .values()
+            .any(|list| list.iter().any(|b| b["id"] == id))
+    }
+
+    fn with_has_children(&self, mut block: Value) -> Value {
+        let id = block["id"].as_str().unwrap_or_default().to_string();
+        let has = self.children.lock().unwrap().get(&id).is_some_and(|c| !c.is_empty());
+        block["has_children"] = json!(has);
+        block
+    }
+
+    /// Stores one appended block (and its nested children) and returns the stored JSON.
+    fn store_block(&self, mut block: Value) -> Value {
+        let id = self.new_id("b10c");
+        let kind = block["type"].as_str().map(str::to_owned).unwrap_or_else(|| {
+            block
+                .as_object()
+                .and_then(|m| m.keys().find(|k| *k != "object" && *k != "children").cloned())
+                .unwrap_or_else(|| "paragraph".into())
+        });
+        let mut nested = block
+            .get_mut(&kind)
+            .and_then(Value::as_object_mut)
+            .and_then(|inner| inner.remove("children"));
+        if nested.is_none() {
+            nested = block.as_object_mut().and_then(|m| m.remove("children"));
+        }
+        block["object"] = json!("block");
+        block["id"] = json!(id);
+        block["type"] = json!(kind);
+        audit_fill_plain_text(&mut block);
+        let stored_children: Vec<Value> = nested
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|child| self.store_block(child))
+            .collect();
+        block["has_children"] = json!(!stored_children.is_empty());
+        if !stored_children.is_empty() {
+            self.children.lock().unwrap().insert(id, stored_children);
+        }
+        block
+    }
+
+    async fn handle(
+        State(mock): State<AuditMock>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        let path = uri.path().to_string();
+        let query = uri.query().unwrap_or("").to_string();
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        mock.requests.lock().unwrap().push(AuditRequest {
+            method: method.to_string(),
+            path: path.clone(),
+            query: query.clone(),
+            body: body.clone(),
+        });
+        let params: std::collections::HashMap<String, String> =
+            url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+        let page_size = |fallback: usize| {
+            params
+                .get("page_size")
+                .and_then(|v| v.parse::<usize>().ok())
+                .or_else(|| body["page_size"].as_u64().map(|v| v as usize))
+                .unwrap_or(fallback)
+        };
+        let cursor = params
+            .get("start_cursor")
+            .cloned()
+            .or_else(|| body["start_cursor"].as_str().map(str::to_owned));
+
+        if let Some(name) = path.strip_prefix("/media/") {
+            let decoded = urlencoding::decode(name).map(|c| c.into_owned()).unwrap_or_default();
+            return match mock.media.lock().unwrap().get(&decoded).cloned() {
+                Some(bytes) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/pdf")],
+                    bytes,
+                )
+                    .into_response(),
+                None => StatusCode::NOT_FOUND.into_response(),
+            };
+        }
+
+        let is_write = matches!(method.as_str(), "POST" | "PATCH")
+            && !path.ends_with("/query")
+            && path != "/v1/search";
+        if is_write {
+            if let Some(violation) = audit_limit_violation(&body) {
+                return audit_error(
+                    StatusCode::BAD_REQUEST,
+                    "validation_error",
+                    format!("body failed validation: {violation}"),
+                );
+            }
+        }
+
+        let segs: Vec<&str> = path.trim_start_matches("/v1/").split('/').collect();
+        match (method.as_str(), segs.as_slice()) {
+            ("GET", ["users", "me"]) => Json(json!({
+                "object": "user",
+                "id": "bot-audit-1",
+                "name": "Audit Bot",
+                "type": "bot",
+                "bot": { "workspace_name": "Audit Workspace" }
+            }))
+            .into_response(),
+            ("POST", ["search"]) => {
+                let wanted = body.pointer("/filter/value").and_then(Value::as_str);
+                let needle = body["query"].as_str().unwrap_or("").to_lowercase();
+                let mut all: Vec<Value> = Vec::new();
+                if wanted != Some("database") {
+                    all.extend(mock.pages.lock().unwrap().iter().cloned());
+                }
+                if wanted != Some("page") {
+                    all.extend(mock.databases.lock().unwrap().iter().cloned());
+                }
+                all.retain(|o| needle.is_empty() || audit_title_of(o).to_lowercase().contains(&needle));
+                all.sort_by(|a, b| {
+                    b["last_edited_time"]
+                        .as_str()
+                        .unwrap_or("")
+                        .cmp(a["last_edited_time"].as_str().unwrap_or(""))
+                });
+                Json(audit_paginate(all, page_size(100), cursor.as_deref())).into_response()
+            }
+            ("POST", ["pages"]) => {
+                let id = mock.new_id("9a6e");
+                let mut page = json!({
+                    "object": "page",
+                    "id": id,
+                    "url": format!("https://www.notion.so/{}", id.replace('-', "")),
+                    "parent": body.get("parent").cloned().unwrap_or_else(|| json!({ "type": "workspace" })),
+                    "icon": body.get("icon").cloned().unwrap_or(Value::Null),
+                    "archived": false,
+                    "last_edited_time": "2026-11-22T10:00:00.000Z",
+                    "properties": body.get("properties").cloned().unwrap_or_else(|| json!({}))
+                });
+                if let Some(props) = page["properties"].as_object_mut() {
+                    for prop in props.values_mut() {
+                        let kind = prop.as_object().and_then(|m| m.keys().next().cloned());
+                        if let (Some(kind), None) = (kind, prop.get("type")) {
+                            prop["type"] = json!(kind);
+                        }
+                    }
+                }
+                audit_fill_plain_text(&mut page);
+                let stored: Vec<Value> = body["children"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|child| mock.store_block(child))
+                    .collect();
+                mock.children.lock().unwrap().insert(id, stored);
+                mock.pages.lock().unwrap().push(page.clone());
+                Json(page).into_response()
+            }
+            ("GET", ["pages", id]) => match mock.page(id) {
+                Some(page) => Json(page).into_response(),
+                None => audit_not_found("page", id),
+            },
+            ("PATCH", ["pages", id]) => {
+                let mut pages = mock.pages.lock().unwrap();
+                let Some(page) = pages.iter_mut().find(|p| p["id"] == *id) else {
+                    return audit_not_found("page", id);
+                };
+                if let Some(archived) = body["archived"].as_bool() {
+                    page["archived"] = json!(archived);
+                }
+                if let Some(icon) = body.get("icon") {
+                    page["icon"] = icon.clone();
+                }
+                if let Some(props) = body["properties"].as_object() {
+                    for (name, value) in props {
+                        let mut value = value.clone();
+                        audit_fill_plain_text(&mut value);
+                        let kind = value.as_object().and_then(|m| m.keys().next().cloned());
+                        let slot = &mut page["properties"][name];
+                        if !slot.is_object() {
+                            *slot = json!({});
+                        }
+                        if let Some(fields) = value.as_object() {
+                            for (k, v) in fields {
+                                slot[k] = v.clone();
+                            }
+                        }
+                        if let (Some(kind), None) = (kind, slot.get("type")) {
+                            slot["type"] = json!(kind);
+                        }
+                    }
+                }
+                Json(page.clone()).into_response()
+            }
+            ("GET", ["blocks", id]) => {
+                let found = mock
+                    .children
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .flat_map(|list| list.iter())
+                    .find(|b| b["id"] == *id)
+                    .cloned();
+                match found {
+                    Some(block) => Json(mock.with_has_children(block)).into_response(),
+                    None => audit_not_found("block", id),
+                }
+            }
+            ("PATCH", ["blocks", id]) => {
+                let mut map = mock.children.lock().unwrap();
+                let Some(block) = map
+                    .values_mut()
+                    .flat_map(|list| list.iter_mut())
+                    .find(|b| b["id"] == *id)
+                else {
+                    return audit_not_found("block", id);
+                };
+                let kind = block["type"].as_str().unwrap_or("paragraph").to_string();
+                if let Some(fields) = body[&kind].as_object() {
+                    for (k, v) in fields {
+                        let mut v = v.clone();
+                        audit_fill_plain_text(&mut v);
+                        block[&kind][k] = v;
+                    }
+                }
+                Json(block.clone()).into_response()
+            }
+            ("DELETE", ["blocks", id]) => {
+                let mut map = mock.children.lock().unwrap();
+                let mut removed = None;
+                for list in map.values_mut() {
+                    if let Some(pos) = list.iter().position(|b| b["id"] == *id) {
+                        removed = Some(list.remove(pos));
+                        break;
+                    }
+                }
+                match removed {
+                    Some(mut block) => {
+                        map.remove(*id);
+                        block["archived"] = json!(true);
+                        Json(block).into_response()
+                    }
+                    None => audit_not_found("block", id),
+                }
+            }
+            ("GET", ["blocks", id, "children"]) => {
+                if mock.page(id).is_none() && !mock.block_exists(id) {
+                    return audit_not_found("block", id);
+                }
+                let list: Vec<Value> = mock
+                    .children_of(id)
+                    .into_iter()
+                    .map(|b| mock.with_has_children(b))
+                    .collect();
+                Json(audit_paginate(list, page_size(100), cursor.as_deref())).into_response()
+            }
+            ("PATCH", ["blocks", id, "children"]) => {
+                if mock.page(id).is_none() && !mock.block_exists(id) {
+                    return audit_not_found("block", id);
+                }
+                let after = body["after"].as_str();
+                if let Some(anchor) = after {
+                    if !mock.children_of(id).iter().any(|b| b["id"] == anchor) {
+                        return audit_not_found("block", anchor);
+                    }
+                }
+                let created: Vec<Value> = body["children"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|child| mock.store_block(child))
+                    .collect();
+                let mut map = mock.children.lock().unwrap();
+                let list = map.entry(id.to_string()).or_default();
+                let at = match after {
+                    Some(anchor) => list.iter().position(|b| b["id"] == anchor).map(|p| p + 1),
+                    None if body.pointer("/position/type") == Some(&json!("start")) => Some(0),
+                    None => None,
+                }
+                .unwrap_or(list.len());
+                for (offset, block) in created.iter().enumerate() {
+                    list.insert(at + offset, block.clone());
+                }
+                Json(json!({ "object": "list", "results": created })).into_response()
+            }
+            ("GET", ["databases", id]) => {
+                match mock.databases.lock().unwrap().iter().find(|d| d["id"] == *id).cloned() {
+                    Some(db) => Json(db).into_response(),
+                    None => audit_not_found("database", id),
+                }
+            }
+            ("POST", ["databases", id, "query"]) => {
+                let rows: Vec<Value> = mock
+                    .pages
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|p| p.pointer("/parent/database_id").and_then(Value::as_str) == Some(*id))
+                    .filter(|p| p["archived"] != json!(true))
+                    .cloned()
+                    .collect();
+                Json(audit_paginate(rows, page_size(100), cursor.as_deref())).into_response()
+            }
+            ("GET", ["comments"]) => {
+                let block_id = params.get("block_id").cloned().unwrap_or_default();
+                let list: Vec<Value> = mock
+                    .comments
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c.pointer("/parent/page_id").and_then(Value::as_str) == Some(block_id.as_str()))
+                    .cloned()
+                    .collect();
+                Json(audit_paginate(list, page_size(100), cursor.as_deref())).into_response()
+            }
+            ("POST", ["comments"]) => {
+                let mut rich_text = body.get("rich_text").cloned().unwrap_or_else(|| json!([]));
+                audit_fill_plain_text(&mut rich_text);
+                let comment = json!({
+                    "object": "comment",
+                    "id": mock.new_id("c033"),
+                    "parent": body.get("parent").cloned().unwrap_or(Value::Null),
+                    "discussion_id": body["discussion_id"].as_str().unwrap_or("disc-audit-1"),
+                    "created_time": "2026-11-22T10:05:00.000Z",
+                    "created_by": { "id": "bot-audit-1", "name": "Audit Bot" },
+                    "rich_text": rich_text
+                });
+                mock.comments.lock().unwrap().push(comment.clone());
+                Json(comment).into_response()
+            }
+            _ => audit_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_url",
+                format!("AuditMock has no route for {method} {path}"),
+            ),
+        }
+    }
+}
+
+struct AuditEnv {
+    mock: AuditMock,
+    cfg: AppConfig,
+    auth: AuthManager,
+    client: NotionClient,
+    storage: Storage,
+    server: tokio::task::JoinHandle<()>,
+}
+
+async fn start_audit_env() -> AuditEnv {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let mock = AuditMock::default();
+    let app = Router::new().fallback(AuditMock::handle).with_state(mock.clone());
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let cfg = test_config(&base_url);
+    let auth = AuthManager::from_token(cfg.clone(), "ntn_audit_token");
+    let client = NotionClient::new(&cfg, auth.clone()).unwrap();
+    AuditEnv {
+        mock,
+        cfg,
+        auth,
+        client,
+        storage: Storage::open_in_memory().unwrap(),
+        server,
+    }
+}
+
+/// Serves the HTTP API for an AuditEnv on a random loopback port.
+async fn start_audit_api(
+    env: &AuditEnv,
+    api_key: Option<&str>,
+    options: serve::ServeOptions,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let state = Arc::new(serve::ApiState {
+        config: env.cfg.clone(),
+        auth: env.auth.clone(),
+        client: env.client.clone(),
+        storage: env.storage.clone(),
+        api_key: api_key.map(str::to_owned),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, serve::build_router_with(state, options)).await;
+    });
+    (base, server)
+}
+
+const AUDIT_PAGE_A: &str = "a11d0000-0000-4000-8000-00000000000a";
+const AUDIT_PAGE_B: &str = "a11d0000-0000-4000-8000-00000000000b";
+const AUDIT_DB: &str = "a11d0000-0000-4000-8000-0000000000db";
+
+#[tokio::test]
+async fn regression_s01_serve_rejects_cross_origin_and_foreign_host() {
+    let env = start_audit_env().await;
+    env.mock.add_page(audit_page(
+        AUDIT_PAGE_A,
+        "Launch Plan",
+        json!({ "type": "workspace", "workspace": true }),
+        "2026-11-20T02:00:00.000Z",
+    ));
+    let (api, api_server) = start_audit_api(&env, Some("local-secret"), serve::ServeOptions::default()).await;
+    let http = reqwest::Client::new();
+    let forbidden = |resp: &reqwest::Response| {
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "a rejected request must not carry CORS headers"
+        );
+    };
+
+    // 1. Preflight from a foreign origin: rejected, and never answered with CORS headers.
+    let preflight = http
+        .request(reqwest::Method::OPTIONS, format!("{api}/api/v1/pages"))
+        .header("Origin", "https://evil.example")
+        .header("Access-Control-Request-Method", "POST")
+        .header("Access-Control-Request-Headers", "content-type,x-api-key")
+        .send()
+        .await
+        .unwrap();
+    forbidden(&preflight);
+    assert!(preflight.headers().get("access-control-allow-methods").is_none());
+
+    // 2. A simple cross-origin GET, even with the right key.
+    let cross_get = http
+        .get(format!("{api}/api/v1/search?q=x"))
+        .header("Origin", "https://evil.example")
+        .header("x-api-key", "local-secret")
+        .send()
+        .await
+        .unwrap();
+    forbidden(&cross_get);
+    let body: Value = cross_get.json().await.unwrap();
+    assert_eq!(body, json!({ "ok": false, "error": "Forbidden origin" }));
+
+    // 3. DNS rebinding: the socket is loopback but the Host header names another site.
+    for host in ["evil.example", "127.0.0.1.evil.example:8791", "localhost.evil.example"] {
+        let rebound = http
+            .get(format!("{api}/api/v1/whoami"))
+            .header("Host", host)
+            .header("x-api-key", "local-secret")
+            .send()
+            .await
+            .unwrap();
+        forbidden(&rebound);
+        let body: Value = rebound.json().await.unwrap();
+        assert_eq!(body, json!({ "ok": false, "error": "Forbidden host" }), "{host}");
+    }
+    let health_rebound = http
+        .get(format!("{api}/health"))
+        .header("Host", "evil.example")
+        .send()
+        .await
+        .unwrap();
+    forbidden(&health_rebound);
+
+    // 4. A body-less cross-site POST needs no preflight; it must not reach Notion.
+    let searches_before = env.mock.count("POST", "/v1/search");
+    for site in ["cross-site", "same-site"] {
+        let cross_post = http
+            .post(format!("{api}/api/v1/sync"))
+            .header("Sec-Fetch-Site", site)
+            .header("x-api-key", "local-secret")
+            .send()
+            .await
+            .unwrap();
+        forbidden(&cross_post);
+    }
+    assert_eq!(env.mock.count("POST", "/v1/search"), searches_before);
+    assert!(env.mock.requests.lock().unwrap().is_empty(), "no guarded request may reach Notion");
+
+    // 5. The same calls from a local client with the key work, with no CORS headers at all.
+    let health = http.get(format!("{api}/health")).send().await.unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    let missing_key = http.get(format!("{api}/api/v1/whoami")).send().await.unwrap();
+    assert_eq!(missing_key.status(), StatusCode::UNAUTHORIZED);
+    let wrong_key = http
+        .get(format!("{api}/api/v1/whoami"))
+        .header("Authorization", "Bearer local-secreT")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_key.status(), StatusCode::UNAUTHORIZED);
+    let whoami = http
+        .get(format!("{api}/api/v1/whoami"))
+        .header("Authorization", "Bearer local-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(whoami.status(), StatusCode::OK);
+    assert!(whoami.headers().get("access-control-allow-origin").is_none());
+    let sync = http
+        .post(format!("{api}/api/v1/sync"))
+        .header("x-api-key", "local-secret")
+        .header("Sec-Fetch-Site", "none")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sync.status(), StatusCode::OK);
+    let sync_body: Value = sync.json().await.unwrap();
+    assert_eq!(sync_body["pages_count"], 1);
+    api_server.abort();
+
+    // 6. --cors-origin opts in exactly one origin; --allowed-host one extra Host name.
+    let (cors_api, cors_server) = start_audit_api(
+        &env,
+        Some("local-secret"),
+        serve::ServeOptions {
+            allowed_hosts: vec!["notion.internal".into()],
+            cors_origins: vec!["https://app.example.com".into()],
+            enforce_host: true,
+        },
+    )
+    .await;
+    let allowed_preflight = http
+        .request(reqwest::Method::OPTIONS, format!("{cors_api}/api/v1/pages"))
+        .header("Origin", "https://app.example.com")
+        .header("Access-Control-Request-Method", "POST")
+        .header("Access-Control-Request-Headers", "content-type,x-api-key")
+        .send()
+        .await
+        .unwrap();
+    assert!(allowed_preflight.status().is_success());
+    assert_eq!(
+        allowed_preflight.headers()["access-control-allow-origin"],
+        "https://app.example.com"
+    );
+    let allowed_get = http
+        .get(format!("{cors_api}/api/v1/whoami"))
+        .header("Origin", "https://app.example.com")
+        .header("Sec-Fetch-Site", "cross-site")
+        .header("Host", "notion.internal:8791")
+        .header("x-api-key", "local-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed_get.status(), StatusCode::OK);
+    assert_eq!(
+        allowed_get.headers()["access-control-allow-origin"],
+        "https://app.example.com"
+    );
+    // The opt-in does not remove the key requirement.
+    let allowed_origin_no_key = http
+        .get(format!("{cors_api}/api/v1/whoami"))
+        .header("Origin", "https://app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed_origin_no_key.status(), StatusCode::UNAUTHORIZED);
+    for origin in ["https://evil.example", "https://app.example.com.evil.example", "null"] {
+        let other = http
+            .get(format!("{cors_api}/api/v1/whoami"))
+            .header("Origin", origin)
+            .header("x-api-key", "local-secret")
+            .send()
+            .await
+            .unwrap();
+        forbidden(&other);
+    }
+
+    cors_server.abort();
+    env.server.abort();
+}

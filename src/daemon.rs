@@ -31,7 +31,7 @@ use tokio::{
 use crate::{
     auth::AuthManager,
     config::{ensure_parent, AppConfig},
-    models::{CoreEvent, POLL_RETRY_SUMMARY},
+    models::{constant_time_eq, CoreEvent, POLL_RETRY_SUMMARY},
     notion::NotionClient,
     storage::Storage,
     sync::{self, FocusTarget, SyncCommand, SyncController},
@@ -430,17 +430,6 @@ fn generate_secret() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 fn is_user_compatible(expected_user_id: Option<&str>, actual_user_id: Option<&str>) -> bool {
