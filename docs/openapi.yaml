@@ -103,14 +103,27 @@ paths:
           description: Page not found or page body unavailable in the offline cache
     patch:
       summary: Update page metadata, properties, or archive state
+      description: Every field given is applied in one Notion call.
       parameters:
         - name: id
           in: path
           required: true
           schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                icon: { type: string, description: Emoji; an empty string is ignored }
+                archived: { type: boolean }
+                properties: { type: object }
       responses:
         "200":
           description: Updated page
+        "400":
+          description: None of title, icon, archived, properties was given
   /api/v1/pages/{id}/blocks:
     get:
       summary: Get recursive children of a page or block
@@ -163,9 +176,20 @@ paths:
           in: path
           required: true
           schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter: { type: object }
+                sorts: { type: array, items: { type: object } }
+                limit: { type: integer }
+                cursor: { type: string, description: next_cursor from the previous response }
+                offline: { type: boolean, default: false }
       responses:
         "200":
-          description: Database rows
+          description: Database rows ({ ok, count, rows, has_more, next_cursor })
         "400":
           description: Invalid offline query (filter or sorts combined with offline=true) or invalid limit
   /api/v1/databases/{id}/items:

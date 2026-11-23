@@ -4481,17 +4481,16 @@ mod tests {
         assert_eq!(opt_detail.media.len(), 1);
 
         // 4. Stale known_existing ID -> 404 triggers clean fallback refetch + retry!
+        // The cache holds "Intro" under an ID that no longer exists; the content is unchanged.
         let stale_known = vec![
             NotionBlock {
                 id: "blk-stale-gone".into(),
                 page_id: page_id.into(),
                 block_type: "paragraph".into(),
-                kind: NotionBlockKind::Paragraph {
-                    rich_text: vec![RichTextSpan::plain("Stale")],
-                    color: NotionColor::Default,
-                },
+                kind: detail2.blocks[0].kind.clone(),
                 ..Default::default()
             },
+            detail2.blocks[1].clone(),
             detail2.blocks[2].clone(),
             detail2.blocks[3].clone(),
         ];

@@ -385,6 +385,9 @@ struct QueryDbBody {
     sorts: Option<Value>,
     #[serde(default = "default_limit")]
     limit: usize,
+    /// `next_cursor` from the previous response.
+    #[serde(default)]
+    cursor: Option<String>,
     #[serde(default)]
     offline: bool,
 }
@@ -676,33 +679,15 @@ async fn patch_page_handler(
     AxumPath(id): AxumPath<String>,
     Json(body): Json<PatchPageBody>,
 ) -> Result<Json<Value>, ApiError> {
-    if let Some(archived) = body.archived {
-        let updated = cli::op_archive_page(&state.client, &state.storage, &id, archived)
-            .await
-            .map_err(ApiError::from_anyhow)?;
-        return Ok(Json(json!({ "ok": true, "page": updated })));
-    }
-    if body.properties.is_some() {
-        let updated = cli::op_update_database_item(
-            &state.client,
-            &state.storage,
-            &id,
-            body.title.as_deref(),
-            None,
-            body.properties,
-        )
-        .await
-        .map_err(ApiError::from_anyhow)?;
-        return Ok(Json(json!({ "ok": true, "page": updated })));
-    }
-    let title = body.title.as_deref().map(Some);
-    let icon = body
-        .icon
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(Some);
-    let updated = cli::op_update_page_metadata(&state.client, &state.storage, &id, title, icon)
+    // An empty or whitespace icon is ignored, as before.
+    let icon = body.icon.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let patch = cli::PagePatch {
+        title: body.title.as_deref(),
+        icon,
+        archived: body.archived,
+        properties: body.properties,
+    };
+    let updated = cli::op_patch_page(&state.client, &state.storage, &id, patch)
         .await
         .map_err(ApiError::from_anyhow)?;
     Ok(Json(json!({ "ok": true, "page": updated })))
@@ -788,14 +773,18 @@ async fn query_database_handler(
         body.filter,
         body.sorts,
         body.limit,
-        None,
+        body.cursor.as_deref().map(str::trim).filter(|c| !c.is_empty()),
         body.offline,
     )
     .await
     .map_err(ApiError::from_anyhow)?;
-    Ok(Json(
-        json!({ "ok": true, "count": rows.items.len(), "rows": rows.items }),
-    ))
+    Ok(Json(json!({
+        "ok": true,
+        "count": rows.items.len(),
+        "rows": rows.items,
+        "has_more": rows.has_more,
+        "next_cursor": rows.next_cursor,
+    })))
 }
 
 async fn create_database_item_handler(

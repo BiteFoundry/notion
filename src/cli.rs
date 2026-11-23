@@ -2516,6 +2516,85 @@ async fn patch_page_metadata(
     Ok(updated)
 }
 
+/// Fields of one `PATCH /api/v1/pages/{id}` request. `None` leaves a field as it is.
+#[derive(Debug, Default)]
+pub struct PagePatch<'a> {
+    pub title: Option<&'a str>,
+    pub icon: Option<&'a str>,
+    pub archived: Option<bool>,
+    pub properties: Option<Value>,
+}
+
+/// Applies every field of `patch` in one Notion `PATCH /v1/pages/{id}` call. A request with a
+/// single field sends the same payload as the dedicated operation for that field.
+pub async fn op_patch_page(
+    client: &NotionClient,
+    storage: &Storage,
+    page: &str,
+    patch: PagePatch<'_>,
+) -> Result<NotionPage> {
+    let PagePatch {
+        title,
+        icon,
+        archived,
+        properties,
+    } = patch;
+    if title.is_none() && icon.is_none() && archived.is_none() && properties.is_none() {
+        bail!("At least one of title, icon, archived, properties is required");
+    }
+    let ws_id = client.auth().active_workspace_id().await;
+    let id = resolver::resolve_page_id_for_write(storage, client, &ws_id, page, archived == Some(false))
+        .await?;
+    let mut payload = serde_json::Map::new();
+    if properties.is_some() {
+        // Same property building as `op_update_database_item`.
+        let props = if title.is_some() {
+            let current = client.get_page(&id).await?;
+            let columns = current.properties.iter().filter_map(|(name, value)| {
+                let kind = match value {
+                    NotionPropertyValue::Title(_) => "title",
+                    NotionPropertyValue::Status(_) => "status",
+                    NotionPropertyValue::Select(_) => "select",
+                    _ => return None,
+                };
+                Some((name.as_str(), kind))
+            });
+            database_item_properties(columns, title, None, properties)?
+        } else {
+            property_map(properties)?
+        };
+        if !props.is_empty() {
+            payload.insert("properties".into(), Value::Object(props));
+        }
+    } else if let Some(text) = title {
+        // Same title payload as `op_update_page_metadata`.
+        let current = client.get_page(&id).await?;
+        let key = current
+            .properties
+            .into_iter()
+            .find_map(|(name, property)| matches!(property, NotionPropertyValue::Title(_)).then_some(name))
+            .context("Page has no accessible title property")?;
+        let spans = if text.is_empty() {
+            json!([])
+        } else {
+            json!([{ "type": "text", "text": { "content": text } }])
+        };
+        payload.insert("properties".into(), json!({ (key): { "title": spans } }));
+    }
+    if let Some(emoji) = icon {
+        payload.insert("icon".into(), json!({ "type": "emoji", "emoji": emoji }));
+    }
+    if let Some(archived) = archived {
+        payload.insert("archived".into(), json!(archived));
+    }
+    if payload.is_empty() {
+        bail!("At least one of title, icon, archived, properties is required");
+    }
+    let updated = client.update_page(&id, Value::Object(payload)).await?;
+    let _ = storage.upsert_page(&updated);
+    Ok(updated)
+}
+
 pub async fn op_archive_page(
     client: &NotionClient,
     storage: &Storage,
@@ -2655,6 +2734,11 @@ async fn apply_page_edit(
                 && known.is_some()
                 && NotionClient::is_authoritative_not_found(&error)
             {
+                // Re-planning against the fresh tree would overwrite a teammate's change with the
+                // stale text in the user's buffer; only retry when nothing else changed.
+                if !crate::page_edit::retry_is_safe(&existing, &fresh.blocks, edited_markdown) {
+                    bail!("Page blocks changed while editing. Reload the page before saving.");
+                }
                 let retry = crate::page_edit::PageEdit::plan(&id, &fresh.blocks, edited_markdown)?;
                 if let Err(error) = retry.apply(client, &id).await {
                     let _ = storage.invalidate_page_detail(&ws_id, &id);

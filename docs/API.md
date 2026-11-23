@@ -45,12 +45,12 @@ Errors return `{ "ok": false, "error": "..." }` and preserve the upstream Notion
 | `GET` | `/api/v1/pages?archived=false&refresh=false&offline=false` | List pages in active workspace |
 | `POST` | `/api/v1/pages` | Create a new page (`{ parent_id, title, icon?, markdown?, parent_is_database?, properties? }`) |
 | `GET` | `/api/v1/pages/{id}?offline=false` | Get full page detail (`detail` includes metadata, properties, block tree, comments, markdown, media refs, `incomplete_blocks`, and `comments_has_more`). Offline reads return HTTP 404 when the page body has not been fetched. |
-| `PATCH` | `/api/v1/pages/{id}` | Update page title, icon, properties, or archive/unarchive (`{ title?, icon?, archived?, properties? }`) |
+| `PATCH` | `/api/v1/pages/{id}` | Update page title, icon, properties, or archive/unarchive (`{ title?, icon?, archived?, properties? }`). Every field given is applied in one Notion call; a body with none of them returns HTTP 400. |
 | `GET` | `/api/v1/pages/{id}/blocks?offline=false` | Get a page or block's recursive children. Offline reads return HTTP 404 for an uncached list and HTTP 200 for a verified empty list. |
 | `POST` | `/api/v1/pages/{id}/blocks` | Append Markdown or slash-style blocks (`{ markdown }`) |
 | `PATCH` | `/api/v1/blocks/{id}` | Update block text or toggle `to_do.checked` (`{ block_type?, text?, checked? }`) |
 | `GET` | `/api/v1/databases?refresh=false&offline=false` | List databases & schemas |
-| `POST` | `/api/v1/databases/{id}/query` | Query database rows (`{ filter?, sorts?, limit?, offline? }`). Returns HTTP 400 when `offline: true` is combined with `filter` or `sorts`. |
+| `POST` | `/api/v1/databases/{id}/query` | Query database rows (`{ filter?, sorts?, limit?, cursor?, offline? }` → `{ ok, count, rows, has_more, next_cursor }`). Pass `next_cursor` back as `cursor` for the next page. Returns HTTP 400 when `offline: true` is combined with `filter` or `sorts`. |
 | `POST` | `/api/v1/databases/{id}/items` | Create a new database item (`{ title, status?, properties?, body? }`) |
 | `GET` | `/api/v1/pages/{id}/comments?offline=false` | List page comments. Offline reads return HTTP 404 when comments have not been fetched or the last fetch failed. |
 | `POST` | `/api/v1/pages/{id}/comments` | Add a comment or discussion reply (`{ text, discussion_id? }`) |

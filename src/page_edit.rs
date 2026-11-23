@@ -939,6 +939,59 @@ pub(crate) fn same_edit_baseline(original: &[NotionBlock], current: &[NotionBloc
         })
 }
 
+/// Whether re-applying `edited_markdown` to `fresh` after a stale-ID failure keeps everyone
+/// else's changes. Every block in `fresh` must either be unchanged from `baseline`, have its
+/// text already in the edit (one of our own writes that landed before the failure), or be a
+/// cached block that came back under a new ID with the same content. Blocks that exist only in
+/// `baseline` were deleted remotely, which caused the failure, and are tolerated.
+pub(crate) fn retry_is_safe(baseline: &[NotionBlock], fresh: &[NotionBlock], edited_markdown: &str) -> bool {
+    fn index<'a>(blocks: &'a [NotionBlock], out: &mut std::collections::HashMap<&'a str, &'a NotionBlock>) {
+        for block in blocks {
+            out.insert(block.id.as_str(), block);
+            index(&block.children, out);
+        }
+    }
+    let mut known = std::collections::HashMap::new();
+    index(baseline, &mut known);
+    let mut fresh_ids = std::collections::HashMap::new();
+    index(fresh, &mut fresh_ids);
+    // Cached blocks whose ID is gone; each may account for one fresh block with the same content.
+    let mut gone: Vec<Option<&NotionBlock>> = known
+        .values()
+        .filter(|b| !fresh_ids.contains_key(b.id.as_str()))
+        .map(|b| Some(*b))
+        .collect();
+    let same_content = |a: &NotionBlock, b: &NotionBlock| {
+        a.block_type == b.block_type
+            && a.archived == b.archived
+            && ((opaque(a) && opaque(b)) || a.kind == b.kind)
+    };
+    let edited_lines: HashSet<&str> = edited_markdown.lines().map(str::trim).collect();
+    let in_edit = |block: &NotionBlock| {
+        let mut own = block.clone();
+        own.children.clear();
+        own.has_children = false;
+        crate::parser::blocks_to_markdown(std::slice::from_ref(&own))
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .all(|line| edited_lines.contains(line))
+    };
+    fn walk(blocks: &[NotionBlock], ok: &mut dyn FnMut(&NotionBlock) -> bool) -> bool {
+        blocks.iter().all(|b| ok(b) && walk(&b.children, ok))
+    }
+    walk(fresh, &mut |block| match known.get(block.id.as_str()) {
+        Some(before) => same_content(before, block) || in_edit(block),
+        None => {
+            if let Some(slot) = gone.iter_mut().find(|g| g.is_some_and(|g| same_content(g, block))) {
+                *slot = None;
+                return true;
+            }
+            in_edit(block)
+        }
+    })
+}
+
 fn can_patch_in_place(block: &NotionBlock, draft: &Draft) -> bool {
     if !patchable(&block.block_type) {
         return false;
@@ -1377,6 +1430,44 @@ mod tests {
             "page",
             None,
         )
+    }
+
+    #[test]
+    fn retry_is_safe_only_when_no_one_else_changed_the_page() {
+        let base = vec![
+            block("b1", "paragraph", "First"),
+            block("b2", "paragraph", "Second"),
+            block("b3", "paragraph", "Third"),
+        ];
+        let edit = "First edited\n\nSecond\n\nThird";
+        // Identical trees.
+        assert!(retry_is_safe(&base, &base, edit));
+        // One block deleted remotely: the cause of the 404.
+        let deleted = vec![base[1].clone(), base[2].clone()];
+        assert!(retry_is_safe(&base, &deleted, edit));
+        // A surviving block edited by someone else.
+        let mut changed = deleted.clone();
+        changed[0] = block("b2", "paragraph", "Second, by a teammate");
+        assert!(!retry_is_safe(&base, &changed, edit));
+        // A surviving block that already holds our own edited text.
+        let mut ours = base.clone();
+        ours[0] = block("b1", "paragraph", "First edited");
+        assert!(retry_is_safe(&base, &ours, edit));
+        // A new block someone else inserted.
+        let mut inserted = base.clone();
+        inserted.push(block("b4", "paragraph", "Teammate's note"));
+        assert!(!retry_is_safe(&base, &inserted, edit));
+        // A new block whose text is in the edit: our own insert that landed.
+        let mut own_insert = base.clone();
+        own_insert.push(block("b5", "paragraph", "First edited"));
+        assert!(retry_is_safe(&base, &own_insert, edit));
+        // A cached block back under a new ID with the same content.
+        let mut reissued = base.clone();
+        reissued[1] = block("b2-new", "paragraph", "Second");
+        assert!(retry_is_safe(&base, &reissued, "First edited"));
+        // A new ID with different content is someone else's block.
+        reissued[1] = block("b2-new", "paragraph", "Second, changed");
+        assert!(!retry_is_safe(&base, &reissued, "First edited"));
     }
 
     #[test]

@@ -5135,3 +5135,180 @@ async fn regression_n08_full_flag_reaches_mcp_and_http() {
     api_server.abort();
     env.server.abort();
 }
+
+#[tokio::test]
+async fn regression_n06_http_database_query_pages_with_cursor() {
+    let env = start_audit_env().await;
+    env.mock.databases.lock().unwrap().push(audit_database(AUDIT_DB, "Paged", "2026-11-20T02:00:00.000Z"));
+    let ids = audit_add_rows(&env, 130);
+    let (api, api_server) = start_audit_api(&env, Some("local-secret"), serve::ServeOptions::default()).await;
+    let http = reqwest::Client::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let mut body = json!({ "limit": 50 });
+        if let Some(c) = &cursor {
+            body["cursor"] = json!(c);
+        }
+        let resp = http
+            .post(format!("{api}/api/v1/databases/{AUDIT_DB}/query"))
+            .header("x-api-key", "local-secret")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page: Value = resp.json().await.unwrap();
+        assert_eq!(page["ok"], true);
+        assert_eq!(page["count"].as_u64().unwrap() as usize, page["rows"].as_array().unwrap().len());
+        for row in page["rows"].as_array().unwrap() {
+            assert!(seen.insert(row["id"].as_str().unwrap().to_string()), "row repeated: {row}");
+        }
+        pages += 1;
+        if page["has_more"] == true {
+            cursor = Some(page["next_cursor"].as_str().expect("has_more comes with a cursor").to_string());
+        } else {
+            assert!(page["next_cursor"].is_null(), "{page}");
+            break;
+        }
+        assert!(pages < 10, "pagination does not end");
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(seen, ids.into_iter().collect());
+    api_server.abort();
+    env.server.abort();
+}
+
+#[tokio::test]
+async fn regression_n13_patch_page_applies_all_fields() {
+    let env = start_audit_env().await;
+    let workspace = json!({ "type": "workspace", "workspace": true });
+    env.mock.add_page(audit_page(AUDIT_PAGE_A, "Draft", workspace, "2026-11-20T02:00:00.000Z"));
+    env.mock.databases.lock().unwrap().push(audit_database(AUDIT_DB, "Tasks", "2026-11-20T02:00:00.000Z"));
+    env.mock.add_page(audit_page(
+        AUDIT_PAGE_B,
+        "Row",
+        json!({ "type": "database_id", "database_id": AUDIT_DB }),
+        "2026-11-20T02:00:00.000Z",
+    ));
+    let (api, api_server) = start_audit_api(&env, Some("local-secret"), serve::ServeOptions::default()).await;
+    let http = reqwest::Client::new();
+    let patch = |id: &str, body: Value| {
+        http.patch(format!("{api}/api/v1/pages/{id}"))
+            .header("x-api-key", "local-secret")
+            .json(&body)
+            .send()
+    };
+    let notion_patches = |id: &str| -> Vec<Value> {
+        env.mock.requests_matching("PATCH", &format!("/v1/pages/{id}")).into_iter().map(|r| r.body).collect()
+    };
+    let title_spans = |text: &str| json!([{ "type": "text", "text": { "content": text } }]);
+
+    // (a) title + archived reach Notion in one call.
+    let resp = patch(AUDIT_PAGE_A, json!({ "title": "Done", "archived": true })).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        notion_patches(AUDIT_PAGE_A),
+        vec![json!({ "properties": { "title": { "title": title_spans("Done") } }, "archived": true })]
+    );
+    let page = env.mock.page(AUDIT_PAGE_A).unwrap();
+    assert_eq!(page["archived"], true);
+    assert_eq!(audit_title_of(&page), "Done");
+
+    // (b) icon + properties on a database row.
+    env.mock.clear_requests();
+    let notes = json!({ "Notes": { "rich_text": [{ "type": "text", "text": { "content": "shipped" } }] } });
+    let resp = patch(AUDIT_PAGE_B, json!({ "icon": "🚀", "properties": notes })).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        notion_patches(AUDIT_PAGE_B),
+        vec![json!({ "properties": notes, "icon": { "type": "emoji", "emoji": "🚀" } })]
+    );
+    let row = env.mock.page(AUDIT_PAGE_B).unwrap();
+    assert_eq!(row["icon"]["emoji"], "🚀");
+    assert_eq!(audit_joined(&row["properties"]["Notes"]["rich_text"]), "shipped");
+
+    // (c) A single field sends exactly what it sent before.
+    env.mock.clear_requests();
+    assert_eq!(patch(AUDIT_PAGE_A, json!({ "archived": false })).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(patch(AUDIT_PAGE_A, json!({ "title": "x" })).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(patch(AUDIT_PAGE_A, json!({ "icon": "📌" })).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        notion_patches(AUDIT_PAGE_A),
+        vec![
+            json!({ "archived": false }),
+            json!({ "properties": { "title": { "title": title_spans("x") } } }),
+            json!({ "icon": { "type": "emoji", "emoji": "📌" } }),
+        ]
+    );
+
+    // (d) Nothing to change is a client error and never reaches Notion.
+    env.mock.clear_requests();
+    for body in [json!({}), json!({ "icon": "  " })] {
+        let resp = patch(AUDIT_PAGE_A, body.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+        let err: Value = resp.json().await.unwrap();
+        assert!(err["error"].as_str().unwrap().contains("At least one of title, icon, archived, properties"), "{err}");
+    }
+    assert!(notion_patches(AUDIT_PAGE_A).is_empty());
+    api_server.abort();
+    env.server.abort();
+}
+
+fn audit_block_texts(env: &AuditEnv, parent: &str) -> Vec<String> {
+    env.mock
+        .children_of(parent)
+        .iter()
+        .map(|b| audit_joined(&b[b["type"].as_str().unwrap()]["rich_text"]))
+        .collect()
+}
+
+#[tokio::test]
+async fn regression_n13_stale_retry_refuses_to_overwrite_remote_edit() {
+    let env = start_audit_env().await;
+    let workspace = json!({ "type": "workspace", "workspace": true });
+    env.mock.add_page(audit_page(AUDIT_PAGE_A, "Notes", workspace, "2026-11-20T02:00:00.000Z"));
+    let b1 = "b1000000-0000-4000-8000-000000000001";
+    let b2 = "b1000000-0000-4000-8000-000000000002";
+    let reset = || {
+        env.mock.set_children(
+            AUDIT_PAGE_A,
+            vec![audit_block(b1, "paragraph", "Alpha"), audit_block(b2, "paragraph", "Beta")],
+        );
+    };
+    let edited = "Alpha edited\n\nBeta";
+
+    // A teammate deleted block 1 and rewrote block 2 after our cache was taken.
+    reset();
+    let cached = sync::sync_page_detail_force(&env.client, &env.storage, AUDIT_PAGE_A).await.unwrap();
+    env.mock.set_children(AUDIT_PAGE_A, vec![audit_block(b2, "paragraph", "Beta, rewritten by a teammate")]);
+    let err = notion_cli::cli::op_diff_sync_page_markdown(
+        &env.client,
+        &env.storage,
+        AUDIT_PAGE_A,
+        edited,
+        Some(cached.blocks),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("Reload the page before saving"), "{err}");
+    assert_eq!(audit_block_texts(&env, AUDIT_PAGE_A), vec!["Beta, rewritten by a teammate"]);
+
+    // Only the deletion: the retry the path was built for still succeeds.
+    reset();
+    let cached = sync::sync_page_detail_force(&env.client, &env.storage, AUDIT_PAGE_A).await.unwrap();
+    env.mock.set_children(AUDIT_PAGE_A, vec![audit_block(b2, "paragraph", "Beta")]);
+    let detail = notion_cli::cli::op_diff_sync_page_markdown(
+        &env.client,
+        &env.storage,
+        AUDIT_PAGE_A,
+        edited,
+        Some(cached.blocks),
+    )
+    .await
+    .unwrap();
+    assert_eq!(audit_block_texts(&env, AUDIT_PAGE_A), vec!["Alpha edited", "Beta"]);
+    assert_eq!(detail.blocks.len(), 2);
+    env.server.abort();
+}
