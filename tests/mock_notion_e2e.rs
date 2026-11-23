@@ -657,13 +657,40 @@ async fn start_mock_notion_server() -> (String, MockNotionState, tokio::task::Jo
                 }
             }),
         )
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::middleware::from_fn(reject_oversized_writes));
 
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
 
     (base_url, state_ret, handle)
+}
+
+/// Rejects write bodies that break Notion's request limits, as the real API does.
+async fn reject_oversized_writes(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path().to_string();
+    let is_write = matches!(request.method().as_str(), "POST" | "PATCH")
+        && !path.ends_with("/query")
+        && path != "/v1/search";
+    if !is_write {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    if let Some(violation) = audit_limit_violation(&json) {
+        return audit_error(
+            StatusCode::BAD_REQUEST,
+            "validation_error",
+            format!("body failed validation: {violation}"),
+        );
+    }
+    next.run(axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes)))
+        .await
 }
 
 fn test_config(base_url: &str) -> AppConfig {
@@ -3811,6 +3838,8 @@ async fn regression_notion_bug_05_code_block_single_edit_preserves_literal_text(
 struct AuditRequest {
     method: String,
     path: String,
+    // Read only through Debug, in assertion messages.
+    #[allow(dead_code)]
     query: String,
     body: Value,
 }
@@ -4655,5 +4684,199 @@ async fn regression_n14_peek_url_archives_row_not_parent() {
         assert_eq!(page.id, AUDIT_PAGE_A, "{url}");
     }
     assert_eq!(env.mock.count("PATCH", &format!("/v1/pages/{AUDIT_PAGE_A}")), 2);
+    env.server.abort();
+}
+
+/// Joins the text.content of every span in a recorded rich_text array.
+fn audit_joined(spans: &Value) -> String {
+    spans
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|s| s.pointer("/text/content").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Asserts every span of a recorded rich_text array is within the limit and that together they
+/// hold `expected` exactly. Returns the span count.
+fn assert_within_limit(spans: &Value, expected: &str, what: &str) -> usize {
+    let items = spans.as_array().unwrap_or_else(|| panic!("{what}: not an array: {spans}"));
+    for item in items {
+        let units = item["text"]["content"].as_str().unwrap().encode_utf16().count();
+        assert!(units <= 2000, "{what}: span has {units} UTF-16 units");
+    }
+    assert_eq!(audit_joined(spans), expected, "{what}: text must survive unchanged");
+    items.len()
+}
+
+/// Like [`assert_within_limit`], for a write that starts from a single span.
+fn assert_chunked(spans: &Value, expected: &str, count: usize, what: &str) {
+    assert_eq!(assert_within_limit(spans, expected, what), count, "{what}: span count");
+}
+
+/// Text of exactly `len` characters built from `unit`, ending in a non-space character.
+fn audit_long_text(unit: &str, len: usize) -> String {
+    let mut text: String = unit.chars().cycle().take(len).collect();
+    if text.ends_with(char::is_whitespace) {
+        text.pop();
+        text.push('.');
+    }
+    text
+}
+
+#[tokio::test]
+async fn regression_n03_long_text_is_chunked_on_every_write_path() {
+    const ROW: &str = "a11d0000-0000-4000-8000-0000000000a1";
+    const CODE_BLOCK: &str = "a11d0000-0000-4000-8000-0000000000c0";
+    const PARAGRAPH: &str = "a11d0000-0000-4000-8000-0000000000c1";
+
+    let env = start_audit_env().await;
+    env.mock.databases.lock().unwrap().push(audit_database(
+        AUDIT_DB,
+        "Sprint Tasks",
+        "2026-11-20T02:00:00.000Z",
+    ));
+    for (id, title) in [(AUDIT_PAGE_A, "Long Notes"), (AUDIT_PAGE_B, "Edit Target")] {
+        env.mock.add_page(audit_page(
+            id,
+            title,
+            json!({ "type": "workspace", "workspace": true }),
+            "2026-11-20T02:00:00.000Z",
+        ));
+    }
+    env.mock.add_page(audit_page(
+        ROW,
+        "Row",
+        json!({ "type": "database_id", "database_id": AUDIT_DB }),
+        "2026-11-20T02:00:00.000Z",
+    ));
+    let mut code_block = audit_block(CODE_BLOCK, "code", "let old = 1;");
+    code_block["code"]["language"] = json!("rust");
+    env.mock.set_children(
+        AUDIT_PAGE_B,
+        vec![audit_block(PARAGRAPH, "paragraph", "short paragraph"), code_block],
+    );
+
+    // The mock refuses what Notion refuses, so a pass below means the request was valid.
+    let oversized = json!({ "children": [{ "paragraph": { "rich_text": [{ "text": { "content": "x".repeat(2001) } }] } }] });
+    assert!(audit_limit_violation(&oversized).is_some());
+
+    // 1. Append a 5,000-character fenced code block.
+    let code = audit_long_text("let total = compute(input) + offset;\n", 5000);
+    let appended = notion_cli::cli::op_append_blocks(
+        &env.client,
+        &env.storage,
+        AUDIT_PAGE_A,
+        &format!("```rust\n{code}\n```"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(appended.len(), 1);
+    let appends = env.mock.requests_matching("PATCH", &format!("/v1/blocks/{AUDIT_PAGE_A}/children"));
+    assert_eq!(appends.len(), 1, "{appends:?}");
+    assert_chunked(&appends[0].body["children"][0]["code"]["rich_text"], &code, 3, "appended code");
+    let detail = notion_cli::cli::op_get_page(&env.client, &env.storage, AUDIT_PAGE_A, false)
+        .await
+        .unwrap();
+    assert!(detail.markdown.contains(&code), "code must read back unchanged");
+
+    // 2. A 4,100-character Korean comment.
+    let comment_text = audit_long_text("긴 한국어 댓글 본문입니다 ", 4100);
+    let comment = notion_cli::cli::op_add_comment(&env.client, &env.storage, AUDIT_PAGE_A, None, &comment_text)
+        .await
+        .unwrap();
+    assert_eq!(comment.body, comment_text);
+    let posts = env.mock.requests_matching("POST", "/v1/comments");
+    assert_eq!(posts.len(), 1);
+    assert_chunked(&posts[0].body["rich_text"], &comment_text, 3, "comment");
+
+    // 3. Create a page with a 2,100-character title and a 2,500-character paragraph.
+    let title = audit_long_text("Quarterly planning notes ", 2100);
+    let paragraph = audit_long_text("A sentence that keeps going. ", 2500);
+    let created = notion_cli::cli::op_create_page(
+        &env.client,
+        &env.storage,
+        AUDIT_PAGE_A,
+        &title,
+        None,
+        Some(&paragraph),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.title, title);
+    let creates = env.mock.requests_matching("POST", "/v1/pages");
+    assert_eq!(creates.len(), 1);
+    assert_chunked(&creates[0].body["properties"]["title"]["title"], &title, 2, "page title");
+    assert_chunked(
+        &creates[0].body["children"][0]["paragraph"]["rich_text"],
+        &paragraph,
+        2,
+        "page body paragraph",
+    );
+
+    // 4. Replace a code block's text with 3,000 characters.
+    let new_code = audit_long_text("match state { Ready => run(), _ => wait() }\n", 3000);
+    notion_cli::cli::op_update_block_text(&env.client, &env.storage, CODE_BLOCK, Some("code"), &new_code, None)
+        .await
+        .unwrap();
+    let block_patches = env.mock.requests_matching("PATCH", &format!("/v1/blocks/{CODE_BLOCK}"));
+    assert_eq!(block_patches.len(), 1);
+    assert_chunked(&block_patches[0].body["code"]["rich_text"], &new_code, 2, "updated code");
+
+    // 5. Caller-supplied properties JSON with a 2,500-character rich_text value.
+    let notes = audit_long_text("Reviewer notes, pasted in full. ", 2500);
+    notion_cli::cli::op_update_database_item(
+        &env.client,
+        &env.storage,
+        ROW,
+        None,
+        None,
+        Some(json!({ "Notes": { "rich_text": [{ "text": { "content": notes } }] } })),
+    )
+    .await
+    .unwrap();
+    let row_patches = env.mock.requests_matching("PATCH", &format!("/v1/pages/{ROW}"));
+    assert_eq!(row_patches.len(), 1);
+    assert_chunked(&row_patches[0].body["properties"]["Notes"]["rich_text"], &notes, 2, "row property");
+
+    // 6. Edit a paragraph to 2,600 characters through the Markdown diff sync.
+    env.mock.clear_requests();
+    let before = notion_cli::cli::op_get_page(&env.client, &env.storage, AUDIT_PAGE_B, false)
+        .await
+        .unwrap();
+    assert!(before.markdown.contains(&new_code), "the 3,000-character code reads back unchanged");
+    let long_paragraph = audit_long_text("Edited paragraph text that grows. ", 2600);
+    let edited = before.markdown.replace("short paragraph", &long_paragraph);
+    env.mock.clear_requests();
+    let after = notion_cli::cli::op_diff_sync_page_markdown(&env.client, &env.storage, AUDIT_PAGE_B, &edited, None)
+        .await
+        .unwrap();
+    assert!(after.markdown.contains(&long_paragraph));
+    let edits = env.mock.requests_matching("PATCH", "/v1/blocks/");
+    assert_eq!(edits.len(), 1, "only the paragraph changes: {edits:?}");
+    assert_eq!(edits[0].path, format!("/v1/blocks/{PARAGRAPH}"));
+    // The edit keeps the old span on the stretch of new text it aligns with and adds the rest as
+    // new spans, so the count depends on that alignment; the limit and the text do not.
+    let spans = assert_within_limit(&edits[0].body["paragraph"]["rich_text"], &long_paragraph, "edited paragraph");
+    assert!(spans >= 2, "2,600 characters need at least two spans, got {spans}");
+
+    // 7. Text beyond 100 spans fails locally and sends nothing.
+    env.mock.clear_requests();
+    let huge = "c".repeat(250_000);
+    let err = notion_cli::cli::op_append_blocks(
+        &env.client,
+        &env.storage,
+        AUDIT_PAGE_A,
+        &format!("```\n{huge}\n```"),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("too long for one Notion block"), "{err}");
+    assert_eq!(env.mock.count("PATCH", &format!("/v1/blocks/{AUDIT_PAGE_A}/children")), 0);
     env.server.abort();
 }

@@ -947,14 +947,6 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Helper to build a Notion API rich_text array payload from plain text.
-pub fn plain_rich_text_json(text: &str) -> Value {
-    serde_json::json!([{
-        "type": "text",
-        "text": { "content": text }
-    }])
-}
-
 /// Structured application error carrying a machine-readable code and optional details.
 #[derive(Debug, Clone)]
 pub struct CodedError {

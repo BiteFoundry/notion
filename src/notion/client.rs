@@ -27,6 +27,7 @@ use crate::{
         normalize_notion_id, NotionBlock, NotionComment, NotionDatabase, NotionPage,
         NotionPageDetail, NotionUser,
     },
+    notion::rich_text::chunk_payload,
     parser::{
         blocks_to_markdown, blocks_to_plain_text, collect_media_refs, parse_notion_block,
         parse_notion_comment, parse_notion_database, parse_notion_page,
@@ -539,7 +540,8 @@ impl NotionClient {
     }
 
     /// `POST /v1/pages`
-    pub async fn create_page(&self, payload: Value) -> Result<NotionPage> {
+    pub async fn create_page(&self, mut payload: Value) -> Result<NotionPage> {
+        chunk_payload(&mut payload)?;
         let workspace_id = self.auth.active_workspace_id().await;
         let val = self
             .request_json(Method::POST, "/pages", Some(payload))
@@ -548,7 +550,8 @@ impl NotionClient {
     }
 
     /// `PATCH /v1/pages/{page_id}`
-    pub async fn update_page(&self, page_id: &str, payload: Value) -> Result<NotionPage> {
+    pub async fn update_page(&self, page_id: &str, mut payload: Value) -> Result<NotionPage> {
+        chunk_payload(&mut payload)?;
         let id = normalize_notion_id(page_id);
         let workspace_id = self.auth.active_workspace_id().await;
         let val = self
@@ -875,6 +878,12 @@ impl NotionClient {
         at_start: bool,
         children: Vec<Value>,
     ) -> Result<Vec<NotionBlock>> {
+        // Split over-long text spans before batching, so nothing is sent when a block cannot fit.
+        let mut children = Value::Array(children);
+        chunk_payload(&mut children)?;
+        let Value::Array(children) = children else {
+            unreachable!("chunk_payload keeps the JSON shape");
+        };
         let id = normalize_notion_id(block_id);
         let mut created = Vec::new();
         let mut cursor_after = after
@@ -923,8 +932,9 @@ impl NotionClient {
         &self,
         block_id: &str,
         page_id: &str,
-        payload: Value,
+        mut payload: Value,
     ) -> Result<NotionBlock> {
+        chunk_payload(&mut payload)?;
         let id = normalize_notion_id(block_id);
         let val = self
             .request_json(Method::PATCH, &format!("/blocks/{id}"), Some(payload))
@@ -1068,7 +1078,8 @@ impl NotionClient {
     }
 
     /// `POST /v1/databases`
-    pub async fn create_database(&self, payload: Value) -> Result<NotionDatabase> {
+    pub async fn create_database(&self, mut payload: Value) -> Result<NotionDatabase> {
+        chunk_payload(&mut payload)?;
         let workspace_id = self.auth.active_workspace_id().await;
         let val = self
             .request_json(Method::POST, "/databases", Some(payload))
@@ -1174,8 +1185,10 @@ impl NotionClient {
             "rich_text".into(),
             json!([{ "type": "text", "text": { "content": trimmed } }]),
         );
+        let mut payload = Value::Object(payload);
+        chunk_payload(&mut payload)?;
         let val = self
-            .request_json(Method::POST, "/comments", Some(Value::Object(payload)))
+            .request_json(Method::POST, "/comments", Some(payload))
             .await?;
         let pid = page_id.map(normalize_notion_id).unwrap_or_default();
         Ok(parse_notion_comment(&val, &pid))
