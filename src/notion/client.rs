@@ -93,7 +93,7 @@ pub struct NotionClient {
 
 impl NotionClient {
     pub fn new(config: &AppConfig, auth: AuthManager) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        let http = crate::http::client_builder()?
             .timeout(Duration::from_secs(45))
             .user_agent(format!("notion-cli/{}", env!("CARGO_PKG_VERSION")))
             .build()
@@ -261,7 +261,10 @@ impl NotionClient {
                     continue;
                 }
                 Err(err) => {
-                    return Err(err).with_context(|| format!("Notion API request failed: {method} {url}"));
+                    return Err(crate::http::transport_error(
+                        err,
+                        format!("Notion API request failed: {method} {url}"),
+                    ));
                 }
             };
 

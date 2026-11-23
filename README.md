@@ -110,6 +110,17 @@ notion daemon start
 
 **Identifier resolution & `--json` exit contract:** UUIDs and Notion URLs pass through directly with zero extra lookups. Read commands accept exact or partial titles (preferring active pages), while write commands require a single exact title match among active pages (use `--unarchive` with a page ID or URL if an archived page is not in the local cache; pass a page ID or URL whenever duplicate or newly-created external titles may exist). Runtime failures under `--json` exit `1` and print `{"ok":false,"error":{"code":"...","message":"..."}}` to stdout (with `details.candidates` for ambiguous/missing titles); argument usage errors exit `2` with stderr usage text and empty stdout. On `--json`, treat exit `0` (and not `ok: false`) as success—some commands omit a top-level `ok` field, and `doctor --online --json` reports probe failures inside `online_probe.ok`.
 
+### Corporate proxies and custom root certificates
+
+HTTPS connections trust the bundled Mozilla roots and the operating system's trust store. On a network that inspects HTTPS, also trust the proxy's root CA by pointing `NOTION_EXTRA_CA_PEM` at a PEM file (one certificate or a chain), or by setting it to the PEM text itself:
+
+```bash
+export NOTION_EXTRA_CA_PEM=/etc/ssl/corp-root-ca.pem
+notion doctor --online   # lists each CA source and how many certificates it added
+```
+
+`SSL_CERT_FILE` and `NODE_EXTRA_CA_CERTS` are read as well, as PEM file paths. Every variable that is set is loaded. A `NOTION_EXTRA_CA_PEM` that cannot be loaded is an error; a bad `SSL_CERT_FILE` or `NODE_EXTRA_CA_CERTS` is skipped with a warning on stderr. Certificate verification cannot be turned off.
+
 ### Local HTTP JSON API (`notion serve`)
 
 ```bash

@@ -2,6 +2,7 @@ pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod http;
 pub mod img_preview;
 pub mod mcp;
 pub mod models;

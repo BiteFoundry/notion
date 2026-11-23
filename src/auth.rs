@@ -155,6 +155,8 @@ impl AuthManager {
     }
 
     pub fn from_token(config: AppConfig, token: impl Into<String>) -> Self {
+        // The builder fails only when NOTION_EXTRA_CA_PEM cannot be loaded; NotionClient::new
+        // reports that error, so this constructor stays infallible with a plain client.
         let http = build_auth_http_client().unwrap_or_else(|_| reqwest::Client::new());
         let ws = config.effective_workspace_name(None);
         let cred = StoredCredential {
@@ -450,7 +452,7 @@ pub async fn validate_token_via_users_me(
         .header("Notion-Version", NOTION_API_VERSION)
         .send()
         .await
-        .with_context(|| format!("Failed to reach Notion API at {url}"))?;
+        .map_err(|err| crate::http::transport_error(err, format!("Failed to reach Notion API at {url}")))?;
     let status = resp.status();
     let body: Value = resp
         .json()
@@ -490,7 +492,9 @@ pub async fn exchange_oauth_code(
         .json(&payload)
         .send()
         .await
-        .with_context(|| format!("Failed to exchange Notion OAuth token at {url}"))?;
+        .map_err(|err| {
+            crate::http::transport_error(err, format!("Failed to exchange Notion OAuth token at {url}"))
+        })?;
     let status = resp.status();
     let body: Value = resp
         .json()
@@ -695,7 +699,7 @@ pub(crate) fn generate_random_hex(num_bytes: usize) -> String {
 }
 
 fn build_auth_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::http::client_builder()?
         .timeout(Duration::from_secs(30))
         .user_agent(format!("notion-cli/{}", env!("CARGO_PKG_VERSION")))
         .build()

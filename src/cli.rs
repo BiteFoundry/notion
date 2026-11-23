@@ -2001,6 +2001,8 @@ async fn handle_doctor_cmd(
     } else {
         None
     };
+    // Extra root certificates from NOTION_EXTRA_CA_PEM, SSL_CERT_FILE and NODE_EXTRA_CA_CERTS.
+    let extra_ca = &crate::http::extra_cas()?.reports;
 
     let report = json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -2017,6 +2019,7 @@ async fn handle_doctor_cmd(
         "image_protocol": caps.protocol.as_str(),
         "cell_px": [caps.cell_px.0, caps.cell_px.1],
         "online_probe": online_probe,
+        "extra_ca": extra_ca,
     });
 
     if as_json {
@@ -2028,6 +2031,15 @@ async fn handle_doctor_cmd(
         println!("  Workspace:      {} ({})", ws_name, ws_id);
         println!("  Authenticated:  {}", cred.is_some());
         println!("  Image Protocol: {}", caps.protocol.label());
+        for ca in extra_ca {
+            match &ca.error {
+                Some(error) => println!("  Extra CA:       {} ({}) skipped: {error}", ca.variable, ca.source),
+                None => println!(
+                    "  Extra CA:       {} ({}): {} certificate(s) trusted, {} skipped",
+                    ca.variable, ca.source, ca.certificates, ca.skipped
+                ),
+            }
+        }
         if let Some(probe) = &online_probe {
             println!("  Online Probe:   {probe}");
         }

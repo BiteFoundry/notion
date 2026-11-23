@@ -19,6 +19,22 @@ notion mcp
 }
 ```
 
+On a network that inspects HTTPS, pass the proxy's root CA through the server's `env`; MCP hosts do not always inherit your shell environment:
+
+```json
+{
+  "mcpServers": {
+    "notion": {
+      "command": "notion",
+      "args": ["mcp"],
+      "env": { "NOTION_EXTRA_CA_PEM": "/etc/ssl/corp-root-ca.pem" }
+    }
+  }
+}
+```
+
+`SSL_CERT_FILE` and `NODE_EXTRA_CA_CERTS` are honoured too. Warnings about them go to stderr, never to the JSON-RPC stream on stdout.
+
 ## Available Tools (20)
 
 | # | Tool | Required Args | Description |
