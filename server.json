@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.BiteFoundry/notion",
+  "title": "Notion (TUI, CLI & MCP)",
+  "description": "Notion MCP server, CLI, and TUI in Rust with local SQLite FTS5 sync & Markdown block edits.",
+  "version": "0.4.2",
+  "websiteUrl": "https://bitefoundry.dev/#app-notion",
+  "repository": {
+    "url": "https://github.com/BiteFoundry/notion",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/bitefoundry/notion:0.4.2",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "NOTION_TOKEN",
+          "description": "Notion internal integration token (ntn_... or secret_...).",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
