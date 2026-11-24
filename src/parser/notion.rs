@@ -164,6 +164,36 @@ pub fn parse_parent(val: Option<&Value>) -> (String, Option<String>) {
     (ptype, pid)
 }
 
+fn parse_user_ref(val: Option<&Value>) -> Option<String> {
+    let u = val?;
+    if let Some(s) = u.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(s.to_string());
+    }
+    u.get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            u.get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .map(str::to_string)
+}
+
+fn summarize_json_value(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Array(arr) if arr.is_empty() => String::new(),
+        Value::Object(map) if map.is_empty() => String::new(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
 fn parse_select_option(val: &Value) -> SelectOption {
     SelectOption {
         id: val.get("id").and_then(Value::as_str).map(str::to_string),
@@ -262,7 +292,29 @@ pub fn parse_property_value(val: &Value) -> NotionPropertyValue {
                 .and_then(Value::as_array)
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|f| f.get("name").and_then(Value::as_str).map(str::to_string))
+                        .filter_map(|f| {
+                            let name = f
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty());
+                            let (extracted_url, _) = extract_media_url(Some(f));
+                            let url = if !extracted_url.trim().is_empty() {
+                                Some(extracted_url.trim().to_string())
+                            } else {
+                                f.get("url")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string)
+                            };
+                            match (name, url) {
+                                (Some(n), Some(u)) => Some(format!("[{n}]({u})")),
+                                (Some(n), None) => Some(n.to_string()),
+                                (None, Some(u)) => Some(u),
+                                (None, None) => None,
+                            }
+                        })
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -339,7 +391,35 @@ pub fn parse_property_value(val: &Value) -> NotionPropertyValue {
                                 .join(", ")
                         })
                         .unwrap_or_default(),
-                    _ => String::new(),
+                    other => {
+                        let payload = other
+                            .and_then(|key| r.get(key))
+                            .or_else(|| r.get("string"))
+                            .or_else(|| r.get("boolean"));
+                        match payload {
+                            Some(v) => summarize_json_value(v),
+                            None => {
+                                if let Some(obj) = r.as_object() {
+                                    let extras: serde_json::Map<String, Value> = obj
+                                        .iter()
+                                        .filter(|(k, v)| {
+                                            !matches!(k.as_str(), "type" | "function")
+                                                && !v.is_null()
+                                        })
+                                        .map(|(k, v)| (k.clone(), v.clone()))
+                                        .collect();
+                                    if extras.is_empty() {
+                                        String::new()
+                                    } else {
+                                        serde_json::to_string(&Value::Object(extras))
+                                            .unwrap_or_default()
+                                    }
+                                } else {
+                                    summarize_json_value(r)
+                                }
+                            }
+                        }
+                    }
                 })
                 .unwrap_or_default();
             NotionPropertyValue::Rollup(s)
@@ -389,7 +469,33 @@ pub fn parse_property_value(val: &Value) -> NotionPropertyValue {
                 .to_string();
             NotionPropertyValue::Other(s)
         }
-        _ => NotionPropertyValue::Other(String::new()),
+        other => {
+            let payload = if !other.is_empty() {
+                val.get(other)
+            } else {
+                None
+            };
+            let summary = match payload {
+                Some(v) => summarize_json_value(v),
+                None => {
+                    if let Some(obj) = val.as_object() {
+                        let extras: serde_json::Map<String, Value> = obj
+                            .iter()
+                            .filter(|(k, v)| !matches!(k.as_str(), "id" | "type") && !v.is_null())
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        if extras.is_empty() {
+                            String::new()
+                        } else {
+                            serde_json::to_string(&Value::Object(extras)).unwrap_or_default()
+                        }
+                    } else {
+                        summarize_json_value(val)
+                    }
+                }
+            };
+            NotionPropertyValue::Other(summary)
+        }
     }
 }
 
@@ -451,6 +557,8 @@ pub fn parse_notion_page(val: &Value, workspace_id: &str) -> Result<NotionPage> 
             .get("last_edited_time")
             .and_then(Value::as_str)
             .map(str::to_string),
+        created_by: parse_user_ref(val.get("created_by")),
+        last_edited_by: parse_user_ref(val.get("last_edited_by")),
         synced_at: Some(chrono::Utc::now().to_rfc3339()),
     })
 }
@@ -2923,5 +3031,115 @@ mod tests {
         assert!(flat[2]["numbered_list_item"].get("children").is_none());
         assert_eq!(flat[3]["type"], "to_do");
         assert!(flat[3]["to_do"].get("children").is_none());
+    }
+
+    #[test]
+    fn parser_preserves_file_urls_unknown_props_rollup_variants_and_page_authors() {
+        // 1. files property preserves hosted and external URLs alongside names
+        let files_prop = parse_property_value(&json!({
+            "type": "files",
+            "files": [
+                {
+                    "name": "spec.pdf",
+                    "type": "file",
+                    "file": { "url": "https://files.notion.so/spec.pdf" }
+                },
+                {
+                    "name": "diagram.png",
+                    "type": "external",
+                    "external": { "url": "https://cdn.example.com/diagram.png" }
+                },
+                {
+                    "name": "legacy-only.txt"
+                },
+                {
+                    "type": "external",
+                    "external": { "url": "https://cdn.example.com/nameless.png" }
+                }
+            ]
+        }));
+        assert_eq!(
+            files_prop,
+            NotionPropertyValue::Files(vec![
+                "[spec.pdf](https://files.notion.so/spec.pdf)".into(),
+                "[diagram.png](https://cdn.example.com/diagram.png)".into(),
+                "legacy-only.txt".into(),
+                "https://cdn.example.com/nameless.png".into(),
+            ])
+        );
+
+        // 2. unknown property types preserve compact JSON/string summary instead of Other("")
+        let place_prop = parse_property_value(&json!({
+            "type": "place",
+            "place": { "name": "Seoul", "lat": 37.5 }
+        }));
+        match place_prop {
+            NotionPropertyValue::Other(ref s) => {
+                let parsed: Value = serde_json::from_str(s).unwrap();
+                assert_eq!(parsed["name"], "Seoul");
+                assert_eq!(parsed["lat"], 37.5);
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+        assert_eq!(
+            parse_property_value(&json!({
+                "type": "custom_string",
+                "custom_string": "hello world"
+            })),
+            NotionPropertyValue::Other("hello world".into())
+        );
+
+        // 3. rollup preserves non-number/date/array values (string, boolean, structured)
+        assert_eq!(
+            parse_property_value(&json!({
+                "type": "rollup",
+                "rollup": { "type": "string", "string": "Approved" }
+            })),
+            NotionPropertyValue::Rollup("Approved".into())
+        );
+        assert_eq!(
+            parse_property_value(&json!({
+                "type": "rollup",
+                "rollup": { "type": "boolean", "boolean": true }
+            })),
+            NotionPropertyValue::Rollup("true".into())
+        );
+        assert_eq!(
+            parse_property_value(&json!({
+                "type": "rollup",
+                "rollup": { "type": "unsupported", "unsupported": { "reason": "formula" } }
+            })),
+            NotionPropertyValue::Rollup(r#"{"reason":"formula"}"#.into())
+        );
+
+        // 4. parse_notion_page captures created_by and last_edited_by (name or id)
+        let page_json = json!({
+            "id": "page-authors",
+            "url": "https://notion.so/page-authors",
+            "parent": { "type": "workspace", "workspace": true },
+            "created_by": { "object": "user", "id": "u-1", "name": "Alice Kim" },
+            "last_edited_by": { "object": "user", "id": "u-2" },
+            "properties": {
+                "title": { "type": "title", "title": [{ "plain_text": "Authored" }] }
+            }
+        });
+        let page = parse_notion_page(&page_json, "ws-1").unwrap();
+        assert_eq!(page.created_by.as_deref(), Some("Alice Kim"));
+        assert_eq!(page.last_edited_by.as_deref(), Some("u-2"));
+
+        // Absent authors serialize cleanly (skipped when None)
+        let minimal = parse_notion_page(
+            &json!({
+                "id": "page-min",
+                "properties": { "title": { "type": "title", "title": [{ "plain_text": "Min" }] } }
+            }),
+            "ws-1",
+        )
+        .unwrap();
+        assert_eq!(minimal.created_by, None);
+        assert_eq!(minimal.last_edited_by, None);
+        let ser = serde_json::to_value(&minimal).unwrap();
+        assert!(ser.get("created_by").is_none());
+        assert!(ser.get("last_edited_by").is_none());
     }
 }

@@ -115,6 +115,9 @@ pub enum PagesCommand {
         /// Compatibility alias: compact output is already the --json default
         #[arg(long, requires = "json")]
         compact: bool,
+        /// Select specific standard fields or dynamic property names (comma-separated or repeatable)
+        #[arg(long, requires = "json", conflicts_with = "full", value_delimiter = ',')]
+        fields: Vec<String>,
     },
     /// Create a new Notion page under a parent page or database
     Create {
@@ -1357,9 +1360,14 @@ async fn handle_pages_cmd(
             json: as_json,
             full,
             compact,
+            fields,
         } => {
             let _ = compact;
-            if as_json && !full {
+            if as_json && !fields.is_empty() {
+                let val =
+                    op_get_page_fields(client, storage, &page, refresh, offline, &fields).await?;
+                print_json(&val)?;
+            } else if as_json && !full {
                 let val = op_get_page_compact(client, storage, &page, refresh, offline, |id| {
                     format!("notion pages get {id} --json --full")
                 })
@@ -2359,6 +2367,63 @@ pub async fn op_get_page_compact(
         summary.count,
         summary.error.as_deref(),
     ))
+}
+
+/// Selective field/property projection for a Notion page.
+/// Avoids fetching comments unless `"comments"` is explicitly requested, and avoids
+/// fetching block trees when only page metadata/properties are requested.
+pub async fn op_get_page_fields(
+    client: &NotionClient,
+    storage: &Storage,
+    page: &str,
+    refresh: bool,
+    offline: bool,
+    fields: &[String],
+) -> Result<Value> {
+    let (needs_blocks, needs_comments) = NotionPageDetail::requested_fields_needs(fields);
+    if needs_comments {
+        let (detail, comments_has_more) =
+            op_get_page_for_output(client, storage, page, refresh, offline).await?;
+        return Ok(detail.project_fields(fields, Some(comments_has_more)));
+    }
+
+    let ws_id = client.auth().active_workspace_id().await;
+    let id = resolver::resolve_page_id(storage, (!offline).then_some(client), &ws_id, page).await?;
+
+    if needs_blocks {
+        let detail = if offline {
+            let detail = storage
+                .load_page_detail(&ws_id, &id)?
+                .ok_or_else(|| coded("not_cached", format!("Page '{page}' not found in local cache")))?;
+            if storage.load_cached_children(&ws_id, &id)?.is_none() {
+                return Err(coded(
+                    "not_cached",
+                    format!(
+                        "Page '{page}' body not found in offline cache (not fetched); read it online once"
+                    ),
+                ));
+            }
+            detail
+        } else {
+            sync::sync_page_body(client, storage, &id, refresh).await?
+        };
+        return Ok(detail.project_fields(fields, None));
+    }
+
+    let loaded_page = if offline {
+        storage
+            .get_page(&ws_id, &id)?
+            .ok_or_else(|| coded("not_cached", format!("Page '{page}' not found in local cache")))?
+    } else {
+        let fresh = client.get_page(&id).await?;
+        let _ = storage.upsert_page(&fresh);
+        fresh
+    };
+    let detail = NotionPageDetail {
+        page: loaded_page,
+        ..Default::default()
+    };
+    Ok(detail.project_fields(fields, None))
 }
 
 /// Full page detail plus whether more comments exist than the detail carries.

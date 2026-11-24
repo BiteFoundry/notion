@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 20;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 21;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 22;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 23;
 
 /// Initializes SQLite WAL PRAGMAs, Notion workspace-scoped tables, indexes, and `pages_fts`.
 /// Returns `true` if `pages_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -84,6 +84,8 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             plain_text TEXT NOT NULL DEFAULT '',
             created_time TEXT,
             last_edited_time TEXT,
+            created_by TEXT,
+            last_edited_by TEXT,
             detail_synced_edited_time TEXT,
             body_synced_edited_time TEXT,
             comments_error TEXT,
@@ -172,6 +174,8 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
     .context("Failed to create Notion SQLite schema")?;
 
     // Additive migration for pre-v14 databases: preserves all cached pages, blocks, comments, and FTS rows.
+    ensure_column_exists(conn, "pages", "created_by", "TEXT")?;
+    ensure_column_exists(conn, "pages", "last_edited_by", "TEXT")?;
     ensure_column_exists(conn, "pages", "detail_synced_edited_time", "TEXT")?;
     ensure_column_exists(conn, "pages", "body_synced_edited_time", "TEXT")?;
     if ensure_column_exists(conn, "pages", "comments_error", "TEXT")? {

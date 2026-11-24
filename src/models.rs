@@ -205,6 +205,31 @@ impl NotionPropertyValue {
         }
     }
 
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Title(_) => "title",
+            Self::RichText(_) => "rich_text",
+            Self::Status(_) => "status",
+            Self::Select(_) => "select",
+            Self::MultiSelect(_) => "multi_select",
+            Self::Date { .. } => "date",
+            Self::Checkbox(_) => "checkbox",
+            Self::Number(_) => "number",
+            Self::People(_) => "people",
+            Self::Url(_) => "url",
+            Self::Email(_) => "email",
+            Self::PhoneNumber(_) => "phone_number",
+            Self::Files(_) => "files",
+            Self::Relation(_) => "relation",
+            Self::Formula(_) => "formula",
+            Self::Rollup(_) => "rollup",
+            Self::CreatedTime(_) => "created_time",
+            Self::LastEditedTime(_) => "last_edited_time",
+            Self::UniqueId(_) => "unique_id",
+            Self::Other(_) => "other",
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Checkbox(_) => false,
@@ -243,6 +268,10 @@ pub struct NotionPage {
     pub plain_text: String,
     pub created_time: Option<String>,
     pub last_edited_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_edited_by: Option<String>,
     pub synced_at: Option<String>,
 }
 
@@ -659,11 +688,28 @@ impl NotionPageDetail {
             .and_then(|v| v.as_object().cloned())
             .map(|map| {
                 map.keys()
-                    .filter(|k| !matches!(k.as_str(), "id" | "title" | "last_edited_time"))
+                    .filter(|k| {
+                        !matches!(
+                            k.as_str(),
+                            "id" | "title" | "last_edited_time" | "properties"
+                        )
+                    })
                     .map(|k| format!("page.{k}"))
                     .collect()
             })
             .unwrap_or_default();
+        let populated_properties: Vec<Value> = self
+            .page
+            .properties
+            .iter()
+            .filter(|(_, val)| !val.is_empty())
+            .map(|(name, val)| {
+                serde_json::json!({
+                    "name": name,
+                    "type": val.type_name(),
+                })
+            })
+            .collect();
         let mut out = serde_json::Map::new();
         out.insert("id".into(), serde_json::json!(self.page.id));
         out.insert("title".into(), serde_json::json!(self.page.title));
@@ -687,9 +733,225 @@ impl NotionPageDetail {
                 "comments": comments_count,
                 "media": self.media.len(),
                 "fields": fields,
+                "properties": populated_properties,
             }),
         );
         out.insert("hint".into(), serde_json::json!(hint));
+        Value::Object(out)
+    }
+
+    /// Returns `(needs_blocks, needs_comments)` for a selective `fields` request so callers can
+    /// avoid fetching blocks or up to 2,000 live comments when not requested.
+    pub(crate) fn requested_fields_needs(fields: &[String]) -> (bool, bool) {
+        let mut needs_blocks = false;
+        let mut needs_comments = false;
+        for raw in fields {
+            let norm = raw.trim().to_ascii_lowercase();
+            let key = norm.strip_prefix("page.").unwrap_or(&norm);
+            match key {
+                "comments" | "comments_error" | "comments_has_more" => {
+                    needs_comments = true;
+                }
+                "blocks"
+                | "markdown"
+                | "body_markdown"
+                | "plain_text"
+                | "media"
+                | "incomplete_blocks" => {
+                    needs_blocks = true;
+                }
+                _ => {}
+            }
+        }
+        (needs_blocks, needs_comments)
+    }
+
+    /// Projects only the requested standard fields and/or dynamic page properties (case-insensitive).
+    /// Unrecognized field/property names are returned under `missing_fields`.
+    pub(crate) fn project_fields(
+        &self,
+        requested: &[String],
+        comments_has_more: Option<bool>,
+    ) -> Value {
+        let mut out = serde_json::Map::new();
+        out.insert("id".into(), serde_json::json!(self.page.id));
+        out.insert("title".into(), serde_json::json!(self.page.title));
+
+        let mut all_properties = false;
+        let mut selected_properties = serde_json::Map::new();
+        let mut missing_fields: Vec<String> = Vec::new();
+
+        let lookup_property = |needle: &str| -> Option<(&String, &NotionPropertyValue)> {
+            if let Some(entry) = self.page.properties.get_key_value(needle) {
+                return Some(entry);
+            }
+            let lower = needle.to_lowercase();
+            self.page
+                .properties
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(needle) || k.to_lowercase() == lower)
+        };
+
+        for raw in requested {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+
+            // Explicit `properties.<Name>` or `page.properties.<Name>` always targets dynamic properties.
+            let explicit_prop_prefix_len = if lower.starts_with("page.properties.") {
+                Some("page.properties.".len())
+            } else if lower.starts_with("properties.") {
+                Some("properties.".len())
+            } else {
+                None
+            };
+            if let Some(prefix_len) = explicit_prop_prefix_len {
+                let prop_needle = trimmed[prefix_len..].trim();
+                if let Some((actual_name, prop_val)) = lookup_property(prop_needle) {
+                    selected_properties.insert(
+                        actual_name.clone(),
+                        serde_json::to_value(prop_val).unwrap_or(Value::Null),
+                    );
+                } else if !missing_fields.iter().any(|m| m == trimmed) {
+                    missing_fields.push(trimmed.to_string());
+                }
+                continue;
+            }
+
+            let std_key = lower.strip_prefix("page.").unwrap_or(&lower);
+            match std_key {
+                "id" | "title" => {}
+                "workspace_id" => {
+                    out.insert("workspace_id".into(), serde_json::json!(self.page.workspace_id));
+                }
+                "url" => {
+                    out.insert("url".into(), serde_json::json!(self.page.url));
+                }
+                "parent" => {
+                    out.insert(
+                        "parent".into(),
+                        serde_json::json!({
+                            "parent_type": self.page.parent_type,
+                            "parent_id": self.page.parent_id,
+                        }),
+                    );
+                }
+                "parent_type" => {
+                    out.insert("parent_type".into(), serde_json::json!(self.page.parent_type));
+                }
+                "parent_id" => {
+                    out.insert("parent_id".into(), serde_json::json!(self.page.parent_id));
+                }
+                "icon" => {
+                    out.insert("icon".into(), serde_json::json!(self.page.icon));
+                }
+                "cover_url" | "cover" => {
+                    out.insert("cover_url".into(), serde_json::json!(self.page.cover_url));
+                }
+                "archived" => {
+                    out.insert("archived".into(), serde_json::json!(self.page.archived));
+                }
+                "is_favorite" => {
+                    out.insert("is_favorite".into(), serde_json::json!(self.page.is_favorite));
+                }
+                "created_time" => {
+                    out.insert("created_time".into(), serde_json::json!(self.page.created_time));
+                }
+                "last_edited_time" => {
+                    out.insert(
+                        "last_edited_time".into(),
+                        serde_json::json!(self.page.last_edited_time),
+                    );
+                }
+                "created_by" => {
+                    out.insert("created_by".into(), serde_json::json!(self.page.created_by));
+                }
+                "last_edited_by" => {
+                    out.insert(
+                        "last_edited_by".into(),
+                        serde_json::json!(self.page.last_edited_by),
+                    );
+                }
+                "synced_at" => {
+                    out.insert("synced_at".into(), serde_json::json!(self.page.synced_at));
+                }
+                "properties" => {
+                    all_properties = true;
+                }
+                "blocks" => {
+                    out.insert("blocks".into(), serde_json::json!(self.blocks));
+                }
+                "incomplete_blocks" => {
+                    out.insert(
+                        "incomplete_blocks".into(),
+                        serde_json::json!(crate::parser::incomplete_block_ids(&self.blocks)),
+                    );
+                }
+                "markdown" => {
+                    out.insert("markdown".into(), serde_json::json!(self.markdown));
+                }
+                "body_markdown" => {
+                    out.insert("body_markdown".into(), serde_json::json!(self.markdown));
+                }
+                "plain_text" => {
+                    out.insert("plain_text".into(), serde_json::json!(self.page.plain_text));
+                }
+                "media" => {
+                    out.insert("media".into(), serde_json::json!(self.media));
+                }
+                "comments" => {
+                    let visible_len = self.comments.len().min(crate::notion::DETAIL_COMMENTS_LIMIT);
+                    out.insert(
+                        "comments".into(),
+                        serde_json::json!(&self.comments[..visible_len]),
+                    );
+                    if let Some(has_more) = comments_has_more {
+                        out.insert("comments_has_more".into(), serde_json::json!(has_more));
+                    }
+                    if let Some(err) = &self.comments_error {
+                        out.insert("comments_error".into(), serde_json::json!(err));
+                    }
+                }
+                "comments_error" => {
+                    out.insert(
+                        "comments_error".into(),
+                        serde_json::json!(self.comments_error),
+                    );
+                }
+                "comments_has_more" => {
+                    out.insert(
+                        "comments_has_more".into(),
+                        serde_json::json!(comments_has_more.unwrap_or(false)),
+                    );
+                }
+                _ => {
+                    if let Some((actual_name, prop_val)) = lookup_property(trimmed) {
+                        selected_properties.insert(
+                            actual_name.clone(),
+                            serde_json::to_value(prop_val).unwrap_or(Value::Null),
+                        );
+                    } else if !missing_fields.iter().any(|m| m == trimmed) {
+                        missing_fields.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+
+        if all_properties {
+            out.insert(
+                "properties".into(),
+                serde_json::to_value(&self.page.properties).unwrap_or_else(|_| serde_json::json!({})),
+            );
+        } else if !selected_properties.is_empty() {
+            out.insert("properties".into(), Value::Object(selected_properties));
+        }
+
+        if !missing_fields.is_empty() {
+            out.insert("missing_fields".into(), serde_json::json!(missing_fields));
+        }
+
         Value::Object(out)
     }
 
@@ -1156,8 +1418,9 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert!(fields.contains(&"page.properties"));
+        assert!(!fields.contains(&"page.properties"));
         assert!(!fields.contains(&"page.id"));
+        assert_eq!(cached["omitted"]["properties"], serde_json::json!([]));
         assert_eq!(cached["hint"], "H");
 
         let failed = detail.compact("H".into(), "failed", None, Some("E"));
@@ -1170,6 +1433,108 @@ mod tests {
         assert_eq!(not_fetched["comments_state"], "not_fetched");
         assert!(not_fetched.get("comments_error").is_none());
         assert!(not_fetched.get("comments_has_more").is_none());
+    }
+
+    #[test]
+    fn compact_surfaces_populated_properties_and_project_fields_selects_cleanly() {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "Status".into(),
+            NotionPropertyValue::Status(Some(SelectOption {
+                id: Some("s1".into()),
+                name: "In Progress".into(),
+                color: NotionColor::Blue,
+            })),
+        );
+        props.insert(
+            "Acceptance Criteria".into(),
+            NotionPropertyValue::RichText("Must pass all unit tests".into()),
+        );
+        props.insert("Empty Notes".into(), NotionPropertyValue::RichText(String::new()));
+        props.insert("Empty Url".into(), NotionPropertyValue::Url(None));
+        props.insert("Done".into(), NotionPropertyValue::Checkbox(false));
+
+        let detail = NotionPageDetail {
+            page: NotionPage {
+                id: "p-spec".into(),
+                title: "Feature Spec".into(),
+                url: "https://www.notion.so/p-spec".into(),
+                parent_type: "database_id".into(),
+                parent_id: Some("db-1".into()),
+                created_time: Some("2026-01-01T00:00:00Z".into()),
+                last_edited_time: Some("2026-11-01T00:00:00Z".into()),
+                created_by: Some("Alice".into()),
+                last_edited_by: Some("Bob".into()),
+                properties: props,
+                ..Default::default()
+            },
+            markdown: "## Body\nHello".into(),
+            ..Default::default()
+        };
+
+        let compact = detail.compact("hint".into(), "not_fetched", None, None);
+        // Sorted by name, empty properties filtered out.
+        assert_eq!(
+            compact["omitted"]["properties"],
+            serde_json::json!([
+                { "name": "Acceptance Criteria", "type": "rich_text" },
+                { "name": "Done", "type": "checkbox" },
+                { "name": "Status", "type": "status" }
+            ])
+        );
+
+        // Requesting dynamic properties (case-insensitive + properties. prefix) + standard fields + missing
+        let projected = detail.project_fields(
+            &[
+                "acceptance criteria".into(),
+                "properties.Status".into(),
+                "url".into(),
+                "parent".into(),
+                "created_by".into(),
+                "last_edited_by".into(),
+                "body_markdown".into(),
+                "Does Not Exist".into(),
+            ],
+            None,
+        );
+        assert_eq!(projected["id"], "p-spec");
+        assert_eq!(projected["title"], "Feature Spec");
+        assert_eq!(projected["url"], "https://www.notion.so/p-spec");
+        assert_eq!(
+            projected["parent"],
+            serde_json::json!({ "parent_type": "database_id", "parent_id": "db-1" })
+        );
+        assert_eq!(projected["created_by"], "Alice");
+        assert_eq!(projected["last_edited_by"], "Bob");
+        assert_eq!(projected["body_markdown"], "## Body\nHello");
+        assert_eq!(
+            projected["properties"]["Acceptance Criteria"]["value"],
+            "Must pass all unit tests"
+        );
+        assert_eq!(projected["properties"]["Status"]["value"]["name"], "In Progress");
+        assert!(projected["properties"].get("Done").is_none());
+        assert_eq!(projected["missing_fields"], serde_json::json!(["Does Not Exist"]));
+        assert!(projected.get("comments").is_none());
+        assert!(projected.get("blocks").is_none());
+
+        // Needs analysis: properties-only needs neither blocks nor comments.
+        assert_eq!(
+            NotionPageDetail::requested_fields_needs(&[
+                "Acceptance Criteria".into(),
+                "Status".into(),
+                "url".into(),
+                "created_by".into()
+            ]),
+            (false, false)
+        );
+        assert_eq!(
+            NotionPageDetail::requested_fields_needs(&["body_markdown".into(), "Status".into()]),
+            (true, false)
+        );
+        assert_eq!(
+            NotionPageDetail::requested_fields_needs(&["comments".into()]),
+            (false, true)
+        );
     }
 
     #[test]

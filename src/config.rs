@@ -539,8 +539,9 @@ impl AppConfig {
 
 pub fn config_dir() -> PathBuf {
     if let Ok(override_dir) = std::env::var("NOTION_CONFIG_DIR") {
-        if !override_dir.trim().is_empty() {
-            return PathBuf::from(override_dir.trim());
+        let trimmed = override_dir.trim();
+        if !trimmed.is_empty() {
+            return expand_tilde(trimmed);
         }
     }
     dirs::config_dir()
@@ -550,13 +551,41 @@ pub fn config_dir() -> PathBuf {
 
 pub fn data_dir() -> PathBuf {
     if let Ok(override_dir) = std::env::var("NOTION_DATA_DIR") {
-        if !override_dir.trim().is_empty() {
-            return PathBuf::from(override_dir.trim());
+        let trimmed = override_dir.trim();
+        if !trimmed.is_empty() {
+            return expand_tilde(trimmed);
         }
     }
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(APP_DIR_NAME)
+}
+
+/// Canonicalizes the deepest existing ancestor of `path` and re-appends any non-existent
+/// trailing components, falling back to `std::path::absolute`.
+pub fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut cur: &Path = abs.as_path();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if cur.exists() {
+            if let Ok(mut canon) = fs::canonicalize(cur) {
+                for comp in tail.into_iter().rev() {
+                    canon.push(comp);
+                }
+                return canon;
+            }
+            break;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) if parent != cur => {
+                tail.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => break,
+        }
+    }
+    abs
 }
 
 pub fn config_file_path() -> PathBuf {
@@ -629,12 +658,47 @@ pub fn write_atomic_0600(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 fn write_atomic_with_mode(path: &Path, data: &[u8], mode_0600: bool) -> Result<()> {
-    ensure_parent(path)?;
-    let parent = path
+    let target_path: PathBuf = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if mode_0600 {
+                anyhow::bail!(
+                    "Refusing to write sensitive file through symlink: {}",
+                    path.display()
+                );
+            }
+            let resolved = fs::canonicalize(path).with_context(|| {
+                format!(
+                    "Refusing to write through dangling or unreadable symlink: {}",
+                    path.display()
+                )
+            })?;
+            let target_meta = fs::metadata(&resolved).with_context(|| {
+                format!("Failed to inspect symlink target: {}", resolved.display())
+            })?;
+            if target_meta.is_dir() {
+                anyhow::bail!(
+                    "Refusing to overwrite directory via symlink: {} -> {}",
+                    path.display(),
+                    resolved.display()
+                );
+            }
+            resolved
+        }
+        Ok(meta) if meta.is_dir() => {
+            anyhow::bail!("Refusing to overwrite directory: {}", path.display());
+        }
+        _ => path.to_path_buf(),
+    };
+
+    ensure_parent(&target_path)?;
+    let parent = target_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let name = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
     let pid = std::process::id();
     let seq = ATOMIC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!(".{name}.{pid}.{seq}.tmp"));
@@ -665,9 +729,9 @@ fn write_atomic_with_mode(path: &Path, data: &[u8], mode_0600: bool) -> Result<(
         return Err(err);
     }
 
-    if let Err(rename_err) = fs::rename(&tmp, path) {
+    if let Err(rename_err) = fs::rename(&tmp, &target_path) {
         if let Err(replace_err) =
-            replace_existing_with_backup(&tmp, path, parent, name, pid, seq, rename_err)
+            replace_existing_with_backup(&tmp, &target_path, parent, name, pid, seq, rename_err)
         {
             let _ = fs::remove_file(&tmp);
             return Err(replace_err);
@@ -757,7 +821,7 @@ fn parse_env_bool(input: &str) -> Option<bool> {
     }
 }
 
-fn expand_tilde(input: &str) -> PathBuf {
+pub(crate) fn expand_tilde(input: &str) -> PathBuf {
     if input == "~" {
         return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
     }
@@ -1008,5 +1072,125 @@ mod tests {
         fs::write(&omitted_path, "notify = true\n").unwrap();
         let omitted = AppConfig::load_from(&omitted_path).unwrap();
         assert_eq!(omitted.effective_active_poll_ms(), 5_000);
+    }
+
+    #[test]
+    fn canonicalize_existing_ancestor_resolves_existing_prefix_and_keeps_missing_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_root = fs::canonicalize(dir.path()).unwrap();
+
+        let existing_file = dir.path().join("exists.txt");
+        fs::write(&existing_file, b"ok").unwrap();
+        assert_eq!(
+            canonicalize_existing_ancestor(&existing_file),
+            canonical_root.join("exists.txt")
+        );
+
+        let nested_missing = dir.path().join("sub").join("deep").join("profile");
+        assert_eq!(
+            canonicalize_existing_ancestor(&nested_missing),
+            canonical_root.join("sub").join("deep").join("profile")
+        );
+
+        let dotted = dir.path().join(".").join("sub").join("..").join("leaf");
+        assert_eq!(
+            canonicalize_existing_ancestor(&dotted),
+            canonical_root.join("leaf")
+        );
+    }
+
+    #[tokio::test]
+    async fn config_and_data_dir_expand_tilde() {
+        let _lock = TEST_ENV_LOCK.lock().await;
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let _guard = EnvVarGuard::set(&[
+            ("NOTION_CONFIG_DIR", Some("~/notion-test-cfg")),
+            ("NOTION_DATA_DIR", Some("~/notion-test-data")),
+        ]);
+        assert_eq!(config_dir(), home.join("notion-test-cfg"));
+        assert_eq!(data_dir(), home.join("notion-test-data"));
+    }
+
+    #[cfg(any(unix, windows))]
+    fn create_test_file_symlink(original: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(original, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(original, link)
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn create_test_dir_symlink(original: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(original, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(original, link)
+        }
+    }
+
+    #[test]
+    fn write_atomic_with_mode_hardens_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let real_file = target_dir.path().join("dotfiles-config.toml");
+        fs::write(&real_file, b"old-config").unwrap();
+
+        let link_cfg = dir.path().join("config.toml");
+        match create_test_file_symlink(&real_file, &link_cfg) {
+            Ok(()) => {}
+            #[cfg(windows)]
+            Err(err) if err.raw_os_error() == Some(1314) => {
+                // Unprivileged Windows without Developer Mode cannot create symlinks.
+                return;
+            }
+            Err(err) => panic!("failed to create test symlink: {err}"),
+        }
+
+        // mode_0600 == false resolves target, updates it atomically, and preserves the symlink.
+        write_atomic_with_mode(&link_cfg, b"new-config", false).unwrap();
+        assert!(fs::symlink_metadata(&link_cfg)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&real_file).unwrap(), b"new-config");
+        assert_eq!(fs::read(&link_cfg).unwrap(), b"new-config");
+
+        // mode_0600 == true refuses writing through any symlink (e.g. credentials.json).
+        let secret_target = target_dir.path().join("real-creds.json");
+        fs::write(&secret_target, b"original-secret").unwrap();
+        let secret_link = dir.path().join("credentials.json");
+        create_test_file_symlink(&secret_target, &secret_link).unwrap();
+        let err = write_atomic_0600(&secret_link, b"overwritten").unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fs::read(&secret_target).unwrap(), b"original-secret");
+
+        // Dangling symlink errors even when mode_0600 == false.
+        let dangling_link = dir.path().join("dangling.toml");
+        create_test_file_symlink(&target_dir.path().join("does-not-exist.toml"), &dangling_link)
+            .unwrap();
+        assert!(write_atomic_with_mode(&dangling_link, b"data", false).is_err());
+
+        // Directory symlink errors even when mode_0600 == false.
+        let sub_dir = target_dir.path().join("real-dir");
+        fs::create_dir(&sub_dir).unwrap();
+        let dir_link = dir.path().join("dir-link.toml");
+        create_test_dir_symlink(&sub_dir, &dir_link).unwrap();
+        let dir_err = write_atomic_with_mode(&dir_link, b"data", false).unwrap_err();
+        assert!(
+            dir_err.to_string().contains("directory"),
+            "unexpected error: {dir_err}"
+        );
     }
 }

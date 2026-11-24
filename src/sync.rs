@@ -977,6 +977,8 @@ fn page_semantic_fields(page: &NotionPage) -> impl PartialEq + Serialize + '_ {
         plain_text,
         created_time,
         last_edited_time,
+        created_by,
+        last_edited_by,
         is_favorite: _,
         synced_at: _,
     } = page;
@@ -989,6 +991,8 @@ fn page_semantic_fields(page: &NotionPage) -> impl PartialEq + Serialize + '_ {
             plain_text,
             created_time,
             last_edited_time,
+            created_by,
+            last_edited_by,
         ),
     )
 }

@@ -538,41 +538,61 @@ fn cleanup_owned_files(paths: &DaemonPaths, our_secret: &str, sock_path: Option<
     let _ = sock_path;
 }
 
+fn config_dir_short_hash(config_dir: &Path) -> String {
+    let canonical = crate::config::canonicalize_existing_ancestor(config_dir);
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(canonical.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        hasher.update(canonical.to_string_lossy().as_bytes());
+    }
+    let digest = hex::encode(hasher.finalize());
+    digest[..12].to_string()
+}
+
 #[cfg(windows)]
 fn select_windows_pipe_name(config_dir: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(config_dir.to_string_lossy().as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    let short_hash = &digest[..12];
+    let short_hash = config_dir_short_hash(config_dir);
     format!(r"\\.\pipe\notion-cli-daemon-{short_hash}")
+}
+
+#[cfg(any(unix, test))]
+fn select_unix_socket_path_with_xdg(config_dir: &Path, xdg_runtime_dir: Option<&str>) -> PathBuf {
+    #[cfg(unix)]
+    let path_len = |p: &Path| {
+        use std::os::unix::ffi::OsStrExt;
+        p.as_os_str().as_bytes().len()
+    };
+    #[cfg(not(unix))]
+    let path_len = |p: &Path| p.to_string_lossy().len();
+
+    let candidate = config_dir.join("notion-daemon.sock");
+    if path_len(&candidate) <= 90 {
+        return candidate;
+    }
+
+    let short_hash = config_dir_short_hash(config_dir);
+
+    if let Some(trimmed) = xdg_runtime_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        let xdg_candidate = PathBuf::from(trimmed)
+            .join("notion-cli")
+            .join(format!("notion-daemon-{short_hash}.sock"));
+        if path_len(&xdg_candidate) <= 90 {
+            return xdg_candidate;
+        }
+    }
+
+    PathBuf::from(format!("/tmp/notion-cli-{short_hash}/notion-daemon.sock"))
 }
 
 #[cfg(unix)]
 fn select_unix_socket_path(config_dir: &Path) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-
-    let candidate = config_dir.join("notion-daemon.sock");
-    if candidate.as_os_str().as_bytes().len() <= 90 {
-        return candidate;
-    }
-
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        let trimmed = xdg.trim();
-        if !trimmed.is_empty() {
-            let xdg_candidate = PathBuf::from(trimmed)
-                .join("notion-cli")
-                .join("notion-daemon.sock");
-            if xdg_candidate.as_os_str().as_bytes().len() <= 90 {
-                return xdg_candidate;
-            }
-        }
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(config_dir.as_os_str().as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    let short_hash = &digest[..12];
-    PathBuf::from(format!("/tmp/notion-cli-{short_hash}/notion-daemon.sock"))
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    select_unix_socket_path_with_xdg(config_dir, xdg.as_deref())
 }
 
 #[cfg(unix)]
@@ -1566,11 +1586,8 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
             if status.transport.as_deref() == Some("unix") {
-                assert!(status
-                    .endpoint
-                    .as_deref()
-                    .unwrap()
-                    .ends_with("notion-daemon.sock"));
+                let endpoint = status.endpoint.as_deref().unwrap();
+                assert!(endpoint.contains("notion-daemon") && endpoint.ends_with(".sock"));
             }
         }
 
@@ -1862,5 +1879,52 @@ mod tests {
             Some("{\"ok\":false}")
         );
         assert_eq!(read_limited_line(&mut valid_reader).await.unwrap(), None);
+    }
+
+    #[test]
+    fn unix_socket_path_isolates_long_profiles_across_xdg_and_tmp() {
+        let short_dir = Path::new("/tmp/nc");
+        assert_eq!(
+            select_unix_socket_path_with_xdg(short_dir, Some("/run/user/1000")),
+            short_dir.join("notion-daemon.sock")
+        );
+
+        let base = tempfile::tempdir().unwrap();
+        let long_seg = "very-long-profile-directory-segment-for-isolation-testing-0123456789";
+        let profile_a = base.path().join(long_seg).join("profile-alpha");
+        let profile_b = base.path().join(long_seg).join("profile-beta");
+        let profile_a_equiv = base.path().join(long_seg).join(".").join("profile-alpha");
+
+        let hash_a = config_dir_short_hash(&profile_a);
+        let hash_b = config_dir_short_hash(&profile_b);
+        let hash_a_equiv = config_dir_short_hash(&profile_a_equiv);
+        assert_eq!(hash_a, hash_a_equiv);
+        assert_ne!(hash_a, hash_b);
+
+        // XDG_RUNTIME_DIR fallback includes short_hash so distinct long profiles never collide.
+        let xdg_a = select_unix_socket_path_with_xdg(&profile_a, Some("/run/user/1000"));
+        let xdg_b = select_unix_socket_path_with_xdg(&profile_b, Some("/run/user/1000"));
+        assert_eq!(
+            xdg_a,
+            PathBuf::from("/run/user/1000")
+                .join("notion-cli")
+                .join(format!("notion-daemon-{hash_a}.sock"))
+        );
+        assert_eq!(
+            xdg_b,
+            PathBuf::from("/run/user/1000")
+                .join("notion-cli")
+                .join(format!("notion-daemon-{hash_b}.sock"))
+        );
+        assert_ne!(xdg_a, xdg_b);
+
+        // Without XDG_RUNTIME_DIR, falls back to /tmp/notion-cli-{short_hash}/notion-daemon.sock.
+        let tmp_a = select_unix_socket_path_with_xdg(&profile_a, None);
+        let tmp_b = select_unix_socket_path_with_xdg(&profile_b, None);
+        assert_eq!(
+            tmp_a,
+            PathBuf::from(format!("/tmp/notion-cli-{hash_a}/notion-daemon.sock"))
+        );
+        assert_ne!(tmp_a, tmp_b);
     }
 }

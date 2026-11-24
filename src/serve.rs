@@ -336,6 +336,16 @@ struct OfflineParams {
     refresh: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct PageGetParams {
+    #[serde(default)]
+    offline: bool,
+    #[serde(default)]
+    refresh: bool,
+    #[serde(default)]
+    fields: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CreatePageBody {
     parent_id: String,
@@ -644,8 +654,29 @@ async fn list_pages_handler(
 async fn get_page_handler(
     State(state): State<Arc<ApiState>>,
     AxumPath(id): AxumPath<String>,
-    Query(q): Query<OfflineParams>,
+    Query(q): Query<PageGetParams>,
 ) -> Result<Json<Value>, ApiError> {
+    if let Some(raw_fields) = q.fields.as_deref() {
+        let fields: Vec<String> = raw_fields
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !fields.is_empty() {
+            let projected = cli::op_get_page_fields(
+                &state.client,
+                &state.storage,
+                &id,
+                q.refresh,
+                q.offline,
+                &fields,
+            )
+            .await
+            .map_err(ApiError::from_anyhow)?;
+            return Ok(Json(json!({ "ok": true, "detail": projected })));
+        }
+    }
     let (detail, comments_has_more) =
         cli::op_get_page_for_output(&state.client, &state.storage, &id, q.refresh, q.offline)
             .await

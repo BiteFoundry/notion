@@ -188,7 +188,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_page",
-            "description": "Fetch a Notion page. Compact by default: id, title, last_edited_time, Markdown, incomplete_blocks, comments_state, omitted counts and a hint; compact never requests comments and reports only what the cache knows. Pass compact:false for properties, block tree, comments and media. Full details carry up to 2000 comments; use list_comments with cursor for the rest. Cost: one page request; the block tree (one request per 100 blocks plus one per block with children) is fetched only when the page changed, is not cached, or refresh:true. compact:false also fetches comments.",
+            "description": "Fetch a Notion page. Compact by default (never requests comments) with id, title, Markdown, omitted counts/properties, and a hint. Pass fields:[...] for specific standard fields or dynamic page properties (case-insensitive); skips comments unless \"comments\" is requested. Pass compact:false for full detail (up to 2000 comments). Cost: 1 page request; blocks on change/cache miss/refresh; comments only for compact:false or fields containing \"comments\".",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
@@ -196,6 +196,11 @@ pub fn tool_definitions() -> Vec<Value> {
                     "page": { "type": "string", "description": "Page UUID, Notion URL, or title" },
                     "refresh": { "type": "boolean", "description": "Force refetch of blocks and comments even if page timestamp did not change" },
                     "compact": { "type": "boolean", "default": true, "description": "false returns the full page detail" },
+                    "fields": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Select specific standard fields (properties, blocks, comments, media, url, parent, created_time, last_edited_time, created_by, last_edited_by, body_markdown, etc.) or dynamic property names (case-insensitive, e.g. \"Status\" or \"properties.Status\"). Skips comments unless \"comments\" is listed."
+                    },
                     "offline": { "type": "boolean" }
                 }
             }
@@ -456,6 +461,34 @@ async fn dispatch_tool(
             let page = req_str("page")?;
             let refresh = opt_bool("refresh", false);
             let offline = opt_bool("offline", false);
+            let fields: Option<Vec<String>> = match args.get("fields") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(arr)) => {
+                    let mut out = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        let Some(s) = item.as_str() else {
+                            bail!("`fields` must be an array of strings");
+                        };
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            out.push(trimmed.to_string());
+                        }
+                    }
+                    (!out.is_empty()).then_some(out)
+                }
+                Some(_) => bail!("`fields` must be an array of strings"),
+            };
+            if let Some(req_fields) = fields {
+                return cli::op_get_page_fields(
+                    client,
+                    storage,
+                    &page,
+                    refresh,
+                    offline,
+                    &req_fields,
+                )
+                .await;
+            }
             if opt_bool("compact", true) {
                 return cli::op_get_page_compact(
                     client,
@@ -465,7 +498,7 @@ async fn dispatch_tool(
                     offline,
                     |id| {
                         format!(
-                            "Call get_page with {{\"page\":\"{id}\",\"compact\":false}} for properties, blocks, comments and media."
+                            "Call get_page with {{\"page\":\"{id}\",\"fields\":[\"<property name>\",...]}} to fetch specific properties or fields without pulling full blocks or comments, or {{\"page\":\"{id}\",\"compact\":false}} for full detail."
                         )
                     },
                 )
@@ -765,5 +798,255 @@ mod tests {
                 "MCP description must be 100% English: {desc}"
             );
         }
+        let get_page = tools.iter().find(|t| t["name"] == "get_page").unwrap();
+        assert_eq!(
+            get_page["inputSchema"]["properties"]["fields"]["type"],
+            "array"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_get_page_compact_omitted_properties_and_selective_fields_projection() {
+        use axum::{
+            extract::State,
+            routing::get,
+            Json, Router,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::net::TcpListener;
+
+        #[derive(Clone, Default)]
+        struct MockState {
+            block_reqs: Arc<AtomicUsize>,
+            comment_reqs: Arc<AtomicUsize>,
+        }
+
+        let page_id = "11111111-1111-1111-1111-111111111111";
+        let state = MockState::default();
+        let app = Router::new()
+            .route(
+                "/v1/pages/11111111-1111-1111-1111-111111111111",
+                get(|| async {
+                    Json(json!({
+                        "object": "page",
+                        "id": "11111111-1111-1111-1111-111111111111",
+                        "url": "https://www.notion.so/11111111111111111111111111111111",
+                        "parent": { "type": "database_id", "database_id": "db-stories" },
+                        "archived": false,
+                        "created_time": "2026-01-01T00:00:00.000Z",
+                        "last_edited_time": "2026-11-01T00:00:00.000Z",
+                        "created_by": { "object": "user", "id": "u-creator", "name": "Alice" },
+                        "last_edited_by": { "object": "user", "id": "u-editor" },
+                        "properties": {
+                            "Name": { "type": "title", "title": [{ "plain_text": "Checkout Flow" }] },
+                            "Status": { "type": "status", "status": { "name": "In Review", "color": "blue" } },
+                            "Acceptance Criteria": {
+                                "type": "rich_text",
+                                "rich_text": [{ "plain_text": "1. Card validates\n2. Receipt emailed" }]
+                            },
+                            "Empty Field": { "type": "rich_text", "rich_text": [] }
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/v1/blocks/11111111-1111-1111-1111-111111111111/children",
+                get(|State(st): State<MockState>| async move {
+                    st.block_reqs.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "object": "list",
+                        "results": [
+                            {
+                                "object": "block",
+                                "id": "blk-1",
+                                "type": "paragraph",
+                                "has_children": false,
+                                "paragraph": {
+                                    "rich_text": [{ "type": "text", "text": { "content": "Overview text" }, "plain_text": "Overview text" }]
+                                }
+                            }
+                        ],
+                        "has_more": false,
+                        "next_cursor": Value::Null
+                    }))
+                }),
+            )
+            .route(
+                "/v1/comments",
+                get(|State(st): State<MockState>| async move {
+                    st.comment_reqs.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "object": "list",
+                        "results": [
+                            {
+                                "object": "comment",
+                                "id": "cmt-1",
+                                "parent": { "type": "page_id", "page_id": "11111111-1111-1111-1111-111111111111" },
+                                "discussion_id": "disc-1",
+                                "created_by": { "object": "user", "id": "u-1", "name": "Reviewer" },
+                                "created_time": "2026-11-01T01:00:00.000Z",
+                                "rich_text": [{ "plain_text": "Looks good" }]
+                            }
+                        ],
+                        "has_more": false,
+                        "next_cursor": Value::Null
+                    }))
+                }),
+            )
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let base_url = format!("http://{addr}/v1");
+        let mut cfg = AppConfig::default();
+        cfg.api_base_url = base_url.clone();
+        cfg.upsert_workspace(
+            crate::config::WorkspaceProfile {
+                name: "default".into(),
+                workspace_id: "default".into(),
+                workspace_name: "Test".into(),
+                auth_mode: "integration".into(),
+                api_base_url: Some(base_url),
+                ..Default::default()
+            },
+            true,
+        );
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_test_token");
+        let client = NotionClient::new(&cfg, auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+
+        // 1. Compact get_page surfaces populated properties in omitted.properties & mentions `fields` in hint.
+        let compact_resp = handle_request_value(
+            &cfg,
+            &auth,
+            &client,
+            &storage,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "get_page", "arguments": { "page": page_id } }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(compact_resp["result"]["isError"], false, "{compact_resp}");
+        let compact = &compact_resp["result"]["structuredContent"];
+        assert_eq!(
+            compact["omitted"]["properties"],
+            json!([
+                { "name": "Acceptance Criteria", "type": "rich_text" },
+                { "name": "Name", "type": "title" },
+                { "name": "Status", "type": "status" }
+            ])
+        );
+        let hint = compact["hint"].as_str().unwrap();
+        assert!(hint.contains("fields"), "hint should mention fields: {hint}");
+        assert_eq!(state.comment_reqs.load(Ordering::SeqCst), 0);
+
+        // 2. Selective fields (metadata + dynamic properties) fetches NEITHER blocks NOR comments!
+        let blocks_before = state.block_reqs.load(Ordering::SeqCst);
+        let proj_resp = handle_request_value(
+            &cfg,
+            &auth,
+            &client,
+            &storage,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_page",
+                    "arguments": {
+                        "page": page_id,
+                        "fields": ["acceptance criteria", "properties.Status", "url", "created_by", "last_edited_by", "UnknownProp"]
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(proj_resp["result"]["isError"], false, "{proj_resp}");
+        let proj = &proj_resp["result"]["structuredContent"];
+        assert_eq!(
+            proj["properties"]["Acceptance Criteria"]["value"],
+            "1. Card validates\n2. Receipt emailed"
+        );
+        assert_eq!(proj["properties"]["Status"]["value"]["name"], "In Review");
+        assert_eq!(
+            proj["url"],
+            "https://www.notion.so/11111111111111111111111111111111"
+        );
+        assert_eq!(proj["created_by"], "Alice");
+        assert_eq!(proj["last_edited_by"], "u-editor");
+        assert_eq!(proj["missing_fields"], json!(["UnknownProp"]));
+        assert!(proj.get("comments").is_none());
+        assert!(proj.get("blocks").is_none());
+        assert_eq!(state.block_reqs.load(Ordering::SeqCst), blocks_before);
+        assert_eq!(state.comment_reqs.load(Ordering::SeqCst), 0);
+
+        // 3. Requesting body_markdown still does NOT fetch comments.
+        let body_resp = handle_request_value(
+            &cfg,
+            &auth,
+            &client,
+            &storage,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_page",
+                    "arguments": {
+                        "page": page_id,
+                        "fields": ["body_markdown", "Status"]
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body_resp["result"]["isError"], false, "{body_resp}");
+        let body = &body_resp["result"]["structuredContent"];
+        assert!(body["body_markdown"].as_str().unwrap().contains("Overview text"));
+        assert_eq!(body["properties"]["Status"]["value"]["name"], "In Review");
+        assert!(body.get("missing_fields").is_none());
+        assert_eq!(state.comment_reqs.load(Ordering::SeqCst), 0);
+
+        // 4. Requesting `comments` explicitly DOES fetch comments.
+        let cmt_resp = handle_request_value(
+            &cfg,
+            &auth,
+            &client,
+            &storage,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_page",
+                    "arguments": {
+                        "page": page_id,
+                        "fields": ["comments"]
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cmt_resp["result"]["isError"], false, "{cmt_resp}");
+        let cmt = &cmt_resp["result"]["structuredContent"];
+        assert_eq!(cmt["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(cmt["comments"][0]["body"], "Looks good");
+        assert_eq!(state.comment_reqs.load(Ordering::SeqCst), 1);
+
+        server.abort();
     }
 }

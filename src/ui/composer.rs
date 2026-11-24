@@ -861,11 +861,9 @@ pub fn external_edit(current: &str) -> std::io::Result<String> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(default_editor);
 
-    let parts = parse_editor_command(&editor);
-    let program = parts.first().map(String::as_str).unwrap_or("vi");
-    let args = parts.get(1..).unwrap_or(&[]);
+    let (program, args) = resolve_editor_command(&editor);
 
-    let status = Command::new(program).args(args).arg(&path).status();
+    let status = Command::new(&program).args(&args).arg(&path).status();
 
     let contents = std::fs::read_to_string(&path);
     let _ = std::fs::remove_file(&path);
@@ -875,6 +873,16 @@ pub fn external_edit(current: &str) -> std::io::Result<String> {
         return Err(std::io::Error::other(format!("External editor exited with {status}")));
     }
     Ok(normalize(&contents?))
+}
+
+fn resolve_editor_command(raw: &str) -> (std::path::PathBuf, Vec<String>) {
+    let parts = parse_editor_command(raw);
+    let program = parts
+        .first()
+        .map(|p| crate::config::expand_tilde(p))
+        .unwrap_or_else(|| std::path::PathBuf::from("vi"));
+    let args = parts.get(1..).map(<[String]>::to_vec).unwrap_or_default();
+    (program, args)
 }
 
 fn parse_editor_command(raw: &str) -> Vec<String> {
@@ -1218,5 +1226,24 @@ mod tests {
         composer.stage_inline_image_with_preview(vec![9], "image/png", None, None);
         composer.clear();
         assert!(composer.pending_images.is_empty() && composer.undo.len() == 1 && composer.undo());
+    }
+
+    #[test]
+    fn resolve_editor_command_expands_leading_tilde() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let (prog, args) = resolve_editor_command("~/bin/my-editor --wait -n");
+        assert_eq!(prog, home.join("bin/my-editor"));
+        assert_eq!(args, vec!["--wait", "-n"]);
+
+        let (quoted_prog, quoted_args) =
+            resolve_editor_command(r#""~/My Editors/edit.sh" --flag"#);
+        assert_eq!(quoted_prog, home.join("My Editors/edit.sh"));
+        assert_eq!(quoted_args, vec!["--flag"]);
+
+        let (bare_prog, bare_args) = resolve_editor_command("nvim -u NONE");
+        assert_eq!(bare_prog, std::path::PathBuf::from("nvim"));
+        assert_eq!(bare_args, vec!["-u", "NONE"]);
     }
 }

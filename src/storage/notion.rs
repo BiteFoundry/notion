@@ -536,12 +536,14 @@ impl Storage {
         let conn = self.reader();
         let sql = if include_archived {
             "SELECT id, workspace_id, parent_type, parent_id, title, icon, cover_url, url,
-                    archived, is_favorite, properties_json, plain_text, created_time, last_edited_time, synced_at
+                    archived, is_favorite, properties_json, plain_text, created_time, last_edited_time, synced_at,
+                    created_by, last_edited_by
              FROM pages WHERE workspace_id = ?1
              ORDER BY is_favorite DESC, last_edited_time DESC, title ASC"
         } else {
             "SELECT id, workspace_id, parent_type, parent_id, title, icon, cover_url, url,
-                    archived, is_favorite, properties_json, plain_text, created_time, last_edited_time, synced_at
+                    archived, is_favorite, properties_json, plain_text, created_time, last_edited_time, synced_at,
+                    created_by, last_edited_by
              FROM pages WHERE workspace_id = ?1 AND archived = 0
              ORDER BY is_favorite DESC, last_edited_time DESC, title ASC"
         };
@@ -584,7 +586,8 @@ impl Storage {
         let conn = self.reader();
         let mut stmt = conn.prepare(
             "SELECT id, workspace_id, parent_type, parent_id, title, icon, cover_url, url,
-                    archived, is_favorite, properties_json, plain_text, created_time, last_edited_time, synced_at
+                    archived, is_favorite, properties_json, plain_text, created_time, last_edited_time, synced_at,
+                    created_by, last_edited_by
              FROM pages
              WHERE workspace_id = ?1 AND parent_type = 'database_id' AND parent_id = ?2 AND archived = 0
              ORDER BY last_edited_time DESC, title ASC",
@@ -971,7 +974,8 @@ impl Storage {
 fn get_page(conn: &Connection, workspace_id: &str, page_id: &str) -> Result<Option<NotionPage>> {
     conn.query_row(
         "SELECT id, workspace_id, parent_type, parent_id, title, icon, cover_url, url,
-                archived, is_favorite, properties_json, plain_text, created_time, last_edited_time, synced_at
+                archived, is_favorite, properties_json, plain_text, created_time, last_edited_time, synced_at,
+                created_by, last_edited_by
          FROM pages WHERE workspace_id = ?1 AND id = ?2",
         params![workspace_id, page_id],
         map_page_row,
@@ -1132,8 +1136,8 @@ fn upsert_page_in_tx(tx: &Connection, page: &NotionPage) -> Result<()> {
         "INSERT INTO pages (
             id, workspace_id, parent_type, parent_id, title, icon, cover_url, url,
             archived, is_favorite, properties_json, properties_summary, plain_text,
-            created_time, last_edited_time, synced_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            created_time, last_edited_time, created_by, last_edited_by, synced_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(workspace_id, id) DO UPDATE SET
             parent_type = excluded.parent_type,
             parent_id = excluded.parent_id,
@@ -1148,6 +1152,8 @@ fn upsert_page_in_tx(tx: &Connection, page: &NotionPage) -> Result<()> {
             plain_text = excluded.plain_text,
             created_time = COALESCE(excluded.created_time, pages.created_time),
             last_edited_time = excluded.last_edited_time,
+            created_by = COALESCE(excluded.created_by, pages.created_by),
+            last_edited_by = COALESCE(excluded.last_edited_by, pages.last_edited_by),
             synced_at = excluded.synced_at",
         params![
             page.id,
@@ -1165,6 +1171,8 @@ fn upsert_page_in_tx(tx: &Connection, page: &NotionPage) -> Result<()> {
             effective_plain,
             page.created_time,
             page.last_edited_time,
+            page.created_by,
+            page.last_edited_by,
             page.synced_at
                 .clone()
                 .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
@@ -1542,6 +1550,8 @@ fn map_page_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NotionPage> {
         created_time: r.get(12)?,
         last_edited_time: r.get(13)?,
         synced_at: r.get(14)?,
+        created_by: r.get(15)?,
+        last_edited_by: r.get(16)?,
     })
 }
 
