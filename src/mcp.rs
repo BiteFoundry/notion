@@ -167,7 +167,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "limit": { "type": "integer", "minimum": 1, "default": 50 },
+                    "limit": { "type": "integer", "minimum": 1, "default": 50, "description": "Maximum users to return per page (default 50)." },
                     "cursor": { "type": "string", "description": "next_cursor from a previous reply" }
                 }
             }
@@ -182,7 +182,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "query": { "type": "string", "description": "Search query string" },
                     "remote": { "type": "boolean", "description": "Query live Notion POST /v1/search instead of local SQLite cache" },
                     "offline": { "type": "boolean", "description": "Read local SQLite cache only" },
-                    "limit": { "type": "integer", "default": 30 }
+                    "limit": { "type": "integer", "default": 30, "description": "Maximum search results to return (default 30)." }
                 }
             }
         }),
@@ -201,7 +201,7 @@ pub fn tool_definitions() -> Vec<Value> {
                         "items": { "type": "string" },
                         "description": "Select specific standard fields (properties, blocks, comments, media, url, parent, created_time, last_edited_time, created_by, last_edited_by, body_markdown, etc.) or dynamic property names (case-insensitive, e.g. \"Status\" or \"properties.Status\"). Skips comments unless \"comments\" is listed."
                     },
-                    "offline": { "type": "boolean" }
+                    "offline": { "type": "boolean", "description": "Read from local SQLite cache only without network requests." }
                 }
             }
         }),
@@ -213,15 +213,15 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["page"],
                 "properties": {
                     "page": { "type": "string", "description": "Page or block ID" },
-                    "limit": { "type": "integer", "minimum": 1, "default": 50 },
+                    "limit": { "type": "integer", "minimum": 1, "default": 50, "description": "Maximum top-level blocks to return per page (default 50)." },
                     "cursor": { "type": "string", "description": "next_cursor from a previous reply" },
-                    "offline": { "type": "boolean" }
+                    "offline": { "type": "boolean", "description": "Read cached blocks from local SQLite only without network requests." }
                 }
             }
         }),
         json!({
             "name": "create_page",
-            "description": "Create a new Notion page under a parent page or database from Markdown content. Cost: one write request per 100 blocks.",
+            "description": "Create a new Notion page under a parent page or database (set parent_is_database:true) from Markdown. Use create_database_item for typed database rows with status or custom properties. Cost: one write request per 100 blocks.",
             "inputSchema": {
                 "type": "object",
                 "required": ["parent_id", "title"],
@@ -230,13 +230,13 @@ pub fn tool_definitions() -> Vec<Value> {
                     "title": { "type": "string", "description": "New page title" },
                     "icon": { "type": "string", "description": "Optional emoji icon" },
                     "markdown": { "type": "string", "description": "Optional Markdown body converted into Notion blocks" },
-                    "parent_is_database": { "type": "boolean", "default": false }
+                    "parent_is_database": { "type": "boolean", "default": false, "description": "True if parent_id is a database; false for a parent page." }
                 }
             }
         }),
         json!({
             "name": "update_page",
-            "description": "Change a Notion page's title, emoji icon, or both. Omit a field to keep it or send null to clear it.",
+            "description": "Edit a Notion page's title and/or emoji icon (omit to keep, null to clear). Use update_database_item for row properties or update_block for body text.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page"],
@@ -264,12 +264,12 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "update_block",
-            "description": "Update a block's rich text. Use toggle_todo when changing only the checkbox.",
+            "description": "Edit a single block's rich text (and optional to_do checkbox). Use toggle_todo for checkbox-only changes, update_page for page title/icon, or update_database_item for row properties.",
             "inputSchema": {
                 "type": "object",
                 "required": ["block_id", "text"],
                 "properties": {
-                    "block_id": { "type": "string" },
+                    "block_id": { "type": "string", "description": "Target Notion block UUID from get_page_blocks or append_blocks." },
                     "block_type": { "type": "string", "description": "Optional Notion block type (auto-detected if omitted)" },
                     "text": { "type": "string", "description": "Updated inline Markdown text" },
                     "checked": { "type": "boolean", "description": "Optional checked state for to_do blocks" }
@@ -278,25 +278,25 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "toggle_todo",
-            "description": "Toggle or explicitly set a Notion to_do block's checkbox state.",
+            "description": "Toggle or set only a Notion to_do block's checkbox without editing text.",
             "inputSchema": {
                 "type": "object",
                 "required": ["block_id"],
                 "properties": {
-                    "block_id": { "type": "string" },
+                    "block_id": { "type": "string", "description": "Target Notion to_do block UUID from get_page_blocks." },
                     "checked": { "type": "boolean", "description": "Optional explicit state; flips current state if omitted" }
                 }
             }
         }),
         json!({
             "name": "archive_page",
-            "description": "Archive (or unarchive) a Notion page. Destructive archive requires confirm=true.",
+            "description": "Move a Notion page to trash (reversible with archived:false) or restore it. Requires confirm:true.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page", "confirm"],
                 "properties": {
                     "page": { "type": "string", "description": "Page ID, URL, or title" },
-                    "archived": { "type": "boolean", "default": true },
+                    "archived": { "type": "boolean", "default": true, "description": "True moves page to trash; false restores an archived page." },
                     "confirm": { "type": "boolean", "description": "Must be true to execute archive_page" }
                 }
             }
@@ -307,10 +307,10 @@ pub fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "refresh": { "type": "boolean" },
-                    "limit": { "type": "integer", "minimum": 1, "default": 50 },
+                    "refresh": { "type": "boolean", "description": "Force workspace sync to refresh cached database list and schemas." },
+                    "limit": { "type": "integer", "minimum": 1, "default": 50, "description": "Maximum databases to return per page (default 50)." },
                     "cursor": { "type": "string", "description": "next_cursor from a previous reply" },
-                    "offline": { "type": "boolean" }
+                    "offline": { "type": "boolean", "description": "Read cached databases from local SQLite only without network requests." }
                 }
             }
         }),
@@ -324,21 +324,21 @@ pub fn tool_definitions() -> Vec<Value> {
                     "database": { "type": "string", "description": "Database ID, URL, or title" },
                     "filter": { "type": "object", "description": "Optional Notion API filter JSON object" },
                     "sorts": { "type": "array", "description": "Optional Notion API sorts JSON array" },
-                    "limit": { "type": "integer", "default": 50 },
+                    "limit": { "type": "integer", "default": 50, "description": "Maximum database rows to return per page (default 50)." },
                     "cursor": { "type": "string", "description": "next_cursor from a previous reply" },
-                    "offline": { "type": "boolean" }
+                    "offline": { "type": "boolean", "description": "Read cached rows from local SQLite only; rejects filter and sorts." }
                 }
             }
         }),
         json!({
             "name": "create_database_item",
-            "description": "Create a new row page inside a Notion database with title, optional status, custom properties, and Markdown body.",
+            "description": "Add a typed row page to a Notion database with title, optional status, custom properties, and Markdown body. Use create_page for regular subpages.",
             "inputSchema": {
                 "type": "object",
                 "required": ["database", "title"],
                 "properties": {
-                    "database": { "type": "string" },
-                    "title": { "type": "string" },
+                    "database": { "type": "string", "description": "Target database UUID, Notion URL, or title from list_databases." },
+                    "title": { "type": "string", "description": "Title text for the new database row's title property." },
                     "status": { "type": "string", "description": "Optional Status/Select option name" },
                     "properties": { "type": "object", "description": "Optional raw Notion properties JSON map" },
                     "body": { "type": "string", "description": "Optional Markdown page body" }
@@ -347,15 +347,15 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "update_database_item",
-            "description": "Update title, status, or arbitrary Notion properties on a database row page.",
+            "description": "Edit title, status, or custom properties on an existing database row page. Use update_page for non-database page icon/title or update_block for body text.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page_id"],
                 "properties": {
                     "page_id": { "type": "string", "description": "Row page UUID, Notion URL, or exact title" },
-                    "title": { "type": "string" },
-                    "status": { "type": "string" },
-                    "properties": { "type": "object" }
+                    "title": { "type": "string", "description": "Optional new title for the row's title property." },
+                    "status": { "type": "string", "description": "Optional Status or Select option name matching database schema." },
+                    "properties": { "type": "object", "description": "Optional Notion API properties JSON map to update." }
                 }
             }
         }),
@@ -366,23 +366,23 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "required": ["page"],
                 "properties": {
-                    "page": { "type": "string" },
-                    "limit": { "type": "integer", "minimum": 1, "default": 50 },
+                    "page": { "type": "string", "description": "Target page UUID, Notion URL, or title from search_pages." },
+                    "limit": { "type": "integer", "minimum": 1, "default": 50, "description": "Maximum comments to return per page (default 50)." },
                     "cursor": { "type": "string", "description": "next_cursor from a previous reply" },
-                    "offline": { "type": "boolean" }
+                    "offline": { "type": "boolean", "description": "Read cached comments from local SQLite only; errors if unfetched." }
                 }
             }
         }),
         json!({
             "name": "add_comment",
-            "description": "Add a comment to a Notion page or reply to an existing discussion thread.",
+            "description": "Post a new page-level comment on page, or reply to an existing thread by also passing discussion_id from list_comments.",
             "inputSchema": {
                 "type": "object",
                 "required": ["page", "text"],
                 "properties": {
-                    "page": { "type": "string" },
-                    "text": { "type": "string" },
-                    "discussion_id": { "type": "string" }
+                    "page": { "type": "string", "description": "Target page UUID, Notion URL, or title from search_pages." },
+                    "text": { "type": "string", "description": "Plain text body for the comment (must be non-empty)." },
+                    "discussion_id": { "type": "string", "description": "Optional discussion_id from list_comments to reply to an existing thread." }
                 }
             }
         }),
@@ -803,6 +803,32 @@ mod tests {
             get_page["inputSchema"]["properties"]["fields"]["type"],
             "array"
         );
+    }
+
+    #[test]
+    fn test_mcp_every_tool_property_has_description() {
+        let tools = tool_definitions();
+        for tool in &tools {
+            let tool_name = tool["name"].as_str().unwrap_or("<unknown>");
+            let props = tool["inputSchema"]["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{tool_name} must define inputSchema.properties object"));
+            for (prop_name, schema) in props {
+                let desc = schema
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or("");
+                assert!(
+                    !desc.is_empty(),
+                    "MCP tool `{tool_name}` property `{prop_name}` is missing a non-empty description"
+                );
+                assert!(
+                    !desc.chars().any(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c)),
+                    "MCP tool `{tool_name}` property `{prop_name}` description must be 100% English: {desc}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
