@@ -552,6 +552,11 @@ impl AppState {
         }
     }
 
+    pub fn clear_image_cache(&mut self) {
+        self.image_cache.clear();
+        self.image_cache_bytes = 0;
+    }
+
     pub fn reload_page_parent_hints(&mut self) {
         if let Ok((owners, positions)) = self.storage.load_page_parent_hints(&self.workspace_id) {
             self.block_owner_pages = owners;
@@ -1873,8 +1878,7 @@ impl AppState {
             } => {
                 let sz = rendered.approx_heap_bytes();
                 if self.image_cache_bytes + sz > MAX_IMAGE_CACHE_BYTES {
-                    self.image_cache.clear();
-                    self.image_cache_bytes = 0;
+                    self.clear_image_cache();
                 }
                 self.image_cache_bytes += sz;
                 self.image_cache.insert(cache_key, *rendered);

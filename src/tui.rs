@@ -498,10 +498,11 @@ async fn process_terminal_event_with_burst(
     app: &mut AppState,
     ui: &mut UiState,
     dirty: &mut bool,
+    resized: &mut bool,
     last_activity_sent: &mut Option<Instant>,
 ) -> LoopStep {
     let CrosstermEvent::Key(first_key) = first_ev else {
-        return handle_terminal_event(first_ev, app, ui, dirty, last_activity_sent);
+        return handle_terminal_event(first_ev, app, ui, dirty, resized, last_activity_sent);
     };
     if !ui.accepts_text_input() || !PasteBurstDetector::is_candidate_key(&first_key) {
         return handle_terminal_event(
@@ -509,6 +510,7 @@ async fn process_terminal_event_with_burst(
             app,
             ui,
             dirty,
+            resized,
             last_activity_sent,
         );
     }
@@ -568,6 +570,7 @@ async fn process_terminal_event_with_burst(
                         app,
                         ui,
                         dirty,
+                        resized,
                         last_activity_sent
                     ),
                     LoopStep::Quit
@@ -580,7 +583,7 @@ async fn process_terminal_event_with_burst(
 
     if let Some(extra) = trailing_event {
         if matches!(
-            handle_terminal_event(extra, app, ui, dirty, last_activity_sent),
+            handle_terminal_event(extra, app, ui, dirty, resized, last_activity_sent),
             LoopStep::Quit
         ) {
             return LoopStep::Quit;
@@ -787,6 +790,7 @@ fn handle_terminal_event(
     app: &mut AppState,
     ui: &mut UiState,
     dirty: &mut bool,
+    resized: &mut bool,
     last_activity_sent: &mut Option<Instant>,
 ) -> LoopStep {
     match ev {
@@ -864,12 +868,7 @@ fn handle_terminal_event(
             ui.term_width = w;
             ui.term_height = h;
             *dirty = true;
-            if matches!(
-                ui.overlays.last(),
-                Some(ui::overlays::Overlay::ImagePreview(_))
-            ) {
-                let _ = action::dispatch(Action::LoadPreviewImage, app, ui);
-            }
+            *resized = true;
         }
         CrosstermEvent::FocusGained => {
             app.refresh_active_item();
@@ -1242,6 +1241,7 @@ pub async fn run(
         }
 
         let mut should_quit = false;
+        let mut resized = false;
         tokio::select! {
             _ = tick.tick() => {
                 let now = Instant::now();
@@ -1285,6 +1285,7 @@ pub async fn run(
                                 &mut app,
                                 &mut ui,
                                 &mut dirty,
+                                &mut resized,
                                 &mut last_activity_sent
                             ).await,
                             LoopStep::Quit
@@ -1298,6 +1299,31 @@ pub async fn run(
         }
         if should_quit {
             break;
+        }
+        if resized {
+            #[cfg(windows)]
+            {
+                drop(events);
+                if img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps) {
+                    dirty = true;
+                }
+                win_console::enforce_windows_mouse_capture();
+                let mut stdout = io::stdout();
+                let _ = write_vt_mouse_enable(&mut stdout);
+                events = EventStream::new();
+            }
+            #[cfg(not(windows))]
+            {
+                if img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps) {
+                    dirty = true;
+                }
+            }
+            if matches!(
+                ui.overlays.last(),
+                Some(ui::overlays::Overlay::ImagePreview(_))
+            ) {
+                let _ = action::dispatch(Action::LoadPreviewImage, &mut app, &mut ui);
+            }
         }
 
         let mut drained = 0usize;

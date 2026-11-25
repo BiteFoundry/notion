@@ -1800,12 +1800,10 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             let req_seq = ui.bump_preview_request_seq();
             if let Some(Overlay::ImagePreview(ov)) = ui.overlays.last() {
                 if let Some(target) = ov.current().cloned() {
-                    let (cols, rows) = ov.target_dimensions(ui.term_width, ui.term_height);
+                    let fit = ov.fit_box(ui.term_width, ui.term_height);
                     let caps = ui.graphics_caps;
-                    let cache_key = format!(
-                        "hd:{}:{}:{}:{}:{:?}",
-                        target.page_id, target.media_index, cols, rows, caps.protocol
-                    );
+                    let bg_rgb = crate::img_preview::color_to_rgb(ui.theme.bg_elevated, (25, 25, 25));
+                    let cache_key = ov.cache_key(&target, ui.term_width, ui.term_height, caps);
                     if !app.image_cache.contains_key(&cache_key) {
                         let client = app.client.clone();
                         let http = client.http_client().clone();
@@ -1905,9 +1903,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                                                 let rendered = tokio::task::spawn_blocking(move || {
                                                     crate::img_preview::decode_and_render_for_protocol(
                                                         &bytes,
-                                                        cols,
-                                                        rows,
-                                                        (25, 25, 25),
+                                                        fit,
+                                                        bg_rgb,
                                                         caps,
                                                     )
                                                 })
@@ -2005,8 +2002,12 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::SetTheme(preset) => {
             app.config.theme = preset;
             ui.theme = crate::ui::theme::Theme::detect(preset);
+            app.clear_image_cache();
             let _ = app.config.save();
             ui.info(format!("Theme: {}", preset.label()));
+            if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
+                return dispatch(Action::LoadPreviewImage, app, ui);
+            }
         }
         Action::ToggleInlineImages => {
             app.config.inline_images = !app.config.inline_images;

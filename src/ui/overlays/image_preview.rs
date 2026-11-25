@@ -13,7 +13,9 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    img_preview::TerminalImageProtocol,
+    img_preview::{
+        preview_image_cache_key, FitBox, TerminalGraphicsCaps, TerminalImageProtocol,
+    },
     models::NotionPageDetail,
     ui::{
         action::Action,
@@ -91,20 +93,27 @@ impl ImagePreviewOverlay {
         )
     }
 
-    pub fn target_dimensions(&self, term_width: u16, term_height: u16) -> (u16, u16) {
+    pub fn viewport_dimensions(term_width: u16, term_height: u16) -> (u16, u16) {
         let rect = Self::modal_rect(Rect::new(0, 0, term_width.max(24), term_height.max(12)));
         let inner_w = rect.width.saturating_sub(2).max(12);
-        let inner_h = rect.height.saturating_sub(3).max(6);
-        let base_cols = rect.width.saturating_sub(4).max(12);
-        let max_cols = inner_w.saturating_mul(2).max(base_cols).min(240);
-        let scaled_cols = ((base_cols as u32 * self.zoom_pct as u32) / 100)
-            .clamp(8, max_cols as u32) as u16;
-        // Pass `scrollable_max_rows >= scaled_cols` so `img_preview` fits tall images to width
-        // and lets them scroll vertically immediately at 100% zoom.
-        let scrollable_max_rows = ((inner_h as u32 * 4 * self.zoom_pct as u32) / 100)
-            .max(scaled_cols as u32)
-            .clamp(6, 240) as u16;
-        (scaled_cols, scrollable_max_rows)
+        let inner_h = rect.height.saturating_sub(2).max(6);
+        (inner_w, inner_h)
+    }
+
+    pub fn fit_box(&self, term_width: u16, term_height: u16) -> FitBox {
+        let (view_cols, view_rows) = Self::viewport_dimensions(term_width, term_height);
+        FitBox::scrollable(view_cols, view_rows, self.zoom_pct)
+    }
+
+    pub fn cache_key(
+        &self,
+        target: &PreviewTarget,
+        term_width: u16,
+        term_height: u16,
+        caps: TerminalGraphicsCaps,
+    ) -> String {
+        let fit = self.fit_box(term_width, term_height);
+        preview_image_cache_key(&target.page_id, &target.media_index.to_string(), fit, caps)
     }
 
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
@@ -298,11 +307,7 @@ impl ImagePreviewOverlay {
         let Some(target) = self.current() else {
             return;
         };
-        let (cols, rows) = self.target_dimensions(ui.term_width, ui.term_height);
-        let cache_key = format!(
-            "hd:{}:{}:{}:{}:{:?}",
-            target.page_id, target.media_index, cols, rows, proto
-        );
+        let cache_key = self.cache_key(target, ui.term_width, ui.term_height, ui.graphics_caps);
 
         if let Some(rendered) = app.image_cache.get(&cache_key) {
             let is_pixel =
@@ -472,10 +477,9 @@ mod tests {
             };
 
             let mut overlay = make_preview_overlay();
-            let (cols, rows) = overlay.target_dimensions(ui.term_width, ui.term_height);
+            let fit = overlay.fit_box(ui.term_width, ui.term_height);
             let rendered =
-                decode_and_render_for_protocol(&png, cols, rows, (25, 25, 25), ui.graphics_caps)
-                    .unwrap();
+                decode_and_render_for_protocol(&png, fit, (25, 25, 25), ui.graphics_caps).unwrap();
             let total_rows = if proto == TerminalImageProtocol::Halfblock {
                 rendered.lines.len() as u16
             } else {
@@ -489,7 +493,12 @@ mod tests {
                 "expected scrollable tall image for {proto:?}, total_rows={total_rows}, inner_h={inner_h}"
             );
 
-            let base_key = format!("hd:page-1:0:{cols}:{rows}:{proto:?}");
+            let base_key = overlay.cache_key(
+                overlay.current().unwrap(),
+                ui.term_width,
+                ui.term_height,
+                ui.graphics_caps,
+            );
             app.image_cache.insert(base_key.clone(), rendered);
 
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -605,5 +614,36 @@ mod tests {
                 page_id: Some("page-1".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn test_viewport_dimensions_and_cache_key_reflect_zoom_and_cell_px() {
+        // 180x30 terminal -> modal 176x28 -> inner 174x26 (no 92-col or 240-col cap or *4 inflation)
+        assert_eq!(ImagePreviewOverlay::viewport_dimensions(180, 30), (174, 26));
+        assert_eq!(ImagePreviewOverlay::viewport_dimensions(300, 60), (294, 56));
+
+        let mut ov = make_preview_overlay();
+        let target = ov.current().unwrap().clone();
+        let caps_lo = TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Kitty,
+            cell_px: (10, 20),
+            cell_px_exact: true,
+        };
+        let caps_hi = TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Kitty,
+            cell_px: (16, 32),
+            cell_px_exact: true,
+        };
+        let k1 = ov.cache_key(&target, 180, 30, caps_lo);
+        let k2 = ov.cache_key(&target, 180, 30, caps_hi);
+        assert_ne!(k1, k2);
+        assert!(k1.contains("10x20"));
+        assert!(k2.contains("16x32"));
+        assert!(k1.contains("100%"));
+
+        ov.zoom_pct = 200;
+        let k3 = ov.cache_key(&target, 180, 30, caps_lo);
+        assert_ne!(k1, k3);
+        assert!(k3.contains("200%"));
     }
 }
