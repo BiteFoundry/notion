@@ -428,6 +428,10 @@ impl AppConfig {
     }
 
     pub fn save(&self) -> Result<()> {
+        #[cfg(test)]
+        if std::env::var_os("NOTION_CONFIG_DIR").is_none() {
+            return Ok(());
+        }
         self.save_to(&config_file_path())
     }
 
@@ -792,6 +796,10 @@ impl DraftStore {
     }
 
     pub fn save(&self) -> Result<()> {
+        #[cfg(test)]
+        if std::env::var_os("NOTION_CONFIG_DIR").is_none() {
+            return Ok(());
+        }
         let bytes = serde_json::to_vec_pretty(self)?;
         write_atomic_0600(&drafts_path(), &bytes)
     }
