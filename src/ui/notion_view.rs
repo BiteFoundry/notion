@@ -6,6 +6,10 @@
 //!      Inline Images, Child Page/Database Cards, + Comments Peek Drawer `C`)
 //!   B. Database View (`1 Table`, `2 Board` Kanban, `3 List`, Filter `f`, Sort `s`, New Item `n`).
 
+use bitefoundry_html::layout::{
+    pad_display_width, render_wrapped_table, wrap_styled_spans, TableAlign, TableBorder, TableSpec,
+    WrapPrefix,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -264,175 +268,8 @@ fn draw_page_canvas(
         return;
     }
 
-    let visible = app.visible_blocks(ui);
-    let selected_idx = ui.selected_block.min(visible.len().saturating_sub(1));
-    let canvas_focused = ui.focus == Focus::Canvas;
-
-    let mut rendered_lines: Vec<(Line<'static>, Option<HitTarget>)> = Vec::new();
-    let mut inline_hits: Vec<(usize, u16, u16, HitTarget)> = Vec::new();
-
-    // Generous breathing room at top
-    rendered_lines.push((Line::from(""), None));
-
-    // Page Header: Large Icon + Bold Title + Favorite Star + Quick Pill Bar
-    let fav_mark = if detail.page.is_favorite { " ★" } else { "" };
-    rendered_lines.push((
-        Line::from(vec![
-            Span::styled(
-                format!("{}  ", detail.page.display_icon()),
-                Style::default().fg(theme.fg_primary),
-            ),
-            Span::styled(
-                format!("{}{fav_mark}", detail.page.display_title()),
-                Style::default()
-                    .fg(theme.fg_primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        None,
-    ));
-
-    // Subtle metadata line (Last Edited + Comments count + Media count)
-    let edited = detail
-        .page
-        .last_edited_time
-        .as_deref()
-        .map(short_timestamp)
-        .unwrap_or_else(|| "Synced".into());
-    let edited_prefix = format!("Edited {edited}  ·  ");
-    let comment_badge = if detail.comments.is_empty() {
-        "💬 0".to_string()
-    } else {
-        format!("💬 {}", detail.comments.len())
-    };
-    let meta_line_idx = rendered_lines.len();
-    let comment_x = edited_prefix.width() as u16;
-    let comment_w = comment_badge.width() as u16;
-    if comment_w > 0 {
-        inline_hits.push((
-            meta_line_idx,
-            comment_x,
-            comment_w,
-            HitTarget::Button(ButtonId::ToggleComments),
-        ));
-    }
-    let mut meta_spans = vec![
-        Span::styled(edited_prefix, theme.muted_style()),
-        Span::styled(comment_badge, theme.accent_style()),
-    ];
-    if !detail.media.is_empty() {
-        let sep = "  ·  ";
-        let media_badge = format!("🖼 {} media", detail.media.len());
-        let media_x = comment_x
-            .saturating_add(comment_w)
-            .saturating_add(sep.width() as u16);
-        let media_w = media_badge.width() as u16;
-        if media_w > 0 {
-            inline_hits.push((
-                meta_line_idx,
-                media_x,
-                media_w,
-                HitTarget::Button(ButtonId::ImagePreview),
-            ));
-        }
-        meta_spans.push(Span::styled(sep, theme.muted_style()));
-        meta_spans.push(Span::styled(media_badge, theme.muted_style()));
-    }
-    rendered_lines.push((Line::from(meta_spans), None));
-
-    // Clickable Page Quick Action Pill Bar
-    let action_line_idx = rendered_lines.len();
-    let fav_pill = if detail.page.is_favorite {
-        "[★ Fav]"
-    } else {
-        "[☆ Fav]"
-    };
-    let href_pill = if ui.show_inline_hrefs {
-        "[hrefs:on]"
-    } else {
-        "[hrefs]"
-    };
-    let files_pill = if detail.media.is_empty() {
-        "[📎 Files]".to_string()
-    } else {
-        format!("[📎 Files:{}]", detail.media.len())
-    };
-    let action_pills: [(&str, ButtonId, bool); 8] = [
-        (fav_pill, ButtonId::ToggleFavorite, detail.page.is_favorite),
-        ("[+ Append]", ButtonId::QuickAppend, false),
-        ("[+ Child]", ButtonId::NewChildPage, false),
-        ("[✎ Edit]", ButtonId::EditPage, false),
-        ("[↗ Web]", ButtonId::OpenWeb, false),
-        ("[🔗 Links]", ButtonId::LinkExtractor, false),
-        (href_pill, ButtonId::ToggleHrefs, ui.show_inline_hrefs),
-        (&files_pill, ButtonId::Attachments, false),
-    ];
-    let mut action_spans: Vec<Span<'static>> = Vec::new();
-    let mut ax = 0u16;
-    for (pill_idx, (label, btn, active)) in action_pills.iter().enumerate() {
-        let sep_w = if pill_idx == 0 { 0 } else { 1 };
-        let w = label.width() as u16;
-        if ax.saturating_add(sep_w + w) > content_area.width {
-            break;
-        }
-        if pill_idx > 0 {
-            action_spans.push(Span::raw(" "));
-            ax = ax.saturating_add(1);
-        }
-        let style = if *active {
-            theme.accent_style().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.fg_muted).bg(theme.bg_card)
-        };
-        action_spans.push(Span::styled((*label).to_string(), style));
-        inline_hits.push((action_line_idx, ax, w, HitTarget::Button(*btn)));
-        ax = ax.saturating_add(w);
-    }
-    if !action_spans.is_empty() {
-        rendered_lines.push((Line::from(action_spans), None));
-    }
-
-    // Properties Strip (for database rows or pages with properties)
-    push_properties_strip(detail, &theme, &mut rendered_lines);
-
-    // Subtle hairline divider
-    let rule = "─".repeat(content_area.width.min(96) as usize);
-    rendered_lines.push((
-        Line::from(Span::styled(rule, Style::default().fg(theme.divider))),
-        None,
-    ));
-    rendered_lines.push((Line::from(""), None));
-
-    // Interactive Blocks
-    let mut selected_line_range: Option<(usize, usize)> = None;
-    if visible.is_empty() {
-        rendered_lines.push((
-            Line::from(Span::styled(
-                "Empty page. Press `a` to append blocks (/h1, /todo, /callout, /code) or `e` to edit.",
-                theme.muted_style().add_modifier(Modifier::ITALIC),
-            )),
-            None,
-        ));
-    } else {
-        for (idx, vblk) in visible.iter().enumerate() {
-            let is_sel = canvas_focused && idx == selected_idx;
-            let start_line = rendered_lines.len();
-            render_block_lines(
-                vblk,
-                idx,
-                is_sel,
-                content_area.width as usize,
-                ui,
-                &theme,
-                &mut rendered_lines,
-                &mut inline_hits,
-            );
-            let end_line = rendered_lines.len().saturating_sub(1);
-            if idx == selected_idx && rendered_lines.len() > start_line {
-                selected_line_range = Some((start_line, end_line));
-            }
-        }
-    }
+    let (rendered_lines, inline_hits, selected_line_range) =
+        build_page_canvas_lines(app, detail, ui, &theme, content_area.width);
 
     // Keep the selected block visible when navigating with Up/Down/j/k, while allowing MouseScroll to roam freely
     if ui.canvas_follow_selected {
@@ -978,16 +815,278 @@ fn classify_markdown_line(
     (logical_start, base_default, base_default, true)
 }
 
+#[allow(clippy::type_complexity)]
+fn build_page_canvas_lines(
+    app: &AppState,
+    detail: &NotionPageDetail,
+    ui: &UiState,
+    theme: &Theme,
+    content_width: u16,
+) -> (
+    Vec<(Line<'static>, Option<HitTarget>)>,
+    Vec<(usize, u16, u16, HitTarget)>,
+    Option<(usize, usize)>,
+) {
+    let content_w = content_width as usize;
+    let visible = app.visible_blocks(ui);
+    let selected_idx = ui.selected_block.min(visible.len().saturating_sub(1));
+    let canvas_focused = ui.focus == Focus::Canvas;
+
+    let mut rendered_lines: Vec<(Line<'static>, Option<HitTarget>)> = Vec::new();
+    let mut inline_hits: Vec<(usize, u16, u16, HitTarget)> = Vec::new();
+
+    // Generous breathing room at top
+    rendered_lines.push((Line::from(""), None));
+
+    // Page Header: Large Icon + Bold Title + Favorite Star (wrapped losslessly)
+    let fav_mark = if detail.page.is_favorite { " ★" } else { "" };
+    let icon_prefix = format!("{}  ", detail.page.display_icon());
+    let icon_pad = " ".repeat(icon_prefix.width());
+    let title_first = [Span::styled(
+        icon_prefix,
+        Style::default().fg(theme.fg_primary),
+    )];
+    let title_cont = [Span::raw(icon_pad)];
+    let title_spans = [Span::styled(
+        format!("{}{fav_mark}", detail.page.display_title()),
+        Style::default()
+            .fg(theme.fg_primary)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for line in wrap_styled_spans(
+        &title_spans,
+        content_w,
+        WrapPrefix {
+            first: &title_first,
+            cont: &title_cont,
+        },
+    ) {
+        rendered_lines.push((line, None));
+    }
+
+    // Subtle metadata line (Last Edited + Comments count + Media count), flow-wrapped on narrow viewports
+    let edited = detail
+        .page
+        .last_edited_time
+        .as_deref()
+        .map(short_timestamp)
+        .unwrap_or_else(|| "Synced".into());
+    let edited_seg = format!("Edited {edited}");
+    let comment_badge = if detail.comments.is_empty() {
+        "💬 0".to_string()
+    } else {
+        format!("💬 {}", detail.comments.len())
+    };
+    let mut meta_items: Vec<(String, Style, Option<HitTarget>)> = vec![
+        (edited_seg, theme.muted_style(), None),
+        (
+            comment_badge,
+            theme.accent_style(),
+            Some(HitTarget::Button(ButtonId::ToggleComments)),
+        ),
+    ];
+    if !detail.media.is_empty() {
+        meta_items.push((
+            format!("🖼 {} media", detail.media.len()),
+            theme.muted_style(),
+            Some(HitTarget::Button(ButtonId::ImagePreview)),
+        ));
+    }
+    let meta_sep = "  ·  ";
+    let meta_sep_w = meta_sep.width() as u16;
+    let mut meta_spans: Vec<Span<'static>> = Vec::new();
+    let mut mx = 0u16;
+    for (label, style, hit) in meta_items {
+        let w = label.width() as u16;
+        let sep_w = if meta_spans.is_empty() { 0 } else { meta_sep_w };
+        if !meta_spans.is_empty() && mx.saturating_add(sep_w).saturating_add(w) > content_width {
+            rendered_lines.push((Line::from(std::mem::take(&mut meta_spans)), None));
+            mx = 0;
+        }
+        if !meta_spans.is_empty() {
+            meta_spans.push(Span::styled(meta_sep, theme.muted_style()));
+            mx = mx.saturating_add(meta_sep_w);
+        }
+        if w > content_width {
+            for wrapped in
+                wrap_styled_spans(&[Span::styled(label, style)], content_w, WrapPrefix::empty())
+            {
+                let l_idx = rendered_lines.len();
+                let lw = (wrapped.width() as u16).min(content_width);
+                if let Some(target) = hit {
+                    if lw > 0 {
+                        inline_hits.push((l_idx, 0, lw, target));
+                    }
+                }
+                rendered_lines.push((wrapped, None));
+            }
+            mx = 0;
+        } else {
+            let l_idx = rendered_lines.len();
+            meta_spans.push(Span::styled(label, style));
+            if let Some(target) = hit {
+                if w > 0 {
+                    inline_hits.push((l_idx, mx, w, target));
+                }
+            }
+            mx = mx.saturating_add(w);
+        }
+    }
+    if !meta_spans.is_empty() {
+        rendered_lines.push((Line::from(meta_spans), None));
+    }
+
+    // Clickable Page Quick Action Pill Bar (flow-wrapped across lines, preserving exact inline_hits)
+    let fav_pill = if detail.page.is_favorite {
+        "[★ Fav]"
+    } else {
+        "[☆ Fav]"
+    };
+    let href_pill = if ui.show_inline_hrefs {
+        "[hrefs:on]"
+    } else {
+        "[hrefs]"
+    };
+    let files_pill = if detail.media.is_empty() {
+        "[📎 Files]".to_string()
+    } else {
+        format!("[📎 Files:{}]", detail.media.len())
+    };
+    let action_pills: [(&str, ButtonId, bool); 8] = [
+        (fav_pill, ButtonId::ToggleFavorite, detail.page.is_favorite),
+        ("[+ Append]", ButtonId::QuickAppend, false),
+        ("[+ Child]", ButtonId::NewChildPage, false),
+        ("[✎ Edit]", ButtonId::EditPage, false),
+        ("[↗ Web]", ButtonId::OpenWeb, false),
+        ("[🔗 Links]", ButtonId::LinkExtractor, false),
+        (href_pill, ButtonId::ToggleHrefs, ui.show_inline_hrefs),
+        (&files_pill, ButtonId::Attachments, false),
+    ];
+    let mut action_spans: Vec<Span<'static>> = Vec::new();
+    let mut ax = 0u16;
+    for (label, btn, active) in action_pills {
+        let w = label.width() as u16;
+        let sep_w = if action_spans.is_empty() { 0 } else { 1 };
+        if !action_spans.is_empty() && ax.saturating_add(sep_w).saturating_add(w) > content_width {
+            rendered_lines.push((Line::from(std::mem::take(&mut action_spans)), None));
+            ax = 0;
+        }
+        let style = if active {
+            theme.accent_style().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg_muted).bg(theme.bg_card)
+        };
+        if !action_spans.is_empty() {
+            action_spans.push(Span::raw(" "));
+            ax = ax.saturating_add(1);
+        }
+        if w > content_width {
+            for wrapped in wrap_styled_spans(
+                &[Span::styled(label.to_string(), style)],
+                content_w,
+                WrapPrefix::empty(),
+            ) {
+                let l_idx = rendered_lines.len();
+                let lw = (wrapped.width() as u16).min(content_width);
+                if lw > 0 {
+                    inline_hits.push((l_idx, 0, lw, HitTarget::Button(btn)));
+                }
+                rendered_lines.push((wrapped, None));
+            }
+            ax = 0;
+        } else {
+            let action_line_idx = rendered_lines.len();
+            action_spans.push(Span::styled(label.to_string(), style));
+            inline_hits.push((action_line_idx, ax, w, HitTarget::Button(btn)));
+            ax = ax.saturating_add(w);
+        }
+    }
+    if !action_spans.is_empty() {
+        rendered_lines.push((Line::from(action_spans), None));
+    }
+
+    // Properties Strip (for database rows or pages with properties)
+    push_properties_strip(detail, content_w, theme, &mut rendered_lines);
+
+    // Subtle hairline divider
+    let rule = "─".repeat(content_width.min(96) as usize);
+    rendered_lines.push((
+        Line::from(Span::styled(rule, Style::default().fg(theme.divider))),
+        None,
+    ));
+    rendered_lines.push((Line::from(""), None));
+
+    // Interactive Blocks
+    let mut selected_line_range: Option<(usize, usize)> = None;
+    if visible.is_empty() {
+        let notice = [Span::styled(
+            "Empty page. Press `a` to append blocks (/h1, /todo, /callout, /code) or `e` to edit.",
+            theme.muted_style().add_modifier(Modifier::ITALIC),
+        )];
+        for line in wrap_styled_spans(&notice, content_w, WrapPrefix::empty()) {
+            rendered_lines.push((line, None));
+        }
+    } else {
+        for (idx, vblk) in visible.iter().enumerate() {
+            let is_sel = canvas_focused && idx == selected_idx;
+            let start_line = rendered_lines.len();
+            render_block_lines(
+                vblk,
+                idx,
+                is_sel,
+                content_w,
+                ui,
+                theme,
+                &mut rendered_lines,
+                &mut inline_hits,
+            );
+            let end_line = rendered_lines.len().saturating_sub(1);
+            if idx == selected_idx && rendered_lines.len() > start_line {
+                selected_line_range = Some((start_line, end_line));
+            }
+        }
+    }
+
+    (rendered_lines, inline_hits, selected_line_range)
+}
+
+fn push_wrapped_block(
+    spans: &[Span<'static>],
+    max_width: usize,
+    first_prefix: &[Span<'static>],
+    cont_prefix: &[Span<'static>],
+    line_style: Style,
+    hit: Option<HitTarget>,
+    out: &mut Vec<(Line<'static>, Option<HitTarget>)>,
+) {
+    for line in wrap_styled_spans(
+        spans,
+        max_width,
+        WrapPrefix {
+            first: first_prefix,
+            cont: cont_prefix,
+        },
+    ) {
+        out.push((line.style(line_style), hit));
+    }
+}
+
 fn push_properties_strip(
     detail: &NotionPageDetail,
+    max_width: usize,
     theme: &Theme,
     out: &mut Vec<(Line<'static>, Option<HitTarget>)>,
 ) {
     let mut prop_spans: Vec<Span<'static>> = Vec::new();
+    let mut first_prop = true;
     for (name, val) in &detail.page.properties {
         if matches!(val, NotionPropertyValue::Title(_)) || val.is_empty() {
             continue;
         }
+        if !first_prop {
+            prop_spans.push(Span::raw("   "));
+        }
+        first_prop = false;
         prop_spans.push(Span::styled(format!("{name}: "), theme.muted_style()));
         match val {
             NotionPropertyValue::Status(Some(opt)) | NotionPropertyValue::Select(Some(opt)) => {
@@ -1020,12 +1119,13 @@ fn push_properties_strip(
                 ));
             }
         }
-        prop_spans.push(Span::raw("   "));
     }
 
     if !prop_spans.is_empty() {
         out.push((Line::from(""), None));
-        out.push((Line::from(prop_spans), None));
+        for line in wrap_styled_spans(&prop_spans, max_width, WrapPrefix::empty()) {
+            out.push((line, None));
+        }
     }
 }
 
@@ -1063,21 +1163,28 @@ fn render_block_lines(
             } else {
                 ""
             };
-            let mut spans = vec![cursor_gutter, Span::raw(format!("{indent}{prefix}"))];
-            spans.extend(style_rich_text(
+            let first = [
+                cursor_gutter.clone(),
+                Span::raw(format!("{indent}{prefix}")),
+            ];
+            let cont = [
+                cursor_gutter,
+                Span::raw(format!("{indent}{}", " ".repeat(prefix.width()))),
+            ];
+            let body = style_rich_text(
                 rich_text,
                 Style::default()
                     .fg(theme.fg_primary)
                     .add_modifier(Modifier::BOLD),
                 theme,
                 ui.show_inline_hrefs,
-            ));
+            );
             let hit = if *is_toggleable {
                 HitTarget::ToggleBlock(idx)
             } else {
                 HitTarget::CanvasBlock(idx)
             };
-            out.push((Line::from(spans).style(sel_bg), Some(hit)));
+            push_wrapped_block(&body, max_width, &first, &cont, sel_bg, Some(hit), out);
             out.push((Line::from(""), None));
         }
         NotionBlockKind::Heading2 {
@@ -1090,21 +1197,28 @@ fn render_block_lines(
             } else {
                 ""
             };
-            let mut spans = vec![cursor_gutter, Span::raw(format!("{indent}{prefix}"))];
-            spans.extend(style_rich_text(
+            let first = [
+                cursor_gutter.clone(),
+                Span::raw(format!("{indent}{prefix}")),
+            ];
+            let cont = [
+                cursor_gutter,
+                Span::raw(format!("{indent}{}", " ".repeat(prefix.width()))),
+            ];
+            let body = style_rich_text(
                 rich_text,
                 Style::default()
                     .fg(theme.accent_soft)
                     .add_modifier(Modifier::BOLD),
                 theme,
                 ui.show_inline_hrefs,
-            ));
+            );
             let hit = if *is_toggleable {
                 HitTarget::ToggleBlock(idx)
             } else {
                 HitTarget::CanvasBlock(idx)
             };
-            out.push((Line::from(spans).style(sel_bg), Some(hit)));
+            push_wrapped_block(&body, max_width, &first, &cont, sel_bg, Some(hit), out);
         }
         NotionBlockKind::Heading3 {
             rich_text,
@@ -1116,60 +1230,99 @@ fn render_block_lines(
             } else {
                 ""
             };
-            let mut spans = vec![cursor_gutter, Span::raw(format!("{indent}{prefix}"))];
-            spans.extend(style_rich_text(
+            let first = [
+                cursor_gutter.clone(),
+                Span::raw(format!("{indent}{prefix}")),
+            ];
+            let cont = [
+                cursor_gutter,
+                Span::raw(format!("{indent}{}", " ".repeat(prefix.width()))),
+            ];
+            let body = style_rich_text(
                 rich_text,
                 Style::default()
                     .fg(theme.fg_secondary)
                     .add_modifier(Modifier::BOLD),
                 theme,
                 ui.show_inline_hrefs,
-            ));
+            );
             let hit = if *is_toggleable {
                 HitTarget::ToggleBlock(idx)
             } else {
                 HitTarget::CanvasBlock(idx)
             };
-            out.push((Line::from(spans).style(sel_bg), Some(hit)));
+            push_wrapped_block(&body, max_width, &first, &cont, sel_bg, Some(hit), out);
         }
         NotionBlockKind::Paragraph { rich_text, .. } => {
-            let mut spans = vec![cursor_gutter, Span::raw(indent)];
-            spans.extend(style_rich_text(
+            let prefix = [cursor_gutter, Span::raw(indent)];
+            let body = style_rich_text(
                 rich_text,
                 Style::default().fg(theme.fg_primary),
                 theme,
                 ui.show_inline_hrefs,
-            ));
-            out.push((Line::from(spans).style(sel_bg), Some(HitTarget::CanvasBlock(idx))));
+            );
+            push_wrapped_block(
+                &body,
+                max_width,
+                &prefix,
+                &prefix,
+                sel_bg,
+                Some(HitTarget::CanvasBlock(idx)),
+                out,
+            );
         }
         NotionBlockKind::BulletedListItem { rich_text, .. } => {
-            let mut spans = vec![
-                cursor_gutter,
-                Span::raw(indent),
-                Span::styled("• ", theme.accent_style()),
+            let marker = "• ";
+            let first = [
+                cursor_gutter.clone(),
+                Span::raw(indent.clone()),
+                Span::styled(marker, theme.accent_style()),
             ];
-            spans.extend(style_rich_text(
+            let cont = [
+                cursor_gutter,
+                Span::raw(format!("{indent}{}", " ".repeat(marker.width()))),
+            ];
+            let body = style_rich_text(
                 rich_text,
                 Style::default().fg(theme.fg_primary),
                 theme,
                 ui.show_inline_hrefs,
-            ));
-            out.push((Line::from(spans).style(sel_bg), Some(HitTarget::CanvasBlock(idx))));
+            );
+            push_wrapped_block(
+                &body,
+                max_width,
+                &first,
+                &cont,
+                sel_bg,
+                Some(HitTarget::CanvasBlock(idx)),
+                out,
+            );
         }
         NotionBlockKind::NumberedListItem { rich_text, .. } => {
             let num = vblk.numbered_index.max(1);
-            let mut spans = vec![
-                cursor_gutter,
-                Span::raw(indent),
-                Span::styled(format!("{num}. "), theme.accent_style()),
+            let marker = format!("{num}. ");
+            let marker_pad = " ".repeat(marker.width());
+            let first = [
+                cursor_gutter.clone(),
+                Span::raw(indent.clone()),
+                Span::styled(marker, theme.accent_style()),
             ];
-            spans.extend(style_rich_text(
+            let cont = [cursor_gutter, Span::raw(format!("{indent}{marker_pad}"))];
+            let body = style_rich_text(
                 rich_text,
                 Style::default().fg(theme.fg_primary),
                 theme,
                 ui.show_inline_hrefs,
-            ));
-            out.push((Line::from(spans).style(sel_bg), Some(HitTarget::CanvasBlock(idx))));
+            );
+            push_wrapped_block(
+                &body,
+                max_width,
+                &first,
+                &cont,
+                sel_bg,
+                Some(HitTarget::CanvasBlock(idx)),
+                out,
+            );
         }
         NotionBlockKind::ToDo {
             rich_text, checked, ..
@@ -1191,47 +1344,60 @@ fn render_block_lines(
                     Style::default().fg(theme.fg_primary),
                 )
             };
-            let mut spans = vec![
-                cursor_gutter,
-                Span::raw(indent),
+            let first = [
+                cursor_gutter.clone(),
+                Span::raw(indent.clone()),
                 Span::styled(box_glyph, box_style),
             ];
-            spans.extend(style_rich_text(
-                rich_text,
-                text_base,
-                theme,
-                ui.show_inline_hrefs,
-            ));
-            out.push((
-                Line::from(spans).style(sel_bg),
+            let cont = [
+                cursor_gutter,
+                Span::raw(format!("{indent}{}", " ".repeat(box_glyph.width()))),
+            ];
+            let body = style_rich_text(rich_text, text_base, theme, ui.show_inline_hrefs);
+            push_wrapped_block(
+                &body,
+                max_width,
+                &first,
+                &cont,
+                sel_bg,
                 Some(HitTarget::TodoToggle(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::Toggle { rich_text, .. } => {
             let arrow = if vblk.is_toggle_open { "▾ " } else { "▸ " };
-            let mut spans = vec![
-                cursor_gutter,
-                Span::raw(indent),
+            let first = [
+                cursor_gutter.clone(),
+                Span::raw(indent.clone()),
                 Span::styled(arrow, theme.accent_style().add_modifier(Modifier::BOLD)),
             ];
-            spans.extend(style_rich_text(
+            let cont = [
+                cursor_gutter,
+                Span::raw(format!("{indent}{}", " ".repeat(arrow.width()))),
+            ];
+            let mut body = style_rich_text(
                 rich_text,
                 Style::default()
                     .fg(theme.fg_primary)
                     .add_modifier(Modifier::BOLD),
                 theme,
                 ui.show_inline_hrefs,
-            ));
+            );
             if !vblk.is_toggle_open && !vblk.block.children.is_empty() {
-                spans.push(Span::styled(
+                body.push(Span::styled(
                     format!("  ({} items)", vblk.block.children.len()),
                     theme.muted_style(),
                 ));
             }
-            out.push((
-                Line::from(spans).style(sel_bg),
+            push_wrapped_block(
+                &body,
+                max_width,
+                &first,
+                &cont,
+                sel_bg,
                 Some(HitTarget::ToggleBlock(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::Callout {
             rich_text,
@@ -1249,43 +1415,62 @@ fn render_block_lines(
             } else {
                 theme.bg_card
             };
-            let mut spans = vec![
-                cursor_gutter,
-                Span::raw(indent),
-                Span::styled("┃ ", Style::default().fg(accent_col).bg(card_bg)),
+            let bar = Span::styled("┃ ", Style::default().fg(accent_col).bg(card_bg));
+            let first = [
+                cursor_gutter.clone(),
+                Span::raw(indent.clone()),
+                bar.clone(),
                 Span::styled(format!("{ic}  "), Style::default().bg(card_bg)),
             ];
-            spans.extend(style_rich_text(
+            let cont = [cursor_gutter, Span::raw(indent), bar];
+            let body = style_rich_text(
                 rich_text,
                 Style::default().fg(theme.fg_primary).bg(card_bg),
                 theme,
                 ui.show_inline_hrefs,
-            ));
-            out.push((
-                Line::from(spans).style(Style::default().bg(card_bg)),
+            );
+            push_wrapped_block(
+                &body,
+                max_width,
+                &first,
+                &cont,
+                Style::default().bg(card_bg),
                 Some(HitTarget::CanvasBlock(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::Quote { rich_text, .. } => {
-            let mut spans = vec![
-                cursor_gutter,
-                Span::raw(indent),
-                Span::styled("│ ", Style::default().fg(theme.fg_muted)),
-            ];
-            spans.extend(style_rich_text(
+            let bar = Span::styled("│ ", Style::default().fg(theme.fg_muted));
+            let prefix = [cursor_gutter, Span::raw(indent), bar];
+            let body = style_rich_text(
                 rich_text,
                 theme.quote_style(),
                 theme,
                 ui.show_inline_hrefs,
-            ));
-            out.push((Line::from(spans).style(sel_bg), Some(HitTarget::CanvasBlock(idx))));
+            );
+            push_wrapped_block(
+                &body,
+                max_width,
+                &prefix,
+                &prefix,
+                sel_bg,
+                Some(HitTarget::CanvasBlock(idx)),
+                out,
+            );
         }
         NotionBlockKind::Divider => {
-            let w = max_width.saturating_sub(indent.len() + 4).max(12);
+            let max_indent_w = max_width.saturating_sub(3);
+            let clamped_indent = if indent.width() > max_indent_w {
+                " ".repeat(max_indent_w)
+            } else {
+                indent
+            };
+            let avail = max_width.saturating_sub(2 + clamped_indent.width());
+            let w = avail.saturating_sub(2).max(1).min(avail);
             out.push((
                 Line::from(vec![
                     cursor_gutter,
-                    Span::raw(indent),
+                    Span::raw(clamped_indent),
                     Span::styled("─".repeat(w), Style::default().fg(theme.divider)),
                 ])
                 .style(sel_bg),
@@ -1303,59 +1488,117 @@ fn render_block_lines(
                 theme.bg_code
             };
             let is_html = crate::ui::action::is_html_code_language(language);
-            let header_line_idx = out.len();
             let badge = format!("  {indent}╭─ {language} (y to copy) ");
-            let mut header_spans = vec![Span::styled(
-                badge.clone(),
-                Style::default()
-                    .fg(theme.fg_muted)
-                    .bg(code_bg)
-                    .add_modifier(Modifier::BOLD),
-            )];
-            if is_html {
-                let preview_pill = "[▶ Preview HTML]";
-                let pill_x = badge.width() as u16;
-                let pill_w = preview_pill.width() as u16;
-                header_spans.push(Span::styled(
-                    preview_pill,
-                    Style::default()
-                        .fg(theme.bg_canvas)
-                        .bg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                inline_hits.push((
-                    header_line_idx,
-                    pill_x,
-                    pill_w,
-                    HitTarget::CodeHtmlPreview(idx),
-                ));
-            }
-            out.push((Line::from(header_spans), Some(HitTarget::CanvasBlock(idx))));
-            let raw = spans_plain_text(rich_text);
-            for line in raw.lines() {
+            let badge_style = Style::default()
+                .fg(theme.fg_muted)
+                .bg(code_bg)
+                .add_modifier(Modifier::BOLD);
+            let preview_pill = "[▶ Preview HTML]";
+            let preview_style = Style::default()
+                .fg(theme.bg_canvas)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD);
+            let combined_w = badge.width() + if is_html { preview_pill.width() } else { 0 };
+            if combined_w <= max_width {
+                let header_line_idx = out.len();
+                let mut header_spans = vec![Span::styled(badge.clone(), badge_style)];
+                if is_html {
+                    let pill_x = badge.width() as u16;
+                    let pill_w = preview_pill.width() as u16;
+                    header_spans.push(Span::styled(preview_pill, preview_style));
+                    inline_hits.push((
+                        header_line_idx,
+                        pill_x,
+                        pill_w,
+                        HitTarget::CodeHtmlPreview(idx),
+                    ));
+                }
                 out.push((
-                    Line::from(vec![
-                        cursor_gutter.clone(),
-                        Span::raw(indent.clone()),
-                        Span::styled(
-                            format!("│ {line}"),
-                            Style::default().fg(theme.code_fg).bg(code_bg),
-                        ),
-                    ])
-                    .style(Style::default().bg(code_bg)),
+                    Line::from(header_spans).style(Style::default().bg(code_bg)),
                     Some(HitTarget::CanvasBlock(idx)),
                 ));
+            } else {
+                for line in wrap_styled_spans(
+                    &[Span::styled(badge, badge_style)],
+                    max_width,
+                    WrapPrefix::empty(),
+                ) {
+                    out.push((
+                        line.style(Style::default().bg(code_bg)),
+                        Some(HitTarget::CanvasBlock(idx)),
+                    ));
+                }
+                if is_html {
+                    let pill_prefix = [Span::styled(
+                        format!("  {indent}"),
+                        Style::default().bg(code_bg),
+                    )];
+                    for line in wrap_styled_spans(
+                        &[Span::styled(preview_pill, preview_style)],
+                        max_width,
+                        WrapPrefix {
+                            first: &pill_prefix,
+                            cont: &pill_prefix,
+                        },
+                    ) {
+                        let line_idx = out.len();
+                        let lead_w = (2 + indent.width()).min(max_width) as u16;
+                        let pill_w = (line.width() as u16).saturating_sub(lead_w);
+                        if pill_w > 0 {
+                            inline_hits.push((
+                                line_idx,
+                                lead_w,
+                                pill_w,
+                                HitTarget::CodeHtmlPreview(idx),
+                            ));
+                        }
+                        out.push((
+                            line.style(Style::default().bg(code_bg)),
+                            Some(HitTarget::CanvasBlock(idx)),
+                        ));
+                    }
+                }
             }
+            let raw = spans_plain_text(rich_text);
+            let trimmed_raw = raw
+                .strip_suffix("\r\n")
+                .or_else(|| raw.strip_suffix('\n'))
+                .unwrap_or(&raw);
+            if !trimmed_raw.is_empty() {
+                let code_prefix = [
+                    cursor_gutter.clone(),
+                    Span::raw(indent.clone()),
+                    Span::styled("│ ", Style::default().fg(theme.code_fg).bg(code_bg)),
+                ];
+                let code_body = [Span::styled(
+                    trimmed_raw.to_string(),
+                    Style::default().fg(theme.code_fg).bg(code_bg),
+                )];
+                push_wrapped_block(
+                    &code_body,
+                    max_width,
+                    &code_prefix,
+                    &code_prefix,
+                    Style::default().bg(code_bg),
+                    Some(HitTarget::CanvasBlock(idx)),
+                    out,
+                );
+            }
+            let footer_prefix_w = 2 + indent.width();
+            let footer = if footer_prefix_w + 2 > max_width {
+                let lead = " ".repeat(max_width.saturating_sub(2));
+                format!("{lead}╰─")
+            } else {
+                let dashes = max_width.saturating_sub(footer_prefix_w + 1).min(20);
+                format!("  {indent}╰{}", "─".repeat(dashes))
+            };
             out.push((
-                Line::from(Span::styled(
-                    format!("  {indent}╰────────────────────"),
-                    Style::default().fg(theme.border),
-                )),
+                Line::from(Span::styled(footer, Style::default().fg(theme.border))),
                 Some(HitTarget::CanvasBlock(idx)),
             ));
         }
         NotionBlockKind::Table { .. } => {
-            render_unicode_table(vblk, idx, selected, max_width, theme, out);
+            render_unicode_table(vblk, idx, selected, max_width, ui.show_inline_hrefs, theme, out);
         }
         NotionBlockKind::Image { url, caption, .. } => {
             let cap = spans_plain_text(caption);
@@ -1364,29 +1607,26 @@ fn render_block_lines(
             } else {
                 cap
             };
-            out.push((
-                Line::from(vec![
-                    cursor_gutter,
-                    Span::raw(indent),
-                    Span::styled(
-                        format!(" 🖼 [IMG: {label}] (press v to preview) "),
-                        Style::default()
-                            .fg(theme.accent_soft)
-                            .bg(theme.bg_card)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        if ui.show_inline_hrefs {
-                            format!("  {url}")
-                        } else {
-                            String::new()
-                        },
-                        theme.muted_style(),
-                    ),
-                ])
-                .style(sel_bg),
+            let prefix = [cursor_gutter, Span::raw(indent)];
+            let mut body = vec![Span::styled(
+                format!(" 🖼 [IMG: {label}] (press v to preview) "),
+                Style::default()
+                    .fg(theme.accent_soft)
+                    .bg(theme.bg_card)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            if ui.show_inline_hrefs {
+                body.push(Span::styled(format!("  {url}"), theme.muted_style()));
+            }
+            push_wrapped_block(
+                &body,
+                max_width,
+                &prefix,
+                &prefix,
+                sel_bg,
                 Some(HitTarget::MediaChip(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::Video { url, caption, .. } => {
             let cap = spans_plain_text(caption);
@@ -1395,29 +1635,26 @@ fn render_block_lines(
             } else {
                 cap.as_str()
             };
-            out.push((
-                Line::from(vec![
-                    cursor_gutter,
-                    Span::raw(indent),
-                    Span::styled(
-                        format!(" 🎬 [VIDEO: {label}] (Enter: open) "),
-                        Style::default()
-                            .fg(theme.accent_soft)
-                            .bg(theme.bg_card)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        if ui.show_inline_hrefs && !cap.is_empty() {
-                            format!("  {url}")
-                        } else {
-                            String::new()
-                        },
-                        theme.muted_style(),
-                    ),
-                ])
-                .style(sel_bg),
+            let prefix = [cursor_gutter, Span::raw(indent)];
+            let mut body = vec![Span::styled(
+                format!(" 🎬 [VIDEO: {label}] (Enter: open) "),
+                Style::default()
+                    .fg(theme.accent_soft)
+                    .bg(theme.bg_card)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            if ui.show_inline_hrefs && !cap.is_empty() {
+                body.push(Span::styled(format!("  {url}"), theme.muted_style()));
+            }
+            push_wrapped_block(
+                &body,
+                max_width,
+                &prefix,
+                &prefix,
+                sel_bg,
                 Some(HitTarget::MediaChip(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::Audio { url, caption, .. } => {
             let cap = spans_plain_text(caption);
@@ -1426,21 +1663,23 @@ fn render_block_lines(
             } else {
                 cap.as_str()
             };
-            out.push((
-                Line::from(vec![
-                    cursor_gutter,
-                    Span::raw(indent),
-                    Span::styled(
-                        format!(" 🎵 [AUDIO: {label}] (Enter: open) "),
-                        Style::default()
-                            .fg(theme.accent_soft)
-                            .bg(theme.bg_card)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ])
-                .style(sel_bg),
+            let prefix = [cursor_gutter, Span::raw(indent)];
+            let body = [Span::styled(
+                format!(" 🎵 [AUDIO: {label}] (Enter: open) "),
+                Style::default()
+                    .fg(theme.accent_soft)
+                    .bg(theme.bg_card)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            push_wrapped_block(
+                &body,
+                max_width,
+                &prefix,
+                &prefix,
+                sel_bg,
                 Some(HitTarget::MediaChip(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::ChildPage { title } => {
             let card_bg = if selected {
@@ -1448,21 +1687,23 @@ fn render_block_lines(
             } else {
                 theme.bg_card
             };
-            out.push((
-                Line::from(vec![
-                    cursor_gutter,
-                    Span::raw(indent),
-                    Span::styled(
-                        format!(" 📄 {title}  → "),
-                        Style::default()
-                            .fg(theme.fg_primary)
-                            .bg(card_bg)
-                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                    ),
-                ])
-                .style(Style::default().bg(card_bg)),
+            let prefix = [cursor_gutter, Span::raw(indent)];
+            let body = [Span::styled(
+                format!(" 📄 {title}  → "),
+                Style::default()
+                    .fg(theme.fg_primary)
+                    .bg(card_bg)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )];
+            push_wrapped_block(
+                &body,
+                max_width,
+                &prefix,
+                &prefix,
+                Style::default().bg(card_bg),
                 Some(HitTarget::ChildCard(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::ChildDatabase { title } => {
             let card_bg = if selected {
@@ -1470,52 +1711,61 @@ fn render_block_lines(
             } else {
                 theme.bg_card
             };
-            out.push((
-                Line::from(vec![
-                    cursor_gutter,
-                    Span::raw(indent),
-                    Span::styled(
-                        format!(" 🗂 {title}  [Database →] "),
-                        Style::default()
-                            .fg(theme.accent_soft)
-                            .bg(card_bg)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ])
-                .style(Style::default().bg(card_bg)),
+            let prefix = [cursor_gutter, Span::raw(indent)];
+            let body = [Span::styled(
+                format!(" 🗂 {title}  [Database →] "),
+                Style::default()
+                    .fg(theme.accent_soft)
+                    .bg(card_bg)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            push_wrapped_block(
+                &body,
+                max_width,
+                &prefix,
+                &prefix,
+                Style::default().bg(card_bg),
                 Some(HitTarget::ChildCard(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::Bookmark { url, caption }
         | NotionBlockKind::Embed { url, caption } => {
             let cap = spans_plain_text(caption);
             let label = if cap.is_empty() { url.as_str() } else { cap.as_str() };
-            out.push((
-                Line::from(vec![
-                    cursor_gutter,
-                    Span::raw(indent),
-                    Span::styled(
-                        format!(" 🔗 {label} "),
-                        Style::default()
-                            .fg(theme.accent_soft)
-                            .bg(theme.bg_card)
-                            .add_modifier(Modifier::UNDERLINED),
-                    ),
-                ])
-                .style(sel_bg),
+            let prefix = [cursor_gutter, Span::raw(indent)];
+            let body = [Span::styled(
+                format!(" 🔗 {label} "),
+                Style::default()
+                    .fg(theme.accent_soft)
+                    .bg(theme.bg_card)
+                    .add_modifier(Modifier::UNDERLINED),
+            )];
+            push_wrapped_block(
+                &body,
+                max_width,
+                &prefix,
+                &prefix,
+                sel_bg,
                 Some(HitTarget::ChildCard(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::LinkPreview { url } => {
-            out.push((
-                Line::from(vec![
-                    cursor_gutter,
-                    Span::raw(indent),
-                    Span::styled(format!(" 🔗 {url}"), Style::default().fg(theme.accent_soft)),
-                ])
-                .style(sel_bg),
+            let prefix = [cursor_gutter, Span::raw(indent)];
+            let body = [Span::styled(
+                format!(" 🔗 {url}"),
+                Style::default().fg(theme.accent_soft),
+            )];
+            push_wrapped_block(
+                &body,
+                max_width,
+                &prefix,
+                &prefix,
+                sel_bg,
                 Some(HitTarget::ChildCard(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::File { url, name, .. } => {
             let label = name.as_deref().unwrap_or(url.as_str());
@@ -1541,56 +1791,80 @@ fn render_block_lines(
                     Style::default().fg(theme.fg_secondary).bg(theme.bg_card),
                 )
             };
-            out.push((
-                Line::from(vec![cursor_gutter, Span::raw(indent), chip]).style(sel_bg),
+            let prefix = [cursor_gutter, Span::raw(indent)];
+            push_wrapped_block(
+                &[chip],
+                max_width,
+                &prefix,
+                &prefix,
+                sel_bg,
                 Some(HitTarget::MediaChip(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::Pdf { url, caption } => {
             let cap = spans_plain_text(caption);
             let label = if cap.is_empty() { url.as_str() } else { cap.as_str() };
-            out.push((
-                Line::from(vec![
-                    cursor_gutter,
-                    Span::raw(indent),
-                    Span::styled(format!(" 📄 [PDF] {label} "), Style::default().fg(theme.warning).bg(theme.bg_card)),
-                ])
-                .style(sel_bg),
+            let prefix = [cursor_gutter, Span::raw(indent)];
+            let body = [Span::styled(
+                format!(" 📄 [PDF] {label} "),
+                Style::default().fg(theme.warning).bg(theme.bg_card),
+            )];
+            push_wrapped_block(
+                &body,
+                max_width,
+                &prefix,
+                &prefix,
+                sel_bg,
                 Some(HitTarget::MediaChip(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::Equation { expression } => {
             let badge_style = math_badge_style(theme);
             let expr_style = math_style(theme);
-            let expr_lines: Vec<&str> = if expression.is_empty() {
-                vec![""]
+            let first = [
+                cursor_gutter.clone(),
+                Span::raw(indent.clone()),
+                Span::styled(" ∑ ", badge_style),
+            ];
+            let cont = [
+                cursor_gutter,
+                Span::raw(indent),
+                Span::styled(" │ ", badge_style),
+            ];
+            let expr_text = if expression.is_empty() {
+                " ".to_string()
             } else {
-                expression.lines().collect()
+                expression
+                    .lines()
+                    .map(|l| format!(" {l} "))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             };
-            for (line_idx, expr_line) in expr_lines.into_iter().enumerate() {
-                let prefix = if line_idx == 0 { " ∑ " } else { " │ " };
-                out.push((
-                    Line::from(vec![
-                        cursor_gutter.clone(),
-                        Span::raw(indent.clone()),
-                        Span::styled(prefix, badge_style),
-                        Span::styled(format!(" {expr_line} "), expr_style),
-                    ])
-                    .style(sel_bg),
-                    Some(HitTarget::CanvasBlock(idx)),
-                ));
-            }
+            let body = [Span::styled(expr_text, expr_style)];
+            push_wrapped_block(
+                &body,
+                max_width,
+                &first,
+                &cont,
+                sel_bg,
+                Some(HitTarget::CanvasBlock(idx)),
+                out,
+            );
         }
         NotionBlockKind::TableOfContents { .. } => {
-            out.push((
-                Line::from(vec![
-                    cursor_gutter,
-                    Span::raw(indent),
-                    Span::styled("[Table of Contents]", theme.muted_style()),
-                ])
-                .style(sel_bg),
+            let prefix = [cursor_gutter, Span::raw(indent)];
+            let body = [Span::styled("[Table of Contents]", theme.muted_style())];
+            push_wrapped_block(
+                &body,
+                max_width,
+                &prefix,
+                &prefix,
+                sel_bg,
                 Some(HitTarget::CanvasBlock(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::Button { rich_text } => {
             let raw_label = spans_plain_text(rich_text);
@@ -1610,30 +1884,34 @@ fn render_block_lines(
                     .bg(theme.bg_card)
                     .add_modifier(Modifier::BOLD)
             };
-            out.push((
-                Line::from(vec![
-                    cursor_gutter,
-                    Span::raw(indent),
-                    Span::styled(format!("[ ⚡ {label} ]"), pill_style),
-                ])
-                .style(sel_bg),
+            let prefix = [cursor_gutter, Span::raw(indent)];
+            let body = [Span::styled(format!("[ ⚡ {label} ]"), pill_style)];
+            push_wrapped_block(
+                &body,
+                max_width,
+                &prefix,
+                &prefix,
+                sel_bg,
                 Some(HitTarget::NotionButton(idx)),
-            ));
+                out,
+            );
         }
         NotionBlockKind::ColumnList
         | NotionBlockKind::Column
         | NotionBlockKind::SyncedBlock { .. }
         | NotionBlockKind::TableRow { .. } => {}
         NotionBlockKind::Unsupported { raw_type } => {
-            out.push((
-                Line::from(vec![
-                    cursor_gutter,
-                    Span::raw(indent),
-                    Span::styled(format!("[{raw_type}]"), theme.muted_style()),
-                ])
-                .style(sel_bg),
+            let prefix = [cursor_gutter, Span::raw(indent)];
+            let body = [Span::styled(format!("[{raw_type}]"), theme.muted_style())];
+            push_wrapped_block(
+                &body,
+                max_width,
+                &prefix,
+                &prefix,
+                sel_bg,
                 Some(HitTarget::CanvasBlock(idx)),
-            ));
+                out,
+            );
         }
     }
 }
@@ -1643,25 +1921,23 @@ fn render_unicode_table(
     idx: usize,
     selected: bool,
     max_width: usize,
+    show_hrefs: bool,
     theme: &Theme,
     out: &mut Vec<(Line<'static>, Option<HitTarget>)>,
 ) {
-    let mut rows: Vec<Vec<String>> = Vec::new();
+    let header_style = Style::default()
+        .fg(theme.fg_primary)
+        .add_modifier(Modifier::BOLD);
+    let cell_style = Style::default().fg(theme.fg_secondary);
+
+    let mut raw_rows: Vec<&Vec<Vec<RichTextSpan>>> = Vec::new();
     for child in &vblk.block.children {
         if let NotionBlockKind::TableRow { cells } = &child.kind {
-            rows.push(cells.iter().map(|c| spans_plain_text(c)).collect());
+            raw_rows.push(cells);
         }
     }
-    if rows.is_empty() {
+    if raw_rows.is_empty() {
         return;
-    }
-    let col_count = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
-    let max_col_w = ((max_width.saturating_sub(col_count * 3 + 4)) / col_count).clamp(8, 28);
-    let mut widths = vec![4usize; col_count];
-    for r in &rows {
-        for (c, cell) in r.iter().enumerate() {
-            widths[c] = widths[c].max(cell.width().min(max_col_w));
-        }
     }
 
     let border_style = if selected {
@@ -1669,63 +1945,53 @@ fn render_unicode_table(
     } else {
         Style::default().fg(theme.border)
     };
-    let top = format!(
-        "  ┌{}┐",
-        widths
-            .iter()
-            .map(|w| "─".repeat(*w + 2))
-            .collect::<Vec<_>>()
-            .join("┬")
-    );
-    let mid = format!(
-        "  ├{}┤",
-        widths
-            .iter()
-            .map(|w| "─".repeat(*w + 2))
-            .collect::<Vec<_>>()
-            .join("┼")
-    );
-    let bot = format!(
-        "  └{}┘",
-        widths
-            .iter()
-            .map(|w| "─".repeat(*w + 2))
-            .collect::<Vec<_>>()
-            .join("┴")
-    );
-
-    out.push((
-        Line::from(Span::styled(top, border_style)),
-        Some(HitTarget::CanvasBlock(idx)),
-    ));
-    for (r_idx, r) in rows.iter().enumerate() {
-        let mut spans = vec![Span::styled("  │", border_style)];
-        for (c, &w) in widths.iter().enumerate() {
-            let text = r.get(c).map(String::as_str).unwrap_or("");
-            let trunc = truncate_width(text, w);
-            let pad = w.saturating_sub(trunc.width());
-            let cell_style = if r_idx == 0 {
-                Style::default()
-                    .fg(theme.fg_primary)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.fg_secondary)
-            };
-            spans.push(Span::styled(format!(" {trunc}{} ", " ".repeat(pad)), cell_style));
-            spans.push(Span::styled("│", border_style));
-        }
-        out.push((Line::from(spans), Some(HitTarget::CanvasBlock(idx))));
-        if r_idx == 0 && rows.len() > 1 {
-            out.push((
-                Line::from(Span::styled(mid.clone(), border_style)),
-                Some(HitTarget::CanvasBlock(idx)),
-            ));
-        }
+    let cursor_gutter = if selected {
+        Span::styled("▎ ", Style::default().fg(theme.accent).bg(theme.bg_selected))
+    } else {
+        Span::styled("  ", Style::default().bg(theme.bg_canvas))
+    };
+    let indent = "  ".repeat(vblk.depth);
+    let mut prefix = vec![cursor_gutter];
+    if !indent.is_empty() {
+        prefix.push(Span::raw(indent));
     }
-    out.push((
-        Line::from(Span::styled(bot, border_style)),
-        Some(HitTarget::CanvasBlock(idx)),
-    ));
+
+    let (headers, body_rows, eff_cell_style) = if raw_rows.len() > 1 {
+        let hdr: Vec<Vec<Span<'static>>> = raw_rows[0]
+            .iter()
+            .map(|c| style_rich_text(c, header_style, theme, show_hrefs))
+            .collect();
+        let body: Vec<Vec<Vec<Span<'static>>>> = raw_rows[1..]
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|c| style_rich_text(c, cell_style, theme, show_hrefs))
+                    .collect()
+            })
+            .collect();
+        (hdr, body, cell_style)
+    } else {
+        let single: Vec<Vec<Vec<Span<'static>>>> = vec![raw_rows[0]
+            .iter()
+            .map(|c| style_rich_text(c, header_style, theme, show_hrefs))
+            .collect()];
+        (Vec::new(), single, header_style)
+    };
+
+    let spec = TableSpec {
+        headers: &headers,
+        rows: &body_rows,
+        alignments: &[],
+        border: TableBorder::Box,
+        prefix: &prefix,
+        border_style,
+        header_style,
+        cell_style: eff_cell_style,
+    };
+
+    for line in render_wrapped_table(&spec, max_width) {
+        out.push((line, Some(HitTarget::CanvasBlock(idx))));
+    }
 }
 
 fn math_style(theme: &Theme) -> Style {
@@ -2197,17 +2463,25 @@ fn draw_db_table(
     let col_w = if extra_cols.is_empty() {
         16
     } else {
-        ((area.width as usize).saturating_sub(title_w + 4) / extra_cols.len()).clamp(10, 22)
+        let avail_extra =
+            (area.width as usize).saturating_sub(title_w + 2 + extra_cols.len() * 3);
+        (avail_extra / extra_cols.len()).clamp(6, 22)
     };
 
     // Header row
     let mut header_spans = vec![Span::styled(
-        format!(" {:<title_w$} ", "Name"),
+        format!(
+            " {} ",
+            pad_display_width(&truncate_width("Name", title_w), title_w, TableAlign::Left)
+        ),
         theme.muted_style().add_modifier(Modifier::BOLD),
     )];
     for col in &extra_cols {
         header_spans.push(Span::styled(
-            format!("│ {:<col_w$} ", truncate_width(col, col_w)),
+            format!(
+                "│ {} ",
+                pad_display_width(&truncate_width(col, col_w), col_w, TableAlign::Left)
+            ),
             theme.muted_style().add_modifier(Modifier::BOLD),
         ));
     }
@@ -2233,9 +2507,11 @@ fn draw_db_table(
 
         let title_text = format!("{} {}", row.display_icon(), row.display_title());
         let trunc_title = truncate_width(&title_text, title_w);
-        let pad_title = title_w.saturating_sub(trunc_title.width());
         let mut spans = vec![Span::styled(
-            format!(" {trunc_title}{} ", " ".repeat(pad_title)),
+            format!(
+                " {} ",
+                pad_display_width(&trunc_title, title_w, TableAlign::Left)
+            ),
             Style::default()
                 .fg(theme.fg_primary)
                 .bg(row_bg)
@@ -2302,7 +2578,7 @@ fn push_table_cell_spans(
         }
         NotionPropertyValue::Checkbox(b) => {
             let glyph = if *b { "☑" } else { "☐" };
-            let pad = width.saturating_sub(1);
+            let pad = width.saturating_sub(glyph.width());
             out.push(Span::styled(
                 format!("{glyph}{}", " ".repeat(pad)),
                 Style::default()
@@ -2312,9 +2588,8 @@ fn push_table_cell_spans(
         }
         _ => {
             let txt = truncate_width(&v.to_plain_string(), width);
-            let pad = width.saturating_sub(txt.width());
             out.push(Span::styled(
-                format!("{txt}{}", " ".repeat(pad)),
+                pad_display_width(&txt, width, TableAlign::Left),
                 Style::default().fg(theme.fg_secondary).bg(row_bg),
             ));
         }
@@ -2561,5 +2836,772 @@ fn short_timestamp(ts: &str) -> String {
         ts[..16].replace('T', " ")
     } else {
         ts.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use super::*;
+    use crate::{
+        auth::AuthManager,
+        config::AppConfig,
+        models::{
+            NotionBlock, NotionPage, NotionPropertySchema, RichTextAnnotations, SelectOption,
+        },
+        notion::NotionClient,
+        storage::Storage,
+        sync::{FocusTarget, SyncController},
+        ui,
+    };
+
+    fn make_test_app_and_ui() -> (AppState, UiState) {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_track_d_test_token");
+        let client = NotionClient::new(&cfg, auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = tokio::sync::watch::channel(FocusTarget::default());
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+
+        let mut ui_state = UiState::from_config(&cfg);
+        ui_state.show_sidebar = false;
+        ui_state.focus = Focus::Canvas;
+        let app = AppState::new(cfg, auth, client, storage, sync_ctrl, ui_tx);
+        (app, ui_state)
+    }
+
+    /// Strips decorative wrapping chrome (box borders, quote/callout/code rails, gutter,
+    /// and horizontal rules) plus whitespace, and reassembles multi-line box-table columns
+    /// vertically per section so Centered and Full views can be compared sequence-for-sequence
+    /// with zero character loss or reordering tolerance.
+    fn normalize_visible_content(lines: &[String]) -> String {
+        let strip_chrome = |s: &str, out: &mut String| {
+            for ch in s.chars() {
+                if ch.is_whitespace()
+                    || matches!(
+                        ch,
+                        '│' | '┃' | '─' | '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘'
+                            | '╭' | '╰' | '▎'
+                    )
+                {
+                    continue;
+                }
+                out.push(ch);
+            }
+        };
+
+        let flush_table_section = |cols: &mut Vec<String>, out: &mut String| {
+            for col in cols.drain(..) {
+                out.push_str(&col);
+            }
+        };
+
+        let mut out = String::new();
+        let mut in_box_table = false;
+        let mut table_cols: Vec<String> = Vec::new();
+
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.contains('┌') && trimmed.contains('┐') {
+                in_box_table = true;
+                flush_table_section(&mut table_cols, &mut out);
+                continue;
+            }
+            if in_box_table {
+                if trimmed.contains('├') && trimmed.contains('┤') {
+                    flush_table_section(&mut table_cols, &mut out);
+                    continue;
+                }
+                if trimmed.contains('└') && trimmed.contains('┘') {
+                    flush_table_section(&mut table_cols, &mut out);
+                    in_box_table = false;
+                    continue;
+                }
+                if let (Some(first), Some(last)) = (line.find('│'), line.rfind('│')) {
+                    if last > first {
+                        let inner = &line[first + '│'.len_utf8()..last];
+                        for (c_idx, cell) in inner.split('│').enumerate() {
+                            if c_idx >= table_cols.len() {
+                                table_cols.resize_with(c_idx + 1, String::new);
+                            }
+                            strip_chrome(cell, &mut table_cols[c_idx]);
+                        }
+                        continue;
+                    }
+                }
+            }
+            strip_chrome(line, &mut out);
+        }
+        flush_table_section(&mut table_cols, &mut out);
+        out
+    }
+
+    fn line_to_string(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn render_all_canvas_buffer_rows(
+        app: &mut AppState,
+        ui: &mut UiState,
+        width: u16,
+        height: u16,
+        expected_content_x: u16,
+        expected_content_w: u16,
+    ) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let view_h = height.saturating_sub(2) as usize; // top breadcrumb + bottom status
+        let detail = app.active_page_detail.as_ref().unwrap();
+        let (all_lines, _, _) =
+            build_page_canvas_lines(app, detail, ui, &ui.theme.clone(), expected_content_w);
+        let total = all_lines.len();
+
+        let mut collected: Vec<String> = Vec::with_capacity(total);
+        ui.canvas_follow_selected = false;
+        let mut scroll = 0usize;
+        while collected.len() < total {
+            ui.canvas_scroll = scroll as u16;
+            terminal
+                .draw(|frame| {
+                    ui::draw(frame, app, ui);
+                })
+                .unwrap();
+
+            let actual_scroll = ui.canvas_scroll as usize;
+            let buf = terminal.backend().buffer();
+            for row_offset in 0..view_h {
+                let line_idx = actual_scroll + row_offset;
+                if line_idx < collected.len() || line_idx >= total {
+                    continue;
+                }
+                let y = 1 + row_offset as u16;
+                let mut row_str = String::new();
+                let mut x = expected_content_x;
+                let end_x = expected_content_x + expected_content_w;
+                while x < end_x {
+                    let sym = buf[(x, y)].symbol();
+                    row_str.push_str(sym);
+                    x = x.saturating_add(sym.width().max(1) as u16);
+                }
+                collected.push(row_str);
+            }
+
+            if collected.len() >= total {
+                break;
+            }
+            let next_scroll = collected.len();
+            if next_scroll <= scroll {
+                break;
+            }
+            scroll = next_scroll;
+        }
+        collected
+    }
+
+    #[test]
+    fn test_centered_and_full_width_modes_lossless_parity_and_shift_enter() {
+        let (mut app, mut ui) = make_test_app_and_ui();
+        app.active_view = CanvasView::Page;
+        app.active_page_id = Some("page-track-d".into());
+
+        // 6 diverse properties (Korean + ASCII + pills + checkbox)
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "상태".into(),
+            NotionPropertyValue::Status(Some(SelectOption {
+                id: Some("st-1".into()),
+                name: "진행중".into(),
+                color: NotionColor::Blue,
+            })),
+        );
+        properties.insert(
+            "담당자".into(),
+            NotionPropertyValue::People(vec!["김민수".into(), "이서연".into()]),
+        );
+        properties.insert(
+            "우선순위".into(),
+            NotionPropertyValue::Select(Some(SelectOption {
+                id: Some("pr-1".into()),
+                name: "긴급 P0".into(),
+                color: NotionColor::Red,
+            })),
+        );
+        properties.insert(
+            "태그".into(),
+            NotionPropertyValue::MultiSelect(vec![
+                SelectOption {
+                    id: Some("t-1".into()),
+                    name: "레이아웃".into(),
+                    color: NotionColor::Purple,
+                },
+                SelectOption {
+                    id: Some("t-2".into()),
+                    name: "무손실래핑".into(),
+                    color: NotionColor::Green,
+                },
+            ]),
+        );
+        properties.insert("검토완료".into(), NotionPropertyValue::Checkbox(true));
+        properties.insert(
+            "목표일".into(),
+            NotionPropertyValue::Date {
+                start: Some("2026-11-25".into()),
+                end: Some("2026-12-01".into()),
+            },
+        );
+
+        // 80+ char Korean paragraph
+        let korean_paragraph = "중앙정렬 팔십팔 컬럼 모드와 전체 폭 백오십육 컬럼 모드를 전환하더라도 한글 문단과 영문 식별자 그리고 강조 스타일이 단 한 글자도 조용히 잘리지 않고 온전히 줄바꿈되어 모두 표시되어야 합니다.";
+        assert!(korean_paragraph.chars().count() >= 80);
+
+        // 3-line Shift+Enter callout
+        let callout_l1 = "콜아웃첫줄: Shift+Enter 첫 번째 안내 문구입니다.";
+        let callout_l2 = "콜아웃둘째줄: 명시적 개행이 별도 행으로 보존되어야 합니다.";
+        let callout_l3 = "콜아웃셋째줄: 마지막 줄까지 배경과 세로 막대가 유지됩니다.";
+
+        // Long quote
+        let quote_text = "좋은 터미널 레이아웃은 화면 폭이 좁아져도 정보를 조용히 버리지 않고 읽기 쉬운 행잉 인덴트로 자연스럽게 이어서 보여줍니다.";
+
+        // Numbered list items
+        let numbered_1 = "첫 번째 번호 항목으로 중앙 정렬 모드에서 두 줄 이상으로 깔끔하게 줄바꿈되어 번호 폭만큼 행잉 인덴트를 유지합니다.";
+        let numbered_2 = "두 번째 번호 항목은 한글과 EnglishTokenWithoutBreaks_2026_TrackD_Verification 을 함께 포함합니다.";
+
+        // 4-column Korean table (cells wider than the old 28-col hard cap + embedded Shift+Enter)
+        let mk_cell = |s: &str| vec![RichTextSpan::plain(s)];
+        let table_block = NotionBlock {
+            id: "blk-table".into(),
+            page_id: "page-track-d".into(),
+            kind: NotionBlockKind::Table {
+                table_width: 4,
+                has_column_header: true,
+                has_row_header: false,
+            },
+            has_children: true,
+            children: vec![
+                NotionBlock {
+                    id: "tr-0".into(),
+                    page_id: "page-track-d".into(),
+                    kind: NotionBlockKind::TableRow {
+                        cells: vec![
+                            mk_cell("항목명"),
+                            mk_cell("담당자"),
+                            mk_cell("진행상태"),
+                            mk_cell("상세검증설명"),
+                        ],
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "tr-1".into(),
+                    page_id: "page-track-d".into(),
+                    kind: NotionBlockKind::TableRow {
+                        cells: vec![
+                            mk_cell("스타일래핑"),
+                            mk_cell("김민수"),
+                            mk_cell("진행중"),
+                            mk_cell("기존 스물여덟 컬럼 상한을 제거하고 긴 한글 설명도 여러 줄로 무손실 표시합니다\n개행셀보존확인"),
+                        ],
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "tr-2".into(),
+                    page_id: "page-track-d".into(),
+                    kind: NotionBlockKind::TableRow {
+                        cells: vec![
+                            mk_cell("표정렬검증"),
+                            mk_cell("이서연"),
+                            mk_cell("완료"),
+                            mk_cell("한글과 ASCII 폭을 unicode_width 로 계산해 세로 경계선이 정확히 일치합니다"),
+                        ],
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        // 120+ char code block with tab indentation
+        let code_line = "\tlet result = bitefoundry_html::layout::wrap_styled_spans(&styled_spans, content_width, WrapPrefix { first: &first_prefix, cont: &cont_prefix }); // end_of_120_char_code_marker";
+        assert!(code_line.len() >= 120);
+
+        app.active_page_detail = Some(NotionPageDetail {
+            page: NotionPage {
+                id: "page-track-d".into(),
+                title: "트랙 D 무손실 래핑 검증 페이지 — Centered 88 vs Full 156 Parity Document Title".into(),
+                icon: Some("📘".into()),
+                is_favorite: true,
+                properties,
+                last_edited_time: Some("2026-11-25T16:30:00Z".into()),
+                ..Default::default()
+            },
+            blocks: vec![
+                NotionBlock {
+                    id: "blk-p".into(),
+                    page_id: "page-track-d".into(),
+                    kind: NotionBlockKind::Paragraph {
+                        rich_text: vec![
+                            RichTextSpan::plain(korean_paragraph),
+                            RichTextSpan {
+                                plain_text: " [강조키워드]".into(),
+                                annotations: RichTextAnnotations {
+                                    bold: true,
+                                    color: NotionColor::Blue,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                        ],
+                        color: NotionColor::Default,
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "blk-callout".into(),
+                    page_id: "page-track-d".into(),
+                    kind: NotionBlockKind::Callout {
+                        rich_text: vec![RichTextSpan::plain(format!(
+                            "{callout_l1}\n{callout_l2}\n{callout_l3}"
+                        ))],
+                        icon: Some("💡".into()),
+                        color: NotionColor::Yellow,
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "blk-quote".into(),
+                    page_id: "page-track-d".into(),
+                    kind: NotionBlockKind::Quote {
+                        rich_text: vec![RichTextSpan::plain(quote_text)],
+                        color: NotionColor::Default,
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "blk-num-1".into(),
+                    page_id: "page-track-d".into(),
+                    kind: NotionBlockKind::NumberedListItem {
+                        rich_text: vec![RichTextSpan::plain(numbered_1)],
+                        color: NotionColor::Default,
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "blk-num-2".into(),
+                    page_id: "page-track-d".into(),
+                    kind: NotionBlockKind::NumberedListItem {
+                        rich_text: vec![RichTextSpan::plain(numbered_2)],
+                        color: NotionColor::Default,
+                    },
+                    ..Default::default()
+                },
+                table_block,
+                NotionBlock {
+                    id: "blk-code".into(),
+                    page_id: "page-track-d".into(),
+                    kind: NotionBlockKind::Code {
+                        rich_text: vec![RichTextSpan::plain(code_line)],
+                        language: "rust".into(),
+                        caption: Vec::new(),
+                    },
+                    ..Default::default()
+                },
+            ],
+            comments: Vec::new(),
+            comments_error: None,
+            markdown: String::new(),
+            media: Vec::new(),
+        });
+
+        let detail = app.active_page_detail.as_ref().unwrap();
+        let theme = ui.theme.clone();
+
+        // 1. Direct line-level width invariants at Centered (88) and Full (156)
+        let (centered_lines, _, _) =
+            build_page_canvas_lines(&app, detail, &ui, &theme, EDITORIAL_MAX_COLS);
+        let (full_lines, _, _) = build_page_canvas_lines(&app, detail, &ui, &theme, 156);
+
+        for (i, (line, _)) in centered_lines.iter().enumerate() {
+            assert!(
+                line.width() <= 88,
+                "Centered line {i} width {} exceeded 88: {:?}",
+                line.width(),
+                line_to_string(line)
+            );
+        }
+        for (i, (line, _)) in full_lines.iter().enumerate() {
+            assert!(
+                line.width() <= 156,
+                "Full line {i} width {} exceeded 156: {:?}",
+                line.width(),
+                line_to_string(line)
+            );
+        }
+        assert!(
+            centered_lines.len() > full_lines.len(),
+            "Centered (88) should wrap into more lines than Full (156)"
+        );
+
+        let centered_line_strs: Vec<String> =
+            centered_lines.iter().map(|(l, _)| line_to_string(l)).collect();
+        let full_line_strs: Vec<String> =
+            full_lines.iter().map(|(l, _)| line_to_string(l)).collect();
+        assert_eq!(
+            normalize_visible_content(&centered_line_strs),
+            normalize_visible_content(&full_line_strs),
+            "Direct rendered lines must have 100% character parity between Centered (88) and Full (156)"
+        );
+
+        // Verify Callout continuation lines retain `┃ ` and card_bg
+        let callout_l2_line = centered_lines
+            .iter()
+            .find(|(l, _)| line_to_string(l).contains("콜아웃둘째줄"))
+            .expect("callout Shift+Enter line 2 present");
+        assert!(
+            line_to_string(&callout_l2_line.0).contains("┃ "),
+            "callout continuation line must keep ┃ rail"
+        );
+        assert_eq!(
+            callout_l2_line.0.style.bg,
+            Some(theme.bg_card),
+            "callout continuation line must keep card_bg"
+        );
+
+        // 2. End-to-end TestBackend::new(160, 40) rendering in Centered (88) vs Full (156)
+        ui.page_width = PageWidthMode::Centered;
+        let centered_buf_rows =
+            render_all_canvas_buffer_rows(&mut app, &mut ui, 160, 40, (160 - 88) / 2, 88);
+
+        ui.page_width = PageWidthMode::Full;
+        let full_buf_rows = render_all_canvas_buffer_rows(&mut app, &mut ui, 160, 40, 2, 156);
+
+        assert_eq!(
+            normalize_visible_content(&centered_buf_rows),
+            normalize_visible_content(&full_buf_rows),
+            "TestBackend(160, 40) Centered (88) and Full (156) buffers must have 100% lossless content parity"
+        );
+
+        // Verify all 3 Shift+Enter callout lines appear on 3 distinct rows in BOTH modes
+        for (mode_name, rows) in [("Centered", &centered_buf_rows), ("Full", &full_buf_rows)] {
+            let r1 = rows
+                .iter()
+                .position(|r| r.contains("콜아웃첫줄"))
+                .unwrap_or_else(|| panic!("{mode_name}: missing callout line 1"));
+            let r2 = rows
+                .iter()
+                .position(|r| r.contains("콜아웃둘째줄"))
+                .unwrap_or_else(|| panic!("{mode_name}: missing callout line 2"));
+            let r3 = rows
+                .iter()
+                .position(|r| r.contains("콜아웃셋째줄"))
+                .unwrap_or_else(|| panic!("{mode_name}: missing callout line 3"));
+            assert!(
+                r1 < r2 && r2 < r3,
+                "{mode_name}: Shift+Enter callout lines must be on distinct ordered rows (got r1={r1}, r2={r2}, r3={r3})"
+            );
+
+            // Verify key markers from all content blocks survived in the rendered buffer
+            let joined = rows.join("\n");
+            assert!(
+                joined.contains("end_of_120_char_code_marker"),
+                "{mode_name}: 120-char code tail must not be truncated"
+            );
+            assert!(
+                joined.contains("개행셀보존확인"),
+                "{mode_name}: table cell embedded newline content must be preserved"
+            );
+            assert!(
+                joined.contains("2026-12-01"),
+                "{mode_name}: 6th property value must wrap and stay visible"
+            );
+            assert!(
+                joined.contains("EnglishTokenWithoutBreaks_2026_TrackD_Verification"),
+                "{mode_name}: long token in numbered list must stay lossless"
+            );
+        }
+
+        // 3. Database Table View: Korean header `│` pipes must align exactly with data rows
+        let mut schema = BTreeMap::new();
+        schema.insert(
+            "이름".into(),
+            NotionPropertySchema {
+                id: "title".into(),
+                name: "이름".into(),
+                prop_type: "title".into(),
+                ..Default::default()
+            },
+        );
+        schema.insert(
+            "상태".into(),
+            NotionPropertySchema {
+                id: "status".into(),
+                name: "상태".into(),
+                prop_type: "status".into(),
+                ..Default::default()
+            },
+        );
+        schema.insert(
+            "담당자".into(),
+            NotionPropertySchema {
+                id: "owner".into(),
+                name: "담당자".into(),
+                prop_type: "rich_text".into(),
+                ..Default::default()
+            },
+        );
+        schema.insert(
+            "우선순위".into(),
+            NotionPropertySchema {
+                id: "priority".into(),
+                name: "우선순위".into(),
+                prop_type: "select".into(),
+                ..Default::default()
+            },
+        );
+        app.databases = vec![NotionDatabase {
+            id: "db-kr".into(),
+            title: "스프린트 보드".into(),
+            schema,
+            ..Default::default()
+        }];
+        app.active_database_id = Some("db-kr".into());
+        app.active_view = CanvasView::Database;
+        ui.db_view_mode = DatabaseViewMode::Table;
+
+        let make_db_row = |id: &str, title: &str, st: &str, owner: &str, prio: &str| {
+            let mut props = BTreeMap::new();
+            props.insert(
+                "상태".into(),
+                NotionPropertyValue::Status(Some(SelectOption {
+                    id: None,
+                    name: st.into(),
+                    color: NotionColor::Blue,
+                })),
+            );
+            props.insert("담당자".into(), NotionPropertyValue::RichText(owner.into()));
+            props.insert(
+                "우선순위".into(),
+                NotionPropertyValue::Select(Some(SelectOption {
+                    id: None,
+                    name: prio.into(),
+                    color: NotionColor::Green,
+                })),
+            );
+            NotionPage {
+                id: id.into(),
+                title: title.into(),
+                icon: Some("📄".into()),
+                properties: props,
+                ..Default::default()
+            }
+        };
+        app.active_database_rows = vec![
+            make_db_row("r1", "한글 페이지 작업", "진행중", "김민수", "높음"),
+            make_db_row("r2", "ASCII Task Item", "Done", "Alice", "Low"),
+        ];
+
+        let mut db_terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        db_terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        let db_buf = db_terminal.backend().buffer();
+        let row_pipe_cols = |y: u16| -> Vec<u16> {
+            (0..160u16)
+                .filter(|&x| db_buf[(x, y)].symbol() == "│")
+                .collect()
+        };
+        let row_text = |y: u16| -> String {
+            let mut s = String::new();
+            let mut x = 0u16;
+            while x < 160 {
+                let sym = db_buf[(x, y)].symbol();
+                s.push_str(sym);
+                x = x.saturating_add(sym.width().max(1) as u16);
+            }
+            s
+        };
+
+        let header_y = (0..40u16)
+            .find(|&y| {
+                let txt = row_text(y);
+                txt.contains("Name") && txt.contains("상태") && txt.contains("담당자")
+            })
+            .expect("DB table Korean header row rendered");
+        let data_y1 = (0..40u16)
+            .find(|&y| row_text(y).contains("한글 페이지 작업"))
+            .expect("DB table Korean data row 1 rendered");
+        let data_y2 = (0..40u16)
+            .find(|&y| row_text(y).contains("ASCII Task Item"))
+            .expect("DB table ASCII data row 2 rendered");
+
+        let header_pipes = row_pipe_cols(header_y);
+        assert_eq!(
+            header_pipes.len(),
+            3,
+            "expected 3 column separator pipes for 3 extra Korean columns"
+        );
+        assert_eq!(
+            header_pipes,
+            row_pipe_cols(data_y1),
+            "DB Korean header `│` columns must align exactly with Korean data row"
+        );
+        assert_eq!(
+            header_pipes,
+            row_pipe_cols(data_y2),
+            "DB Korean header `│` columns must align exactly with ASCII data row"
+        );
+    }
+
+    #[test]
+    fn test_narrow_width_wrapping_action_pills_inline_hits_and_all_blocks() {
+        let (mut app, mut ui) = make_test_app_and_ui();
+        app.active_view = CanvasView::Page;
+        app.active_page_id = Some("page-narrow".into());
+        ui.show_inline_hrefs = true;
+        ui.selected_block = 1;
+
+        app.active_page_detail = Some(NotionPageDetail {
+            page: NotionPage {
+                id: "page-narrow".into(),
+                title: "매우 긴 한글 제목과 Narrow Viewport Wrapping 검증 페이지".into(),
+                icon: Some("📄".into()),
+                is_favorite: false,
+                ..Default::default()
+            },
+            blocks: vec![
+                NotionBlock {
+                    id: "b-h1".into(),
+                    page_id: "page-narrow".into(),
+                    kind: NotionBlockKind::Heading1 {
+                        rich_text: vec![RichTextSpan::plain("긴 제목 1단계가 좁은 폭에서 안전하게 줄바꿈되는지 확인")],
+                        is_toggleable: true,
+                        color: NotionColor::Default,
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "b-todo".into(),
+                    page_id: "page-narrow".into(),
+                    kind: NotionBlockKind::ToDo {
+                        rich_text: vec![RichTextSpan::plain("체크박스 할 일 항목이 여러 줄로 래핑될 때 모든 줄에 동일한 히트 타깃이 유지되어야 합니다")],
+                        checked: false,
+                        color: NotionColor::Default,
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "b-html".into(),
+                    page_id: "page-narrow".into(),
+                    kind: NotionBlockKind::Code {
+                        rich_text: vec![RichTextSpan::plain("<div>hello_world_very_long_html_code_block_line_for_narrow_wrap</div>")],
+                        language: "html".into(),
+                        caption: Vec::new(),
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "b-eq".into(),
+                    page_id: "page-narrow".into(),
+                    kind: NotionBlockKind::Equation {
+                        expression: "E = mc^2 + a_1 x_1 + a_2 x_2 + a_3 x_3 + a_4 x_4".into(),
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "b-file".into(),
+                    page_id: "page-narrow".into(),
+                    kind: NotionBlockKind::File {
+                        url: "https://example.com/very-long-report-preview.md".into(),
+                        name: Some("매우긴마크다운파일이름미리보기.md".into()),
+                        caption: Vec::new(),
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "b-div".into(),
+                    page_id: "page-narrow".into(),
+                    kind: NotionBlockKind::Divider,
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "b-btn".into(),
+                    page_id: "page-narrow".into(),
+                    kind: NotionBlockKind::Button {
+                        rich_text: vec![RichTextSpan::plain("긴 자동화 실행 버튼 라벨 테스트")],
+                    },
+                    ..Default::default()
+                },
+            ],
+            comments: Vec::new(),
+            comments_error: None,
+            markdown: String::new(),
+            media: Vec::new(),
+        });
+
+        let detail = app.active_page_detail.as_ref().unwrap();
+        let theme = ui.theme.clone();
+        let narrow_w = 36u16;
+        let (lines, inline_hits, selected_range) =
+            build_page_canvas_lines(&app, detail, &ui, &theme, narrow_w);
+
+        // Width invariant across every single line
+        for (i, (line, _)) in lines.iter().enumerate() {
+            assert!(
+                line.width() <= narrow_w as usize,
+                "Narrow line {i} width {} exceeded {narrow_w}: {:?}",
+                line.width(),
+                line_to_string(line)
+            );
+        }
+
+        // All 8 action pills must be flow-wrapped across multiple lines with exact inline_hits
+        let expected_buttons = [
+            ButtonId::ToggleFavorite,
+            ButtonId::QuickAppend,
+            ButtonId::NewChildPage,
+            ButtonId::EditPage,
+            ButtonId::OpenWeb,
+            ButtonId::LinkExtractor,
+            ButtonId::ToggleHrefs,
+            ButtonId::Attachments,
+        ];
+        let mut pill_rows = std::collections::BTreeSet::new();
+        for btn in expected_buttons {
+            let hit = inline_hits
+                .iter()
+                .find(|&&(_, _, _, target)| target == HitTarget::Button(btn))
+                .unwrap_or_else(|| panic!("missing wrapped action pill hit for {btn:?}"));
+            pill_rows.insert(hit.0);
+            assert!(
+                hit.1.saturating_add(hit.2) <= narrow_w,
+                "action pill {btn:?} hit {:?} exceeds width {narrow_w}",
+                hit
+            );
+        }
+        assert!(
+            pill_rows.len() >= 2,
+            "action pills should wrap across multiple rows at width {narrow_w}, got rows {pill_rows:?}"
+        );
+
+        // Selected multi-line ToDo block must span multiple lines with identical TodoToggle(1) hit
+        let (sel_start, sel_end) = selected_range.expect("selected_line_range present");
+        assert!(
+            sel_end > sel_start,
+            "wrapped ToDo block should span multiple lines (start={sel_start}, end={sel_end})"
+        );
+        for line_idx in sel_start..=sel_end {
+            assert_eq!(
+                lines[line_idx].1,
+                Some(HitTarget::TodoToggle(1)),
+                "every wrapped row of selected ToDo block must carry TodoToggle(1)"
+            );
+        }
     }
 }
