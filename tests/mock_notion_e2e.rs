@@ -2120,7 +2120,7 @@ async fn e2e_bidirectional_sync_versions_forced_refresh_block_writes_and_section
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(msg, UiMsg::PageRefreshed(_)));
+    assert!(matches!(msg, UiMsg::PageRefreshed { .. }));
     app.handle_ui_msg(&mut ui, msg);
     assert!(matches!(
         app.active_page_detail.as_ref().unwrap().blocks[1].kind,

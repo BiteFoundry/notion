@@ -1152,6 +1152,7 @@ pub async fn run(
     app.workspace_id = auth.active_workspace_id().await;
     app.workspace_switch_tx = Some(switch_tx);
     app.load_cached_initial();
+    app.snap_sidebar_selection(&mut ui);
     draw_frame(&mut terminal, &mut app, &mut ui, &mut guard)?;
 
     spawn_sync_supervisor(

@@ -233,7 +233,7 @@ pub fn mouse_to_action(mouse: MouseEvent, hitmap: &HitMap) -> Option<Action> {
             if matches!(target, Some(HitTarget::OverlayBody | HitTarget::OverlayItem { .. })) {
                 return None;
             }
-            Some(Action::OpenContextMenu {
+            Some(Action::RightClick {
                 col: mouse.column,
                 row: mouse.row,
             })

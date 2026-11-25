@@ -227,6 +227,7 @@ pub struct BoardColumn {
     pub label: String,
     pub color: NotionColor,
     pub cards: Vec<NotionPage>,
+    pub is_synthetic: bool,
 }
 
 pub enum UiMsg {
@@ -236,7 +237,11 @@ pub enum UiMsg {
         sync_busy: bool,
     },
     DaemonDetached,
-    PageRefreshed(Box<NotionPageDetail>),
+    PageRefreshed {
+        detail: Box<NotionPageDetail>,
+        seq: u64,
+        task_label: &'static str,
+    },
     TodoToggleFailed {
         page_id: String,
         block_id: String,
@@ -271,6 +276,12 @@ pub enum UiMsg {
         updated: NotionPage,
         column_label: String,
     },
+    BoardCardMoveFailed {
+        database_id: String,
+        prev_col: usize,
+        prev_row: usize,
+        error: String,
+    },
     WorkspaceSwitched {
         name: String,
         workspace_id: String,
@@ -279,8 +290,12 @@ pub enum UiMsg {
         cache_key: String,
         rendered: Box<RenderedTerminalImage>,
     },
-    ImagePreviewFailed(String),
+    ImagePreviewFailed {
+        seq: u64,
+        error: String,
+    },
     HtmlPreviewLoaded {
+        seq: u64,
         title: String,
         html: String,
     },
@@ -317,6 +332,8 @@ pub struct UiState {
     pub page_synced_generations: HashMap<String, u64>,
     pub page_sync_in_flight: HashSet<String>,
     pub pending_page_sync: HashMap<String, (u64, String, Vec<NotionBlock>)>,
+    pub page_refresh_seq: HashMap<String, u64>,
+    pub preview_request_seq: u64,
     pub sidebar_selected: usize,
     pub collapsed_nodes: HashSet<String>,
     pub expanded_toggles: HashSet<String>,
@@ -376,6 +393,8 @@ impl UiState {
             page_synced_generations: HashMap::new(),
             page_sync_in_flight: HashSet::new(),
             pending_page_sync: HashMap::new(),
+            page_refresh_seq: HashMap::new(),
+            preview_request_seq: 0,
             sidebar_selected: 0,
             collapsed_nodes: HashSet::new(),
             expanded_toggles: HashSet::new(),
@@ -436,6 +455,17 @@ impl UiState {
 
     pub fn error(&mut self, msg: impl Into<String>) {
         self.toasts.error(msg);
+    }
+
+    pub fn next_page_refresh_seq(&mut self, page_id: &str) -> u64 {
+        let entry = self.page_refresh_seq.entry(page_id.to_string()).or_insert(0);
+        *entry = entry.wrapping_add(1);
+        *entry
+    }
+
+    pub fn bump_preview_request_seq(&mut self) -> u64 {
+        self.preview_request_seq = self.preview_request_seq.wrapping_add(1);
+        self.preview_request_seq
     }
 }
 
@@ -600,14 +630,14 @@ impl AppState {
     }
 
     pub fn open_page(&mut self, page_id: &str, ui: &mut UiState, push_history: bool) {
-        if ui
-            .inline_editor
-            .as_ref()
-            .is_some_and(|ed| ed.page_id != page_id)
-        {
-            self.close_inline_editor_and_flush(ui);
-        } else if ui.inline_editor.is_some() {
-            self.close_inline_editor_and_flush(ui);
+        let _ = self.try_open_page(page_id, ui, push_history);
+    }
+
+    pub fn try_open_page(&mut self, page_id: &str, ui: &mut UiState, push_history: bool) -> bool {
+        if ui.inline_editor.is_some() && !self.close_inline_editor_and_flush(ui) {
+            ui.focus = Focus::Canvas;
+            ui.warning("Resolve or discard inline edits (Esc x2) before switching pages");
+            return false;
         }
         if push_history {
             self.push_current_to_nav_stack();
@@ -637,21 +667,45 @@ impl AppState {
                 },
                 ..Default::default()
             });
+        } else {
+            self.active_page_detail = None;
         }
+        self.clamp_canvas_selection(ui);
         self.sync_ctrl.set_focus(FocusTarget {
             page_id: Some(page_id.to_string()),
             database_id: None,
         });
+        true
     }
 
     pub fn open_database(&mut self, database_id: &str, ui: &mut UiState, push_history: bool) {
-        if ui.inline_editor.is_some() {
-            self.close_inline_editor_and_flush(ui);
+        let _ = self.try_open_database(database_id, ui, push_history);
+    }
+
+    pub fn try_open_database(
+        &mut self,
+        database_id: &str,
+        ui: &mut UiState,
+        push_history: bool,
+    ) -> bool {
+        if ui.inline_editor.is_some() && !self.close_inline_editor_and_flush(ui) {
+            ui.focus = Focus::Canvas;
+            ui.warning("Resolve or discard inline edits (Esc x2) before switching databases");
+            return false;
         }
         if push_history {
             self.push_current_to_nav_stack();
         }
+        if self.active_database_id.as_deref() != Some(database_id) {
+            ui.db_filter.clear();
+        }
         self.active_view = CanvasView::Database;
+        self.active_page_id = None;
+        self.active_page_detail = None;
+        ui.comments_drawer_open = false;
+        if ui.focus == Focus::Comments {
+            ui.focus = Focus::Canvas;
+        }
         self.active_database_id = Some(database_id.to_string());
         ui.db_selected_row = 0;
         ui.db_board_col = 0;
@@ -663,10 +717,49 @@ impl AppState {
             .list_database_rows(&self.workspace_id, database_id)
             .unwrap_or_default();
         self.active_database_rows_truncated = false;
+        self.clamp_db_selection(ui);
         self.sync_ctrl.set_focus(FocusTarget {
             page_id: None,
             database_id: Some(database_id.to_string()),
         });
+        true
+    }
+
+    pub fn snap_sidebar_selection(&self, ui: &mut UiState) {
+        let items = self.build_sidebar_items(ui);
+        if items.is_empty() {
+            ui.sidebar_selected = 0;
+            return;
+        }
+        let clamped = ui.sidebar_selected.min(items.len() - 1);
+        if !items[clamped].is_section_header {
+            ui.sidebar_selected = clamped;
+            return;
+        }
+        if let Some(next) = ((clamped + 1)..items.len()).find(|&i| !items[i].is_section_header) {
+            ui.sidebar_selected = next;
+        } else if let Some(prev) = (0..clamped).rev().find(|&i| !items[i].is_section_header) {
+            ui.sidebar_selected = prev;
+        } else {
+            ui.sidebar_selected = 0;
+        }
+    }
+
+    pub fn clamp_db_selection(&self, ui: &mut UiState) {
+        let rows_len = self.filtered_sorted_db_rows(ui).len();
+        ui.db_selected_row = ui.db_selected_row.min(rows_len.saturating_sub(1));
+        let cols = self.build_board_columns(ui);
+        ui.db_board_col = ui.db_board_col.min(cols.len().saturating_sub(1));
+        let cards_len = cols
+            .get(ui.db_board_col)
+            .map(|c| c.cards.len())
+            .unwrap_or(0);
+        ui.db_board_row = ui.db_board_row.min(cards_len.saturating_sub(1));
+    }
+
+    pub fn clamp_canvas_selection(&self, ui: &mut UiState) {
+        let count = self.visible_blocks(ui).len();
+        ui.selected_block = ui.selected_block.min(count.saturating_sub(1));
     }
 
     /// Opens the in-place inline Markdown editor directly inside the Page Canvas pane.
@@ -743,6 +836,9 @@ impl AppState {
 
     /// Materializes the draft on demand for actions that read the page's blocks.
     pub fn detail_for_block_action(&self, ui: &UiState) -> Option<Cow<'_, NotionPageDetail>> {
+        if self.active_view != CanvasView::Page {
+            return None;
+        }
         let detail = self.active_page_detail.as_ref()?;
         if let Some(ed) = ui.inline_editor.as_ref().filter(|ed| ed.page_id == detail.page.id) {
             let markdown = ed.composer.text();
@@ -880,10 +976,18 @@ impl AppState {
     }
 
     /// Exits inline edit mode cleanly, saving any unsynced edits immediately while
-    /// preserving the user's current Canvas scroll position.
-    pub fn close_inline_editor_and_flush(&mut self, ui: &mut UiState) {
+    /// preserving the user's current Canvas scroll position. Returns `false` if the editor
+    /// refused to close due to a save error or unresolved remote conflict.
+    pub fn close_inline_editor_and_flush(&mut self, ui: &mut UiState) -> bool {
         if ui.inline_editor.is_none() {
-            return;
+            return true;
+        }
+        if ui
+            .inline_editor
+            .as_ref()
+            .is_some_and(|ed| ed.last_sync_error.is_some())
+        {
+            return false;
         }
         let _ = self.flush_inline_editor_sync(ui, true);
         if ui
@@ -891,13 +995,14 @@ impl AppState {
             .as_ref()
             .is_some_and(|ed| ed.last_sync_error.is_some() || ed.confirm_overwrite)
         {
-            return;
+            return false;
         }
         if let Some(ed) = ui.inline_editor.take() {
             ui.canvas_scroll = ed.scroll_y;
             ui.canvas_follow_selected = false;
         }
         ui.cursor_pos = None;
+        true
     }
 
     /// Submits an edited Markdown document (e.g. from external `$EDITOR`) with 0ms optimistic
@@ -1065,6 +1170,7 @@ impl AppState {
         let bid = block_id.to_string();
         let page_id = self.active_page_id.clone().unwrap_or_default();
         let ws_id = self.workspace_id.clone();
+        let req_seq = ui.next_page_refresh_seq(&page_id);
         ui.tasks.begin("todo");
         tokio::spawn(async move {
             match client.set_todo_checked(&bid, &page_id, next_checked).await {
@@ -1083,7 +1189,11 @@ impl AppState {
                     .await;
 
                     if let Ok(Ok((Some((_, false)), Some(detail)))) = applied {
-                        let _ = ui_tx.send(UiMsg::PageRefreshed(Box::new(detail)));
+                        let _ = ui_tx.send(UiMsg::PageRefreshed {
+                            detail: Box::new(detail),
+                            seq: req_seq,
+                            task_label: "todo",
+                        });
                         return;
                     }
 
@@ -1100,7 +1210,11 @@ impl AppState {
                     if let Ok(detail) =
                         crate::sync::sync_page_detail_force(&client, &storage, &page_id).await
                     {
-                        let _ = ui_tx.send(UiMsg::PageRefreshed(Box::new(detail)));
+                        let _ = ui_tx.send(UiMsg::PageRefreshed {
+                            detail: Box::new(detail),
+                            seq: req_seq,
+                            task_label: "todo",
+                        });
                     } else {
                         let _ = ui_tx.send(UiMsg::TaskDone {
                             label: "todo".into(),
@@ -1154,9 +1268,22 @@ impl AppState {
                         self.open_database(&first_db.id, ui, false);
                     }
                 }
+                self.snap_sidebar_selection(ui);
                 true
             }
             CoreEvent::PageDetailUpdated(detail) => {
+                if let Some(expected) = self.expected_workspace_id.as_deref() {
+                    if !detail.page.workspace_id.is_empty() && detail.page.workspace_id != expected
+                    {
+                        return false;
+                    }
+                    if detail.page.workspace_id.is_empty()
+                        && self.active_page_id.as_deref() != Some(detail.page.id.as_str())
+                        && !self.pages.iter().any(|p| p.id == detail.page.id)
+                    {
+                        return false;
+                    }
+                }
                 let syncing_own_edit = ui.page_sync_in_flight.contains(&detail.page.id)
                     || ui.pending_page_sync.contains_key(&detail.page.id);
                 if syncing_own_edit {
@@ -1246,6 +1373,7 @@ impl AppState {
                     }
                     self.reload_page_parent_hints();
                     self.active_page_detail = Some(*detail);
+                    self.clamp_canvas_selection(ui);
                     return true;
                 }
                 if summary_changed {
@@ -1259,6 +1387,26 @@ impl AppState {
                 rows,
                 rows_truncated,
             } => {
+                if let Some(expected) = self.expected_workspace_id.as_deref() {
+                    let event_ws = database
+                        .as_ref()
+                        .map(|d| d.workspace_id.as_str())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| {
+                            rows.first()
+                                .map(|r| r.workspace_id.as_str())
+                                .filter(|s| !s.is_empty())
+                        });
+                    if let Some(ws) = event_ws {
+                        if ws != expected {
+                            return false;
+                        }
+                    } else if self.active_database_id.as_deref() != Some(database_id.as_str())
+                        && !self.databases.iter().any(|d| d.id == database_id)
+                    {
+                        return false;
+                    }
+                }
                 let mut changed = false;
                 if let Some(db) = database {
                     if let Some(existing) = self.databases.iter_mut().find(|d| d.id == db.id) {
@@ -1272,25 +1420,62 @@ impl AppState {
                     }
                 }
                 if self.active_database_id.as_deref() == Some(database_id.as_str()) {
-                    let rows_same = self.active_database_rows.len() == rows.len()
-                        && self
+                    if rows_truncated && self.active_database_rows.len() > rows.len() {
+                        // Preserve already-loaded rows beyond a truncated background poll slice
+                        // while refreshing any rows present in the poll window.
+                        let mut by_id: HashMap<String, usize> = self
                             .active_database_rows
                             .iter()
-                            .zip(rows.iter())
-                            .all(|(a, b)| crate::sync::page_semantically_equal(a, b));
-                    if !rows_same {
-                        self.active_database_rows = rows;
-                        changed = true;
+                            .enumerate()
+                            .map(|(i, r)| (r.id.clone(), i))
+                            .collect();
+                        for incoming in rows {
+                            if let Some(&idx) = by_id.get(&incoming.id) {
+                                if !crate::sync::page_semantically_equal(
+                                    &self.active_database_rows[idx],
+                                    &incoming,
+                                ) {
+                                    self.active_database_rows[idx] = incoming;
+                                    changed = true;
+                                }
+                            } else {
+                                by_id.insert(incoming.id.clone(), self.active_database_rows.len());
+                                self.active_database_rows.push(incoming);
+                                changed = true;
+                            }
+                        }
+                    } else {
+                        let rows_same = self.active_database_rows.len() == rows.len()
+                            && self
+                                .active_database_rows
+                                .iter()
+                                .zip(rows.iter())
+                                .all(|(a, b)| crate::sync::page_semantically_equal(a, b));
+                        if !rows_same {
+                            self.active_database_rows = rows;
+                            changed = true;
+                        }
                     }
                     if self.active_database_rows_truncated != rows_truncated {
                         self.active_database_rows_truncated = rows_truncated;
                         changed = true;
                     }
+                    self.clamp_db_selection(ui);
                 }
                 changed
             }
             CoreEvent::CommentsUpdated { page_id, comments } => {
+                if self.active_page_id.as_deref() != Some(page_id.as_str()) {
+                    return false;
+                }
                 if let Some(ref mut detail) = self.active_page_detail {
+                    if let Some(expected) = self.expected_workspace_id.as_deref() {
+                        if !detail.page.workspace_id.is_empty()
+                            && detail.page.workspace_id != expected
+                        {
+                            return false;
+                        }
+                    }
                     if detail.page.id == page_id && detail.comments != comments {
                         detail.comments = comments;
                         return true;
@@ -1329,9 +1514,31 @@ impl AppState {
             UiMsg::DaemonDetached => {
                 ui.warning("Sync daemon detached; switched to local sync");
             }
-            UiMsg::PageRefreshed(detail) => {
-                ui.tasks.finish("append", None);
-                ui.tasks.finish("todo", None);
+            UiMsg::PageRefreshed {
+                detail,
+                seq,
+                task_label,
+            } => {
+                ui.tasks.finish(task_label, None);
+                if let Some(expected) = self.expected_workspace_id.as_deref() {
+                    if !detail.page.workspace_id.is_empty() && detail.page.workspace_id != expected
+                    {
+                        return;
+                    }
+                }
+                let latest_seq = ui
+                    .page_refresh_seq
+                    .get(&detail.page.id)
+                    .copied()
+                    .unwrap_or(0);
+                if seq < latest_seq {
+                    return;
+                }
+                let syncing_own_edit = ui.page_sync_in_flight.contains(&detail.page.id)
+                    || ui.pending_page_sync.contains_key(&detail.page.id);
+                if syncing_own_edit {
+                    return;
+                }
                 self.merge_page_summary(&detail.page);
                 let editing_this_page = ui
                     .inline_editor
@@ -1341,6 +1548,7 @@ impl AppState {
                     && !editing_this_page
                 {
                     self.active_page_detail = Some(*detail);
+                    self.clamp_canvas_selection(ui);
                 }
                 self.reload_page_parent_hints();
                 ui.success("Synced page");
@@ -1520,17 +1728,42 @@ impl AppState {
             }
             UiMsg::PageCreated(page) => {
                 ui.tasks.finish("create", None);
+                if let Some(expected) = self.expected_workspace_id.as_deref() {
+                    if !page.workspace_id.is_empty() && page.workspace_id != expected {
+                        return;
+                    }
+                }
                 let id = page.id.clone();
                 let title = page.title.clone();
-                self.pages.insert(0, NotionPageSummary::from(&page));
-                if self.active_view == CanvasView::Database {
-                    if let Some(db_id) = self.active_database_id.clone() {
+                let summary = NotionPageSummary::from(&page);
+                if let Some(existing) = self.pages.iter_mut().find(|p| p.id == id) {
+                    *existing = summary;
+                } else {
+                    self.pages.insert(0, summary);
+                }
+                if page.parent_type == "database_id" {
+                    let target_db_id = page
+                        .parent_id
+                        .clone()
+                        .or_else(|| self.active_database_id.clone());
+                    if let Some(db_id) = target_db_id {
+                        if self.active_database_id.as_deref() == Some(db_id.as_str()) {
+                            if let Some(existing) =
+                                self.active_database_rows.iter_mut().find(|r| r.id == id)
+                            {
+                                *existing = page;
+                            } else {
+                                self.active_database_rows.insert(0, page);
+                            }
+                            self.clamp_db_selection(ui);
+                        }
                         self.sync_ctrl
                             .request(SyncCommand::RefreshDatabase { database_id: db_id });
                     }
                 } else {
-                    self.open_page(&id, ui, true);
+                    let _ = self.try_open_page(&id, ui, true);
                 }
+                self.snap_sidebar_selection(ui);
                 ui.success(format!("Created '{title}'"));
             }
             UiMsg::PageArchived(id) => {
@@ -1538,6 +1771,23 @@ impl AppState {
                 if let Some(p) = self.pages.iter_mut().find(|p| p.id == id) {
                     p.archived = true;
                 }
+                for row in &mut self.active_database_rows {
+                    if row.id == id {
+                        row.archived = true;
+                    }
+                }
+                if let Some(ref mut detail) = self.active_page_detail {
+                    if detail.page.id == id {
+                        detail.page.archived = true;
+                    }
+                }
+                if ui.inline_editor.as_ref().is_some_and(|ed| ed.page_id == id) {
+                    ui.inline_editor = None;
+                    ui.cursor_pos = None;
+                }
+                self.snap_sidebar_selection(ui);
+                self.clamp_db_selection(ui);
+                self.clamp_canvas_selection(ui);
                 ui.success("Archived page");
             }
             UiMsg::CommentAdded { page_id, comment } => {
@@ -1562,11 +1812,26 @@ impl AppState {
                 {
                     *row = updated;
                 }
+                self.clamp_db_selection(ui);
                 if !database_id.is_empty() {
                     self.sync_ctrl
                         .request(SyncCommand::RefreshDatabase { database_id });
                 }
                 ui.success(format!("Moved card -> {column_label}"));
+            }
+            UiMsg::BoardCardMoveFailed {
+                database_id,
+                prev_col,
+                prev_row,
+                error,
+            } => {
+                ui.tasks.finish("move card", Some(error.clone()));
+                if self.active_database_id.as_deref() == Some(database_id.as_str()) {
+                    ui.db_board_col = prev_col;
+                    ui.db_board_row = prev_row;
+                    self.clamp_db_selection(ui);
+                }
+                ui.error(format!("move card: {error}"));
             }
             UiMsg::WorkspaceSwitched { name, workspace_id } => {
                 ui.tasks.finish("workspace", None);
@@ -1581,6 +1846,8 @@ impl AppState {
                 self.active_page_detail = None;
                 ui.inline_editor = None;
                 ui.cursor_pos = None;
+                ui.page_refresh_seq.clear();
+                ui.bump_preview_request_seq();
                 self.active_database_id = None;
                 self.active_database_rows.clear();
                 self.active_database_rows_truncated = false;
@@ -1590,6 +1857,7 @@ impl AppState {
                 // The sync engine must not keep polling a page of the workspace just left.
                 self.sync_ctrl.set_focus(FocusTarget::default());
                 self.load_cached_initial();
+                self.snap_sidebar_selection(ui);
                 let rebinding = self
                     .workspace_switch_tx
                     .as_ref()
@@ -1611,13 +1879,19 @@ impl AppState {
                 self.image_cache_bytes += sz;
                 self.image_cache.insert(cache_key, *rendered);
             }
-            UiMsg::ImagePreviewFailed(err) => {
+            UiMsg::ImagePreviewFailed { seq, error } => {
+                if seq != ui.preview_request_seq {
+                    return;
+                }
                 if let Some(Overlay::ImagePreview(ref mut ov)) = ui.overlays.last_mut() {
-                    ov.error = Some(err);
+                    ov.error = Some(error);
                 }
             }
-            UiMsg::HtmlPreviewLoaded { title, html } => {
+            UiMsg::HtmlPreviewLoaded { seq, title, html } => {
                 ui.tasks.finish("html", None);
+                if seq != ui.preview_request_seq {
+                    return;
+                }
                 if matches!(
                     ui.overlays.last(),
                     Some(Overlay::ImagePreview(_) | Overlay::HtmlPreview(_))
@@ -1995,21 +2269,22 @@ impl AppState {
                     label: opt.name.clone(),
                     color: opt.color,
                     cards: Vec::new(),
+                    is_synthetic: false,
                 });
             }
         }
 
         for row in rows {
-            let (label, color) = row
+            let (label, color, is_synthetic) = row
                 .properties
                 .get(&prop_name)
                 .and_then(|v| match v {
                     NotionPropertyValue::Status(Some(o)) | NotionPropertyValue::Select(Some(o)) => {
-                        Some((o.name.clone(), o.color))
+                        Some((o.name.clone(), o.color, false))
                     }
                     _ => None,
                 })
-                .unwrap_or_else(|| ("No Status".to_string(), NotionColor::Gray));
+                .unwrap_or_else(|| ("No Status".to_string(), NotionColor::Gray, true));
 
             if let Some(col) = cols
                 .iter_mut()
@@ -2023,6 +2298,7 @@ impl AppState {
                     label,
                     color,
                     cards: vec![row],
+                    is_synthetic,
                 });
             }
         }
@@ -2034,6 +2310,7 @@ impl AppState {
                 label: "Backlog".into(),
                 color: NotionColor::Gray,
                 cards: Vec::new(),
+                is_synthetic: true,
             });
         }
         cols

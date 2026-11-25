@@ -52,7 +52,7 @@ pub struct ContextMenu {
 }
 
 impl ContextMenu {
-    pub fn build(target: ContextTarget, anchor: (u16, u16), _app: &AppState, _ui: &UiState) -> Self {
+    pub fn build(target: ContextTarget, anchor: (u16, u16), app: &AppState, ui: &UiState) -> Self {
         let items = match target {
             ContextTarget::PageCanvas => vec![
                 MenuItem::new("Quick Append (/h1, /todo, ...)", Some("a"), Action::OpenQuickAppend),
@@ -68,16 +68,108 @@ impl ContextMenu {
                 MenuItem::new("Open in Browser", Some("o"), Action::OpenActiveInBrowser),
                 MenuItem::new("Archive Page", Some("D"), Action::ConfirmArchivePage),
             ],
-            ContextTarget::Database => vec![
-                MenuItem::new("Table View", Some("1"), Action::SetDbViewMode(DatabaseViewMode::Table)),
-                MenuItem::new("Board (Kanban) View", Some("2"), Action::SetDbViewMode(DatabaseViewMode::Board)),
-                MenuItem::new("List View", Some("3"), Action::SetDbViewMode(DatabaseViewMode::List)),
-                MenuItem::new("Filter Rows", Some("f"), Action::OpenDbFilter),
-                MenuItem::new("Cycle Sort", Some("s"), Action::CycleDbSort),
-                MenuItem::new("New Database Item", Some("n"), Action::OpenNewPageModal),
-                MenuItem::new("Open in Browser", Some("o"), Action::OpenActiveInBrowser),
-            ],
-            ContextTarget::Sidebar | ContextTarget::Global => vec![
+            ContextTarget::Database => {
+                let mut db_items = vec![
+                    MenuItem::new("Open Selected Item", Some("Enter"), Action::Activate),
+                    MenuItem::new("Table View", Some("1"), Action::SetDbViewMode(DatabaseViewMode::Table)),
+                    MenuItem::new("Board (Kanban) View", Some("2"), Action::SetDbViewMode(DatabaseViewMode::Board)),
+                    MenuItem::new("List View", Some("3"), Action::SetDbViewMode(DatabaseViewMode::List)),
+                    MenuItem::new("Filter Rows", Some("f"), Action::OpenDbFilter),
+                    MenuItem::new("Cycle Sort", Some("s"), Action::CycleDbSort),
+                    MenuItem::new("New Database Item", Some("n"), Action::OpenNewPageModal),
+                    MenuItem::new("Open in Browser", Some("o"), Action::OpenActiveInBrowser),
+                    MenuItem::new("Archive Selected Item", Some("D"), Action::ConfirmArchivePage),
+                ];
+                if app.filtered_sorted_db_rows(ui).is_empty() {
+                    db_items.remove(0);
+                    db_items.pop();
+                }
+                db_items
+            }
+            ContextTarget::Sidebar => {
+                let sidebar_items = app.build_sidebar_items(ui);
+                let selected_item = sidebar_items
+                    .get(ui.sidebar_selected)
+                    .filter(|it| !it.is_section_header);
+                if let Some(item) = selected_item {
+                    let mut menu_items = Vec::new();
+                    if item.is_database {
+                        menu_items.push(MenuItem::new(
+                            "Open Database",
+                            Some("Enter"),
+                            Action::OpenDatabaseById(item.id.clone()),
+                        ));
+                    } else {
+                        menu_items.push(MenuItem::new(
+                            "Open Page",
+                            Some("Enter"),
+                            Action::OpenPageById(item.id.clone()),
+                        ));
+                    }
+                    menu_items.push(MenuItem::new(
+                        "Toggle Favorite ★",
+                        Some("f"),
+                        Action::ToggleSidebarFavorite {
+                            id: item.id.clone(),
+                            is_database: item.is_database,
+                        },
+                    ));
+                    let item_url = if item.is_database {
+                        app.databases
+                            .iter()
+                            .find(|d| d.id == item.id)
+                            .map(|d| d.url.clone())
+                    } else {
+                        app.pages
+                            .iter()
+                            .find(|p| p.id == item.id)
+                            .map(|p| p.url.clone())
+                    };
+                    if let Some(url) = item_url.filter(|u| !u.trim().is_empty()) {
+                        menu_items.push(MenuItem::new(
+                            "Open in Browser",
+                            Some("o"),
+                            Action::OpenUrl(url),
+                        ));
+                    } else {
+                        menu_items.push(MenuItem::new(
+                            "Open in Browser",
+                            Some("o"),
+                            Action::OpenActiveInBrowser,
+                        ));
+                    }
+                    if !item.is_database && !item.archived {
+                        menu_items.push(MenuItem::new(
+                            "Archive Page",
+                            Some("D"),
+                            Action::ConfirmArchivePageById {
+                                id: item.id.clone(),
+                                title: item.label.clone(),
+                            },
+                        ));
+                    }
+                    menu_items.push(MenuItem::new(
+                        "New Child Page",
+                        Some("n"),
+                        Action::OpenNewPageModal,
+                    ));
+                    menu_items.push(MenuItem::new(
+                        "Sync Workspace",
+                        Some("Ctrl+R"),
+                        Action::RefreshAll,
+                    ));
+                    menu_items
+                } else {
+                    vec![
+                        MenuItem::new("Quick Find & Commands", Some("Ctrl+K"), Action::OpenOverlay(OverlayKind::CommandPalette)),
+                        MenuItem::new("Switch Workspace", Some("Ctrl+S"), Action::OpenOverlay(OverlayKind::WorkspaceSwitcher)),
+                        MenuItem::new("New Child Page", Some("n"), Action::OpenNewPageModal),
+                        MenuItem::new("Sync Workspace", Some("Ctrl+R"), Action::RefreshAll),
+                        MenuItem::new("Settings & Palettes", Some("Ctrl+,"), Action::OpenOverlay(OverlayKind::Settings)),
+                    ]
+                }
+            }
+            ContextTarget::Global => vec![
                 MenuItem::new("Quick Find & Commands", Some("Ctrl+K"), Action::OpenOverlay(OverlayKind::CommandPalette)),
                 MenuItem::new("Switch Workspace", Some("Ctrl+S"), Action::OpenOverlay(OverlayKind::WorkspaceSwitcher)),
                 MenuItem::new("New Child Page", Some("n"), Action::OpenNewPageModal),

@@ -97,6 +97,7 @@ struct StreamedSearch {
 async fn stream_workspace_search<F>(
     client: &NotionClient,
     storage: &Storage,
+    expected_workspace_id: &str,
     watermark: Option<&str>,
     collect_seen: bool,
     on_batch: &mut F,
@@ -113,11 +114,24 @@ where
 
     loop {
         let fetched_so_far = pages_total + dbs_total;
+        if client.auth().active_workspace_id().await != expected_workspace_id {
+            return Err((
+                fetched_so_far,
+                anyhow::anyhow!("Active workspace changed during sync; aborted to protect cache"),
+            ));
+        }
         batch_num += 1;
         let batch = client
             .search(None, SearchFilterObject::All, 100, cursor.as_deref())
             .await
             .map_err(|err| (fetched_so_far, err))?;
+
+        if client.auth().active_workspace_id().await != expected_workspace_id {
+            return Err((
+                fetched_so_far,
+                anyhow::anyhow!("Active workspace changed during sync; aborted before writing cache"),
+            ));
+        }
 
         for p in &batch.pages {
             if let Some(ts) = p.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
@@ -228,8 +242,30 @@ pub async fn sync_workspace_tree_with_options<F>(
 where
     F: FnMut(usize, usize, usize),
 {
-    let ((workspace_id, _, databases), outcome) =
-        sync_workspace_tree_summaries_with_options(client, storage, full_rescan, on_batch).await?;
+    sync_workspace_tree_with_options_for_workspace(client, storage, None, full_rescan, on_batch)
+        .await
+}
+
+/// Performs a workspace tree sync bound to `expected_workspace_id` (if provided).
+/// Aborts without mutating `storage` if the active workspace switches mid-sync.
+pub async fn sync_workspace_tree_with_options_for_workspace<F>(
+    client: &NotionClient,
+    storage: &Storage,
+    expected_workspace_id: Option<&str>,
+    full_rescan: bool,
+    on_batch: F,
+) -> Result<(String, Vec<NotionPage>, Vec<NotionDatabase>, SyncOutcome)>
+where
+    F: FnMut(usize, usize, usize),
+{
+    let ((workspace_id, _, databases), outcome) = sync_workspace_tree_summaries_with_options(
+        client,
+        storage,
+        expected_workspace_id,
+        full_rescan,
+        on_batch,
+    )
+    .await?;
     let st = storage.clone();
     let ws = workspace_id.clone();
     let pages = tokio::task::spawn_blocking(move || st.list_pages(&ws, true)).await??;
@@ -240,7 +276,7 @@ pub(crate) async fn sync_workspace_tree_summaries(
     client: &NotionClient,
     storage: &Storage,
 ) -> Result<WorkspaceTree> {
-    sync_workspace_tree_summaries_with_options(client, storage, false, |_, _, _| {})
+    sync_workspace_tree_summaries_with_options(client, storage, None, false, |_, _, _| {})
         .await
         .map(|(tree, _)| tree)
 }
@@ -259,6 +295,7 @@ pub fn workspace_cache_complete(storage: &Storage, workspace_id: &str) -> bool {
 async fn sync_workspace_tree_summaries_with_options<F>(
     client: &NotionClient,
     storage: &Storage,
+    expected_workspace_id: Option<&str>,
     full_rescan: bool,
     mut on_batch: F,
 ) -> Result<(WorkspaceTree, SyncOutcome)>
@@ -266,6 +303,13 @@ where
     F: FnMut(usize, usize, usize),
 {
     let workspace_id = client.auth().active_workspace_id().await;
+    if let Some(expected) = expected_workspace_id {
+        if workspace_id != expected {
+            anyhow::bail!(
+                "Active workspace changed before sync started (expected {expected}, got {workspace_id})"
+            );
+        }
+    }
     let scope_key = format!("workspace:{workspace_id}");
     let complete_key = workspace_complete_key(&workspace_id);
 
@@ -291,6 +335,7 @@ where
     let streamed = match stream_workspace_search(
         client,
         storage,
+        &workspace_id,
         watermark.as_deref(),
         full_rescan,
         &mut on_batch,
@@ -306,6 +351,10 @@ where
             });
         }
     };
+
+    if client.auth().active_workspace_id().await != workspace_id {
+        anyhow::bail!("Active workspace changed during sync; aborted before finalizing cache");
+    }
 
     let newest = match (stored_wm.as_deref(), streamed.newest_edited.as_deref()) {
         (Some(a), Some(b)) => Some(if b > a { b.to_string() } else { a.to_string() }),
@@ -858,6 +907,7 @@ struct InFlightActive {
     id: u64,
     target: ActiveTarget,
     mode: DetailSyncMode,
+    db_max_rows: usize,
     show_busy: bool,
     emit_unchanged: bool,
     handle: tokio::task::JoinHandle<()>,
@@ -866,6 +916,7 @@ struct InFlightActive {
 struct PendingActive {
     target: ActiveTarget,
     mode: DetailSyncMode,
+    db_max_rows: usize,
     show_busy: bool,
     emit_unchanged: bool,
 }
@@ -1092,11 +1143,14 @@ pub fn spawn_sync_engine(
         let mut profile_loaded = false;
         let mut last_tree_digest: Option<TreeDigest> = None;
         let mut next_active_id: u64 = 0;
-        // Database the user asked to refresh; its next fetch reads the whole database.
-        let explicit_db_refresh: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        // Database the user explicitly asked to refresh; remembered while staying focused on
+        // that database so the 5s background poll never clobbers a >250-row loaded database
+        // back to a truncated 250-row slice.
+        let expanded_db: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
         let start_active = |target: ActiveTarget,
                             mode: DetailSyncMode,
+                            explicit_db: bool,
                             show_busy: bool,
                             emit_unchanged: bool,
                             in_flight_active: &mut Option<InFlightActive>,
@@ -1105,9 +1159,32 @@ pub fn spawn_sync_engine(
                             loud_tree_busy: bool,
                             active_timer_armed: &mut bool,
                             next_active_id: &mut u64| {
+            let db_max_rows = match &target {
+                ActiveTarget::Database(did) => {
+                    let mut exp = expanded_db.lock().unwrap();
+                    if explicit_db {
+                        *exp = Some(did.clone());
+                        EXPLICIT_DATABASE_ROW_LIMIT
+                    } else if exp.as_deref() == Some(did.as_str()) {
+                        EXPLICIT_DATABASE_ROW_LIMIT
+                    } else {
+                        *exp = None;
+                        TUI_DATABASE_ROW_LIMIT
+                    }
+                }
+                ActiveTarget::Page(_) => {
+                    *expanded_db.lock().unwrap() = None;
+                    TUI_DATABASE_ROW_LIMIT
+                }
+            };
+
             if let Some(cur) = in_flight_active.as_mut() {
                 if cur.target == target {
-                    if cur.mode == DetailSyncMode::Force || mode == DetailSyncMode::Conditional {
+                    let needs_db_upgrade = matches!(target, ActiveTarget::Database(_))
+                        && db_max_rows > cur.db_max_rows;
+                    if !needs_db_upgrade
+                        && (cur.mode == DetailSyncMode::Force || mode == DetailSyncMode::Conditional)
+                    {
                         // Share the single in-flight network fetch and upgrade delivery/busy semantics.
                         cur.emit_unchanged |= emit_unchanged;
                         if show_busy && !cur.show_busy {
@@ -1130,7 +1207,7 @@ pub fn spawn_sync_engine(
                         }
                         return;
                     }
-                    // Upgrade an in-flight Conditional check for the same item to Force if needed.
+                    // Upgrade an in-flight Conditional check (or truncated DB poll) for the same item.
                     cur.emit_unchanged |= emit_unchanged;
                     let merged_busy = pending_active
                         .as_ref()
@@ -1140,9 +1217,14 @@ pub fn spawn_sync_engine(
                         .as_ref()
                         .filter(|p| p.target == target)
                         .map_or(emit_unchanged, |p| p.emit_unchanged || emit_unchanged);
+                    let merged_db_max = pending_active
+                        .as_ref()
+                        .filter(|p| p.target == target)
+                        .map_or(db_max_rows, |p| p.db_max_rows.max(db_max_rows));
                     *pending_active = Some(PendingActive {
                         target,
                         mode: DetailSyncMode::Force,
+                        db_max_rows: merged_db_max,
                         show_busy: merged_busy,
                         emit_unchanged: merged_emit,
                     });
@@ -1184,13 +1266,6 @@ pub fn spawn_sync_engine(
             let tx = event_tx.clone();
             let done_tx = active_done_tx.clone();
             let target_spawn = target.clone();
-            let explicit = explicit_db_refresh.lock().unwrap().take();
-            let db_max_rows = match (&target, explicit) {
-                (ActiveTarget::Database(did), Some(asked)) if *did == asked => {
-                    EXPLICIT_DATABASE_ROW_LIMIT
-                }
-                _ => TUI_DATABASE_ROW_LIMIT,
-            };
             let handle = tokio::spawn(async move {
                 let outcome = match target_spawn {
                     ActiveTarget::Page(ref pid) => {
@@ -1210,6 +1285,7 @@ pub fn spawn_sync_engine(
                 id: req_id,
                 target,
                 mode,
+                db_max_rows,
                 show_busy,
                 emit_unchanged,
                 handle,
@@ -1263,12 +1339,14 @@ pub fn spawn_sync_engine(
                                 &mut loud_tree_busy,
                             );
                             // Consume any pending focus change so RefreshAll fetches the
-                            // active page's block tree exactly once (no duplicate detail fetch).
+                            // active page/database exactly once with full explicit DB limit.
                             let focus = focus_rx.borrow_and_update().clone();
                             if let Some(target) = ActiveTarget::from_focus(&focus) {
+                                let explicit_db = matches!(target, ActiveTarget::Database(_));
                                 start_active(
                                     target,
                                     DetailSyncMode::Force,
+                                    explicit_db,
                                     true,
                                     true,
                                     &mut in_flight_active,
@@ -1300,6 +1378,7 @@ pub fn spawn_sync_engine(
                                 ActiveTarget::Page(page_id),
                                 DetailSyncMode::Force,
                                 false,
+                                false,
                                 true,
                                 &mut in_flight_active,
                                 &mut pending_active,
@@ -1315,10 +1394,10 @@ pub fn spawn_sync_engine(
                             {
                                 let _ = focus_rx.borrow_and_update();
                             }
-                            *explicit_db_refresh.lock().unwrap() = Some(database_id.clone());
                             start_active(
                                 ActiveTarget::Database(database_id),
                                 DetailSyncMode::Force,
+                                true,
                                 false,
                                 true,
                                 &mut in_flight_active,
@@ -1337,6 +1416,7 @@ pub fn spawn_sync_engine(
                     // set_focus so a single page open or attach never fetches the block tree twice.
                     let mut deferred_cmd = None;
                     let mut mode = DetailSyncMode::Conditional;
+                    let mut coalesced_explicit_db = false;
                     if let Ok(cmd) = cmd_rx.try_recv() {
                         match (&cmd, &focus.page_id, &focus.database_id) {
                             (SyncCommand::RefreshPage { page_id }, Some(fp), _) if page_id == fp => {
@@ -1344,6 +1424,7 @@ pub fn spawn_sync_engine(
                             }
                             (SyncCommand::RefreshDatabase { database_id }, _, Some(fd)) if database_id == fd => {
                                 mode = DetailSyncMode::Force;
+                                coalesced_explicit_db = true;
                             }
                             _ => {
                                 deferred_cmd = Some(cmd);
@@ -1361,9 +1442,11 @@ pub fn spawn_sync_engine(
                         );
                         let latest_focus = focus_rx.borrow_and_update().clone();
                         if let Some(target) = ActiveTarget::from_focus(&latest_focus) {
+                            let explicit_db = matches!(target, ActiveTarget::Database(_));
                             start_active(
                                 target,
                                 DetailSyncMode::Force,
+                                explicit_db,
                                 true,
                                 true,
                                 &mut in_flight_active,
@@ -1379,6 +1462,7 @@ pub fn spawn_sync_engine(
                             start_active(
                                 target,
                                 mode,
+                                coalesced_explicit_db,
                                 false,
                                 true,
                                 &mut in_flight_active,
@@ -1390,6 +1474,7 @@ pub fn spawn_sync_engine(
                             );
                         } else {
                             // Focus cleared (e.g., last daemon TUI client detached): stop active polling.
+                            *expanded_db.lock().unwrap() = None;
                             if let Some(cur) = in_flight_active.take() {
                                 cur.handle.abort();
                                 if cur.show_busy {
@@ -1424,6 +1509,7 @@ pub fn spawn_sync_engine(
                                         ActiveTarget::Page(page_id),
                                         DetailSyncMode::Force,
                                         false,
+                                        false,
                                         true,
                                         &mut in_flight_active,
                                         &mut pending_active,
@@ -1434,11 +1520,10 @@ pub fn spawn_sync_engine(
                                     );
                                 }
                                 SyncCommand::RefreshDatabase { database_id } => {
-                                    *explicit_db_refresh.lock().unwrap() =
-                                        Some(database_id.clone());
                                     start_active(
                                         ActiveTarget::Database(database_id),
                                         DetailSyncMode::Force,
+                                        true,
                                         false,
                                         true,
                                         &mut in_flight_active,
@@ -1531,9 +1616,11 @@ pub fn spawn_sync_engine(
                     }
 
                     if let Some(next) = next_pending {
+                        let next_explicit = next.db_max_rows >= EXPLICIT_DATABASE_ROW_LIMIT;
                         start_active(
                             next.target,
                             next.mode,
+                            next_explicit,
                             next.show_busy,
                             next.emit_unchanged,
                             &mut in_flight_active,
@@ -1603,6 +1690,7 @@ pub fn spawn_sync_engine(
                         start_active(
                             target,
                             DetailSyncMode::Force,
+                            false,
                             false,
                             false,
                             &mut in_flight_active,

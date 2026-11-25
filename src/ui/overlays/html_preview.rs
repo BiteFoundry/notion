@@ -90,6 +90,19 @@ impl HtmlPreviewOverlay {
         self.session.editing_input.is_some()
     }
 
+    pub fn toggle_raw_mode(&mut self) {
+        if self.session.editing_input.is_some() {
+            let _ = self.session.finish_editing();
+        }
+        let raw = self.session.toggle_raw_mode();
+        self.session.scroll_y = 0;
+        self.session.last_status = Some(if raw {
+            "Raw HTML source view".to_string()
+        } else {
+            "Rendered interactive view".to_string()
+        });
+    }
+
     pub fn modal_rect(area: Rect) -> Rect {
         centered_rect(
             area,
@@ -194,13 +207,7 @@ impl HtmlPreviewOverlay {
                 self.apply_effects(effs)
             }
             Action::Input('m') | Action::Input('M') => {
-                let raw = self.session.toggle_raw_mode();
-                self.session.scroll_y = 0;
-                self.session.last_status = Some(if raw {
-                    "Raw HTML source view".to_string()
-                } else {
-                    "Rendered interactive view".to_string()
-                });
+                self.toggle_raw_mode();
                 OverlayOutcome::Handled
             }
             Action::OpenActiveInBrowser | Action::Input('o') | Action::Input('O') => {

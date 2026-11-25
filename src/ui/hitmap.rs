@@ -56,6 +56,7 @@ pub enum HitTarget {
     CodeHtmlPreview(usize),
     DbViewTab(DatabaseViewMode),
     DbRow(usize),
+    DbBoardColumn(usize),
     DbBoardCard { col: usize, row: usize },
     Button(ButtonId),
     OverlayBody,

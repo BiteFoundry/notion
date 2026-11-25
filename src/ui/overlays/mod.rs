@@ -197,6 +197,12 @@ impl Overlay {
                     OverlayOutcome::Handled
                 }
                 Action::Activate | Action::OverlaySubmit => menu.activate(),
+                Action::RightClick { col, row } => {
+                    OverlayOutcome::CloseAndDispatch(Action::RightClick { col: *col, row: *row })
+                }
+                Action::OpenContextMenu { col, row } => {
+                    OverlayOutcome::CloseAndDispatch(Action::OpenContextMenu { col: *col, row: *row })
+                }
                 Action::CloseOverlay | Action::Input('q') => OverlayOutcome::Close,
                 Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
                 _ => OverlayOutcome::Handled,
@@ -724,7 +730,7 @@ mod tests {
         assert_eq!(preview_action, Action::Input('v'));
         assert_eq!(
             attachments.handle(&preview_action, &app, &ui),
-            OverlayOutcome::CloseAndDispatch(Action::OpenImagePreview)
+            OverlayOutcome::CloseAndDispatch(Action::OpenImagePreviewAt(0))
         );
     }
 }

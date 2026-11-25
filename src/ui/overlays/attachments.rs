@@ -101,7 +101,8 @@ impl AttachmentsState {
             }
             Action::Input('v') => {
                 if let Some(detail) = app.active_page_detail.as_ref() {
-                    if let Some(item) = self.media(app).get(self.selected.min(len.saturating_sub(1))) {
+                    let selected_idx = self.selected.min(len.saturating_sub(1));
+                    if let Some(item) = self.media(app).get(selected_idx) {
                         if is_html_media(item) {
                             return OverlayOutcome::CloseAndDispatch(Action::FetchHtmlPreview {
                                 title: item.display_name.clone(),
@@ -112,7 +113,9 @@ impl AttachmentsState {
                             });
                         }
                         if is_raster_image_media(item) {
-                            return OverlayOutcome::CloseAndDispatch(Action::OpenImagePreview);
+                            return OverlayOutcome::CloseAndDispatch(Action::OpenImagePreviewAt(
+                                selected_idx,
+                            ));
                         }
                         return OverlayOutcome::Dispatch(Action::ShowToast(format!(
                             "Preview unavailable for {} ({}) — press Enter/d to download",

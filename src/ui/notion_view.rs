@@ -1072,7 +1072,12 @@ fn render_block_lines(
                 theme,
                 ui.show_inline_hrefs,
             ));
-            out.push((Line::from(spans).style(sel_bg), Some(HitTarget::CanvasBlock(idx))));
+            let hit = if *is_toggleable {
+                HitTarget::ToggleBlock(idx)
+            } else {
+                HitTarget::CanvasBlock(idx)
+            };
+            out.push((Line::from(spans).style(sel_bg), Some(hit)));
             out.push((Line::from(""), None));
         }
         NotionBlockKind::Heading2 {
@@ -1094,7 +1099,12 @@ fn render_block_lines(
                 theme,
                 ui.show_inline_hrefs,
             ));
-            out.push((Line::from(spans).style(sel_bg), Some(HitTarget::CanvasBlock(idx))));
+            let hit = if *is_toggleable {
+                HitTarget::ToggleBlock(idx)
+            } else {
+                HitTarget::CanvasBlock(idx)
+            };
+            out.push((Line::from(spans).style(sel_bg), Some(hit)));
         }
         NotionBlockKind::Heading3 {
             rich_text,
@@ -1115,7 +1125,12 @@ fn render_block_lines(
                 theme,
                 ui.show_inline_hrefs,
             ));
-            out.push((Line::from(spans).style(sel_bg), Some(HitTarget::CanvasBlock(idx))));
+            let hit = if *is_toggleable {
+                HitTarget::ToggleBlock(idx)
+            } else {
+                HitTarget::CanvasBlock(idx)
+            };
+            out.push((Line::from(spans).style(sel_bg), Some(hit)));
         }
         NotionBlockKind::Paragraph { rich_text, .. } => {
             let mut spans = vec![cursor_gutter, Span::raw(indent)];
@@ -2198,11 +2213,13 @@ fn draw_db_board(
         return;
     }
 
+    let active_col = ui.db_board_col.min(cols.len().saturating_sub(1));
     let visible_cols = ((area.width as usize) / 24).clamp(1, cols.len().min(5));
-    let start_col = ui
-        .db_board_col
-        .saturating_sub(visible_cols.saturating_sub(1));
-    let slice = &cols[start_col..(start_col + visible_cols).min(cols.len())];
+    let start_col = active_col
+        .saturating_sub(visible_cols.saturating_sub(1))
+        .min(cols.len().saturating_sub(visible_cols));
+    let end_col = (start_col + visible_cols).min(cols.len());
+    let slice = &cols[start_col..end_col];
     let constraints: Vec<Constraint> = slice
         .iter()
         .map(|_| Constraint::Ratio(1, slice.len() as u32))
@@ -2216,7 +2233,7 @@ fn draw_db_board(
 
     for (rel_idx, (col, col_rect)) in slice.iter().zip(rects.iter()).enumerate() {
         let abs_col = start_col + rel_idx;
-        let is_active_col = focused && abs_col == ui.db_board_col;
+        let is_active_col = focused && abs_col == active_col;
         let inner = Rect::new(
             col_rect.x,
             col_rect.y,
@@ -2227,9 +2244,36 @@ fn draw_db_board(
             continue;
         }
 
-        // Pill header + card count
-        let pill_text = format!(" {} ", truncate_width(&col.label, inner.width.saturating_sub(8) as usize));
-        let count_text = format!("  {}", col.cards.len());
+        // Register column container hit target before cards so hovering headers or empty space
+        // below cards targets this column for mouse wheel scrolling and right-click menus.
+        hitmap.add(inner, HitTarget::DbBoardColumn(abs_col));
+
+        let cards_area_h = inner.height.saturating_sub(2) as usize;
+        let visible_cards = if cards_area_h < 3 {
+            0
+        } else {
+            (cards_area_h - 3) / 4 + 1
+        };
+        let active_row = ui.db_board_row.min(col.cards.len().saturating_sub(1));
+        let row_offset = if abs_col == active_col && visible_cards > 0 {
+            crate::ui::nav_pane::selection_offset(active_row, visible_cards, col.cards.len())
+        } else {
+            0
+        };
+
+        // Pill header + card count (with scroll cue when windowed)
+        let scroll_cue = if visible_cards > 0 && col.cards.len() > visible_cards {
+            let up = if row_offset > 0 { "↑" } else { "" };
+            let down = if row_offset + visible_cards < col.cards.len() { "↓" } else { "" };
+            format!(" {up}{down}")
+        } else {
+            String::new()
+        };
+        let pill_text = format!(
+            " {} ",
+            truncate_width(&col.label, inner.width.saturating_sub(10) as usize)
+        );
+        let count_text = format!("  {}{scroll_cue}", col.cards.len());
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
@@ -2242,12 +2286,18 @@ fn draw_db_board(
         );
 
         let mut y = inner.y + 2;
-        for (row_idx, card) in col.cards.iter().enumerate() {
+        for (row_idx, card) in col
+            .cards
+            .iter()
+            .enumerate()
+            .skip(row_offset)
+            .take(visible_cards)
+        {
             if y + 3 > inner.bottom() {
                 break;
             }
             let card_rect = Rect::new(inner.x, y, inner.width, 3);
-            let is_sel = is_active_col && row_idx == ui.db_board_row;
+            let is_sel = is_active_col && row_idx == active_row;
             let card_bg = if is_sel {
                 theme.bg_selected
             } else {

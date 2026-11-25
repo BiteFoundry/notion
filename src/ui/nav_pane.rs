@@ -54,7 +54,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     }
 
     let visible_rows = area.height as usize;
-    let selected = ui.sidebar_selected.min(items.len().saturating_sub(1));
+    let raw_selected = ui.sidebar_selected.min(items.len().saturating_sub(1));
+    let selected = if items[raw_selected].is_section_header {
+        ((raw_selected + 1)..items.len())
+            .find(|&i| !items[i].is_section_header)
+            .or_else(|| (0..raw_selected).rev().find(|&i| !items[i].is_section_header))
+            .unwrap_or(raw_selected)
+    } else {
+        raw_selected
+    };
     let offset = selection_offset(selected, visible_rows, items.len());
     let show_scrollbar = items.len() > visible_rows && area.width >= 8;
     let content_w = if show_scrollbar {
