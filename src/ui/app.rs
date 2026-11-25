@@ -16,16 +16,19 @@ use crate::{
         RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol, MAX_IMAGE_CACHE_BYTES,
     },
     models::{
-        CoreEvent, DatabaseSortMode, DatabaseViewMode, NotionBlock, NotionBlockKind, NotionColor,
-        NotionComment, NotionDatabase, NotionPage, NotionPageDetail, NotionPageSummary, NotionPropertyValue,
-        NotionUser, POLL_RETRY_SUMMARY,
+        spans_plain_text, CoreEvent, DatabaseSortMode, DatabaseViewMode, NotionBlock,
+        NotionBlockKind, NotionColor, NotionComment, NotionDatabase, NotionPage, NotionPageDetail,
+        NotionPageSummary, NotionPropertyValue, NotionUser, RichTextSpan, POLL_RETRY_SUMMARY,
     },
     notion::NotionClient,
-    parser::apply_optimistic_markdown_to_detail,
+    parser::{
+        apply_optimistic_markdown_to_detail, notion::rich_text_to_markdown,
+        parse_inline_markdown_rich_text, parse_rich_text_array,
+    },
     storage::Storage,
     sync::{FocusTarget, SyncCommand, SyncController},
     ui::{
-        composer::{normalize, MultiLineComposer},
+        composer::{normalize, text_layout, MultiLineComposer},
         hitmap::HitMap,
         keymap::KeyMap,
         overlays::Overlay,
@@ -159,6 +162,297 @@ impl InlinePageEditor {
         self.composer.set_cursor(byte_pos);
         self.follow_cursor = true;
         true
+    }
+}
+
+/// Initial cursor placement when entering Notion Native Block-Live editing on a block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockCursorInit {
+    Start,
+    End,
+    ScreenPos { col: u16, row: u16 },
+}
+
+/// Screen layout of a rendered block on the Notion Page Canvas (rebuilt each frame).
+#[derive(Debug, Clone)]
+pub struct CanvasBlockLayout {
+    pub visible_idx: usize,
+    pub block_id: String,
+    pub first_screen_row: u16,
+    pub last_screen_row: u16,
+    /// First screen row of the editable text (equals `first_screen_row`, except Code blocks where header is above).
+    pub text_first_screen_row: u16,
+    /// Screen X where editable text begins on the first text line (after gutter, indent, marker/checkbox/triangle).
+    pub first_text_x: u16,
+    /// Screen X where editable text begins on wrapped continuation lines.
+    pub cont_text_x: u16,
+    /// Effective text wrap width in columns.
+    pub text_width: u16,
+    /// Whether `[0..first_text_x)` on `first_screen_row` contains a leading checkbox or toggle triangle.
+    pub has_leading_toggle: bool,
+}
+
+/// Clickable inline rich-text hyperlink rendered inside a Page Canvas block.
+#[derive(Debug, Clone)]
+pub struct CanvasLinkHit {
+    pub rect: Rect,
+    pub url: String,
+}
+
+/// In-place Notion Native Block-Live editor: edits a single block directly inside the rendered
+/// Page Canvas while all other blocks stay 100% rendered.
+#[derive(Debug, Clone)]
+pub struct InlineBlockEditor {
+    pub page_id: String,
+    pub block_id: String,
+    pub block_type: String,
+    pub kind: NotionBlockKind,
+    pub depth: usize,
+    pub numbered_index: usize,
+    pub is_toggle_open: bool,
+    pub composer: MultiLineComposer,
+    pub last_text_x: u16,
+    pub last_first_screen_row: u16,
+    pub last_screen_rows: u16,
+    pub last_wrap_width: u16,
+    pub last_visual_lines: Vec<(usize, usize)>,
+    pub last_cursor_visual_row: usize,
+    pub dirty: bool,
+}
+
+impl InlineBlockEditor {
+    pub fn from_visible(page_id: impl Into<String>, vblk: &VisibleBlock) -> Self {
+        let initial_text = normalize(&block_editable_text(&vblk.block.kind));
+        let mut composer = MultiLineComposer::new();
+        composer.load_text(&initial_text);
+        Self {
+            page_id: page_id.into(),
+            block_id: vblk.block.id.clone(),
+            block_type: block_type_for_kind(&vblk.block.kind).to_string(),
+            kind: vblk.block.kind.clone(),
+            depth: vblk.depth,
+            numbered_index: vblk.numbered_index,
+            is_toggle_open: vblk.is_toggle_open,
+            composer,
+            last_text_x: 0,
+            last_first_screen_row: 0,
+            last_screen_rows: 1,
+            last_wrap_width: 72,
+            last_visual_lines: Vec::new(),
+            last_cursor_visual_row: 0,
+            dirty: false,
+        }
+    }
+
+    pub fn is_code(&self) -> bool {
+        matches!(self.kind, NotionBlockKind::Code { .. })
+    }
+
+    pub fn effective_wrap_width(&self) -> usize {
+        self.last_wrap_width.max(1) as usize
+    }
+
+    pub fn visual_layout(&self) -> (Vec<(usize, usize)>, usize, usize) {
+        text_layout(
+            self.composer.text(),
+            self.effective_wrap_width(),
+            self.composer.cursor(),
+        )
+    }
+
+    /// Maps a visual line `(start, end)` and display column `target_col` to the closest UTF-8 byte offset.
+    pub fn byte_at_display_col(text: &str, start: usize, end: usize, target_col: usize) -> usize {
+        let slice = text.get(start..end).unwrap_or("");
+        let mut used = 0usize;
+        for (offset, ch) in slice.char_indices() {
+            let w = if ch == '\t' {
+                4
+            } else {
+                UnicodeWidthChar::width(ch).unwrap_or(0)
+            };
+            if target_col < used + w.max(1) {
+                return start + offset;
+            }
+            used += w;
+        }
+        end
+    }
+
+    /// Places cursor at `(col, row)` using the last rendered screen geometry of this active block.
+    pub fn place_cursor_at_screen_pos(&mut self, col: u16, row: u16) -> bool {
+        let text = self.composer.text();
+        let wrap_w = self.effective_wrap_width();
+        let visual = if self.last_visual_lines.is_empty() {
+            text_layout(text, wrap_w, self.composer.cursor()).0
+        } else {
+            self.last_visual_lines.clone()
+        };
+        let byte_pos = if row < self.last_first_screen_row {
+            0
+        } else {
+            let rel_row = (row - self.last_first_screen_row) as usize;
+            let rel_col = col.saturating_sub(self.last_text_x) as usize;
+            if let Some(&(start, end)) = visual.get(rel_row) {
+                Self::byte_at_display_col(text, start, end, rel_col)
+            } else {
+                text.len()
+            }
+        };
+        self.composer.set_cursor(byte_pos);
+        true
+    }
+
+    /// Places cursor at `(col, row)` using a `CanvasBlockLayout` captured while the block was rendered.
+    pub fn place_cursor_from_layout(&mut self, col: u16, row: u16, layout: &CanvasBlockLayout) {
+        self.last_text_x = layout.first_text_x;
+        self.last_first_screen_row = layout.text_first_screen_row;
+        self.last_wrap_width = layout.text_width.max(1);
+        let text = self.composer.text();
+        let (visual, _, _) = text_layout(text, self.last_wrap_width as usize, 0);
+        self.last_visual_lines = visual.clone();
+        let byte_pos = if row < layout.text_first_screen_row {
+            0
+        } else {
+            let rel_row = (row - layout.text_first_screen_row) as usize;
+            let base_x = if rel_row == 0 {
+                layout.first_text_x
+            } else {
+                layout.cont_text_x
+            };
+            let rel_col = col.saturating_sub(base_x) as usize;
+            if let Some(&(start, end)) = visual.get(rel_row) {
+                Self::byte_at_display_col(text, start, end, rel_col)
+            } else {
+                text.len()
+            }
+        };
+        self.composer.set_cursor(byte_pos);
+    }
+
+    /// Moves cursor up one visual line inside the block; returns `false` if already on the first visual line.
+    pub fn move_visual_up(&mut self) -> bool {
+        let (visual, cursor_row, cursor_col) = self.visual_layout();
+        if cursor_row == 0 {
+            return false;
+        }
+        let (start, end) = visual[cursor_row - 1];
+        let target = Self::byte_at_display_col(self.composer.text(), start, end, cursor_col);
+        self.composer.set_cursor(target);
+        true
+    }
+
+    /// Moves cursor down one visual line inside the block; returns `false` if already on the last visual line.
+    pub fn move_visual_down(&mut self) -> bool {
+        let (visual, cursor_row, cursor_col) = self.visual_layout();
+        if cursor_row + 1 >= visual.len() {
+            return false;
+        }
+        let (start, end) = visual[cursor_row + 1];
+        let target = Self::byte_at_display_col(self.composer.text(), start, end, cursor_col);
+        self.composer.set_cursor(target);
+        true
+    }
+}
+
+/// Returns `true` for all Notion block kinds that support live in-place inline text editing.
+pub fn is_block_inline_editable(kind: &NotionBlockKind) -> bool {
+    matches!(
+        kind,
+        NotionBlockKind::Paragraph { .. }
+            | NotionBlockKind::Heading1 { .. }
+            | NotionBlockKind::Heading2 { .. }
+            | NotionBlockKind::Heading3 { .. }
+            | NotionBlockKind::BulletedListItem { .. }
+            | NotionBlockKind::NumberedListItem { .. }
+            | NotionBlockKind::ToDo { .. }
+            | NotionBlockKind::Toggle { .. }
+            | NotionBlockKind::Callout { .. }
+            | NotionBlockKind::Quote { .. }
+            | NotionBlockKind::Code { .. }
+    )
+}
+
+/// Returns `true` for block kinds where pressing `Enter` in Canvas directly opens inline block edit
+/// (toggle blocks keep `Enter` expanding/collapsing while `i` or text click edits them).
+pub fn is_block_enter_editable(kind: &NotionBlockKind) -> bool {
+    match kind {
+        NotionBlockKind::Heading1 { is_toggleable, .. }
+        | NotionBlockKind::Heading2 { is_toggleable, .. }
+        | NotionBlockKind::Heading3 { is_toggleable, .. } => !is_toggleable,
+        NotionBlockKind::Paragraph { .. }
+        | NotionBlockKind::BulletedListItem { .. }
+        | NotionBlockKind::NumberedListItem { .. }
+        | NotionBlockKind::ToDo { .. }
+        | NotionBlockKind::Callout { .. }
+        | NotionBlockKind::Quote { .. }
+        | NotionBlockKind::Code { .. } => true,
+        _ => false,
+    }
+}
+
+pub fn block_type_for_kind(kind: &NotionBlockKind) -> &'static str {
+    match kind {
+        NotionBlockKind::Paragraph { .. } => "paragraph",
+        NotionBlockKind::Heading1 { .. } => "heading_1",
+        NotionBlockKind::Heading2 { .. } => "heading_2",
+        NotionBlockKind::Heading3 { .. } => "heading_3",
+        NotionBlockKind::BulletedListItem { .. } => "bulleted_list_item",
+        NotionBlockKind::NumberedListItem { .. } => "numbered_list_item",
+        NotionBlockKind::ToDo { .. } => "to_do",
+        NotionBlockKind::Toggle { .. } => "toggle",
+        NotionBlockKind::Callout { .. } => "callout",
+        NotionBlockKind::Quote { .. } => "quote",
+        NotionBlockKind::Code { .. } => "code",
+        _ => "paragraph",
+    }
+}
+
+pub fn block_editable_text(kind: &NotionBlockKind) -> String {
+    match kind {
+        NotionBlockKind::Code { rich_text, .. } => spans_plain_text(rich_text),
+        NotionBlockKind::Paragraph { rich_text, .. }
+        | NotionBlockKind::Heading1 { rich_text, .. }
+        | NotionBlockKind::Heading2 { rich_text, .. }
+        | NotionBlockKind::Heading3 { rich_text, .. }
+        | NotionBlockKind::BulletedListItem { rich_text, .. }
+        | NotionBlockKind::NumberedListItem { rich_text, .. }
+        | NotionBlockKind::ToDo { rich_text, .. }
+        | NotionBlockKind::Toggle { rich_text, .. }
+        | NotionBlockKind::Callout { rich_text, .. }
+        | NotionBlockKind::Quote { rich_text, .. } => rich_text_to_markdown(rich_text),
+        _ => String::new(),
+    }
+}
+
+pub fn text_to_rich_spans(text: &str, is_code: bool) -> Vec<RichTextSpan> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if is_code {
+        return vec![RichTextSpan::plain(text)];
+    }
+    let vals = parse_inline_markdown_rich_text(text);
+    parse_rich_text_array(Some(&serde_json::Value::Array(vals)))
+}
+
+pub fn apply_text_to_block_kind(kind: &mut NotionBlockKind, text: &str) {
+    let is_code = matches!(kind, NotionBlockKind::Code { .. });
+    let spans = text_to_rich_spans(text, is_code);
+    match kind {
+        NotionBlockKind::Paragraph { rich_text, .. }
+        | NotionBlockKind::Heading1 { rich_text, .. }
+        | NotionBlockKind::Heading2 { rich_text, .. }
+        | NotionBlockKind::Heading3 { rich_text, .. }
+        | NotionBlockKind::BulletedListItem { rich_text, .. }
+        | NotionBlockKind::NumberedListItem { rich_text, .. }
+        | NotionBlockKind::ToDo { rich_text, .. }
+        | NotionBlockKind::Toggle { rich_text, .. }
+        | NotionBlockKind::Callout { rich_text, .. }
+        | NotionBlockKind::Quote { rich_text, .. }
+        | NotionBlockKind::Code { rich_text, .. } => {
+            *rich_text = spans;
+        }
+        _ => {}
     }
 }
 
@@ -345,6 +639,11 @@ pub struct UiState {
     pub tasks: TaskBoard,
     pub overlays: Vec<Overlay>,
     pub inline_editor: Option<InlinePageEditor>,
+    pub block_editor: Option<InlineBlockEditor>,
+    pub canvas_block_layouts: Vec<CanvasBlockLayout>,
+    pub canvas_link_hits: Vec<CanvasLinkHit>,
+    pub page_confirmed_blocks: HashMap<String, Vec<NotionBlock>>,
+    pub optimistic_block_seq: u64,
     pub cursor_pos: Option<(u16, u16)>,
     pub page_edit_generations: HashMap<String, u64>,
     pub page_synced_generations: HashMap<String, u64>,
@@ -406,6 +705,11 @@ impl UiState {
             tasks: TaskBoard::default(),
             overlays: Vec::new(),
             inline_editor: None,
+            block_editor: None,
+            canvas_block_layouts: Vec::new(),
+            canvas_link_hits: Vec::new(),
+            page_confirmed_blocks: HashMap::new(),
+            optimistic_block_seq: 0,
             cursor_pos: None,
             page_edit_generations: HashMap::new(),
             page_synced_generations: HashMap::new(),
@@ -453,7 +757,9 @@ impl UiState {
         if let Some(top) = self.overlays.last() {
             return top.accepts_text();
         }
-        if self.inline_editor.is_some() && self.focus == Focus::Canvas {
+        if (self.inline_editor.is_some() || self.block_editor.is_some())
+            && self.focus == Focus::Canvas
+        {
             return true;
         }
         self.focus == Focus::Comments
@@ -657,6 +963,9 @@ impl AppState {
     }
 
     pub fn try_open_page(&mut self, page_id: &str, ui: &mut UiState, push_history: bool) -> bool {
+        if ui.block_editor.is_some() {
+            self.commit_and_sync_block_editor(ui, true);
+        }
         if ui.inline_editor.is_some() && !self.close_inline_editor_and_flush(ui) {
             ui.focus = Focus::Canvas;
             ui.warning("Resolve or discard inline edits (Esc x2) before switching pages");
@@ -711,6 +1020,9 @@ impl AppState {
         ui: &mut UiState,
         push_history: bool,
     ) -> bool {
+        if ui.block_editor.is_some() {
+            self.commit_and_sync_block_editor(ui, true);
+        }
         if ui.inline_editor.is_some() && !self.close_inline_editor_and_flush(ui) {
             ui.focus = Focus::Canvas;
             ui.warning("Resolve or discard inline edits (Esc x2) before switching databases");
@@ -787,6 +1099,9 @@ impl AppState {
 
     /// Opens the in-place inline Markdown editor directly inside the Page Canvas pane.
     pub fn open_inline_editor(&mut self, ui: &mut UiState) -> bool {
+        if ui.block_editor.is_some() {
+            self.commit_and_sync_block_editor(ui, true);
+        }
         if self.active_view != CanvasView::Page {
             return false;
         }
@@ -1053,6 +1368,526 @@ impl AppState {
         true
     }
 
+    // ------------------------------------------------------------------
+    // Notion Native Block-Live Flow (Single-Block In-Place Editing)
+    // ------------------------------------------------------------------
+
+    /// Captures the server-confirmed block tree baseline for `page_id` before the first optimistic
+    /// block-live mutation, if not already cached and if all block IDs are real Notion IDs.
+    fn ensure_page_confirmed_baseline(&self, ui: &mut UiState, page_id: &str) {
+        if ui.page_confirmed_blocks.contains_key(page_id) {
+            return;
+        }
+        if let Some(detail) = self.active_page_detail.as_ref().filter(|d| d.page.id == page_id) {
+            if !detail.blocks.is_empty() && all_blocks_have_server_ids(&detail.blocks) {
+                ui.page_confirmed_blocks
+                    .insert(page_id.to_string(), detail.blocks.clone());
+            }
+        }
+    }
+
+    /// Opens Notion Native Block-Live editing directly IN PLACE on visible block `visible_idx`,
+    /// keeping all other blocks on the page 100% rendered.
+    pub fn open_block_editor(
+        &mut self,
+        ui: &mut UiState,
+        visible_idx: usize,
+        cursor_init: BlockCursorInit,
+    ) -> bool {
+        if self.active_view != CanvasView::Page || ui.inline_editor.is_some() {
+            return false;
+        }
+        let Some(page_id) = self.active_page_detail.as_ref().map(|d| d.page.id.clone()) else {
+            return false;
+        };
+        let visible = self.visible_blocks(ui);
+        let Some(vblk) = visible.get(visible_idx).cloned() else {
+            return false;
+        };
+        if !is_block_inline_editable(&vblk.block.kind) {
+            return false;
+        }
+
+        // If already editing this exact block, just reposition the cursor without losing undo state.
+        if let Some(existing) = ui
+            .block_editor
+            .as_mut()
+            .filter(|b| b.page_id == page_id && b.block_id == vblk.block.id)
+        {
+            ui.selected_block = visible_idx;
+            ui.focus = Focus::Canvas;
+            ui.narrow_pane = NarrowPane::Canvas;
+            match cursor_init {
+                BlockCursorInit::Start => existing.composer.set_cursor(0),
+                BlockCursorInit::End => existing.composer.move_doc_end(false),
+                BlockCursorInit::ScreenPos { col, row } => {
+                    existing.place_cursor_at_screen_pos(col, row);
+                }
+            }
+            return true;
+        }
+
+        // Commit any previously active block before switching to a different block.
+        if ui.block_editor.is_some() {
+            self.commit_and_sync_block_editor(ui, true);
+        }
+
+        self.ensure_page_confirmed_baseline(ui, &page_id);
+
+        // Re-fetch visible block in case committing updated the tree.
+        let visible = self.visible_blocks(ui);
+        let target_idx = visible
+            .iter()
+            .position(|vb| vb.block.id == vblk.block.id)
+            .unwrap_or_else(|| visible_idx.min(visible.len().saturating_sub(1)));
+        let Some(target_vblk) = visible.get(target_idx) else {
+            return false;
+        };
+        if !is_block_inline_editable(&target_vblk.block.kind) {
+            return false;
+        }
+
+        let mut editor = InlineBlockEditor::from_visible(page_id, target_vblk);
+        let layout = ui
+            .canvas_block_layouts
+            .iter()
+            .find(|l| l.block_id == target_vblk.block.id || l.visible_idx == target_idx)
+            .cloned();
+        if let Some(ref lay) = layout {
+            editor.last_text_x = lay.first_text_x;
+            editor.last_first_screen_row = lay.text_first_screen_row;
+            editor.last_wrap_width = lay.text_width.max(1);
+        }
+        match cursor_init {
+            BlockCursorInit::Start => editor.composer.set_cursor(0),
+            BlockCursorInit::End => editor.composer.move_doc_end(false),
+            BlockCursorInit::ScreenPos { col, row } => {
+                if let Some(ref lay) = layout {
+                    editor.place_cursor_from_layout(col, row, lay);
+                } else {
+                    editor.composer.move_doc_end(false);
+                }
+            }
+        }
+
+        ui.selected_block = target_idx;
+        ui.canvas_follow_selected = true;
+        ui.block_editor = Some(editor);
+        ui.focus = Focus::Canvas;
+        ui.narrow_pane = NarrowPane::Canvas;
+        true
+    }
+
+    /// Immediately reflects the active `InlineBlockEditor`'s text and kind into
+    /// `self.active_page_detail` (0ms optimistic local state, never touching SQLite).
+    pub fn sync_active_block_to_detail(&mut self, ui: &mut UiState) {
+        let Some(bed) = ui.block_editor.as_mut() else {
+            return;
+        };
+        let text = bed.composer.text().to_string();
+        apply_text_to_block_kind(&mut bed.kind, &text);
+        let page_id = bed.page_id.clone();
+        let block_id = bed.block_id.clone();
+        let new_type = bed.block_type.clone();
+        let new_kind = bed.kind.clone();
+
+        if let Some(ref mut detail) = self.active_page_detail {
+            if detail.page.id == page_id {
+                if update_block_in_tree(&mut detail.blocks, &block_id, &new_type, &new_kind) {
+                    detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
+                    detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
+                }
+            }
+        }
+    }
+
+    /// While editing a `Paragraph` block, converts live Markdown prefixes typed at the start
+    /// (`# `, `## `, `### `, `- `, `* `, `[] `, `[ ] `, `> `) into the corresponding Notion block
+    /// kind in 0ms, stripping the prefix and preserving any text after the cursor.
+    pub fn try_convert_block_markdown_prefix(&mut self, ui: &mut UiState) -> bool {
+        let converted = {
+            let Some(bed) = ui.block_editor.as_mut() else {
+                return false;
+            };
+            let NotionBlockKind::Paragraph { color, .. } = bed.kind else {
+                return false;
+            };
+            let text = bed.composer.text();
+            let cursor = bed.composer.cursor().min(text.len());
+            if !text.is_char_boundary(cursor) {
+                return false;
+            }
+            let prefix = &text[..cursor];
+            let next_spec: Option<(&'static str, NotionBlockKind)> = match prefix {
+                "# " => Some((
+                    "heading_1",
+                    NotionBlockKind::Heading1 {
+                        rich_text: Vec::new(),
+                        is_toggleable: false,
+                        color,
+                    },
+                )),
+                "## " => Some((
+                    "heading_2",
+                    NotionBlockKind::Heading2 {
+                        rich_text: Vec::new(),
+                        is_toggleable: false,
+                        color,
+                    },
+                )),
+                "### " => Some((
+                    "heading_3",
+                    NotionBlockKind::Heading3 {
+                        rich_text: Vec::new(),
+                        is_toggleable: false,
+                        color,
+                    },
+                )),
+                "- " | "* " => Some((
+                    "bulleted_list_item",
+                    NotionBlockKind::BulletedListItem {
+                        rich_text: Vec::new(),
+                        color,
+                    },
+                )),
+                "[] " | "[ ] " => Some((
+                    "to_do",
+                    NotionBlockKind::ToDo {
+                        rich_text: Vec::new(),
+                        checked: false,
+                        color,
+                    },
+                )),
+                "> " => Some((
+                    "quote",
+                    NotionBlockKind::Quote {
+                        rich_text: Vec::new(),
+                        color,
+                    },
+                )),
+                _ => None,
+            };
+            if let Some((new_type, mut new_kind)) = next_spec {
+                let remainder = text[cursor..].to_string();
+                apply_text_to_block_kind(&mut new_kind, &remainder);
+                bed.block_type = new_type.to_string();
+                bed.kind = new_kind;
+                bed.composer.load_text_cursor_start(&remainder);
+                bed.dirty = true;
+                true
+            } else {
+                false
+            }
+        };
+        if converted {
+            self.sync_active_block_to_detail(ui);
+        }
+        converted
+    }
+
+    /// Pressing Backspace at cursor 0 of a Heading/List/To-Do/Quote converts it cleanly back to Paragraph.
+    pub fn try_revert_block_to_paragraph_on_backspace(&mut self, ui: &mut UiState) -> bool {
+        let reverted = {
+            let Some(bed) = ui.block_editor.as_mut() else {
+                return false;
+            };
+            if bed.composer.cursor() != 0 || bed.composer.has_selection() {
+                return false;
+            }
+            let color = match bed.kind {
+                NotionBlockKind::Heading1 { color, .. }
+                | NotionBlockKind::Heading2 { color, .. }
+                | NotionBlockKind::Heading3 { color, .. }
+                | NotionBlockKind::BulletedListItem { color, .. }
+                | NotionBlockKind::NumberedListItem { color, .. }
+                | NotionBlockKind::ToDo { color, .. }
+                | NotionBlockKind::Quote { color, .. } => color,
+                _ => return false,
+            };
+            let text = bed.composer.text().to_string();
+            let mut kind = NotionBlockKind::Paragraph {
+                rich_text: Vec::new(),
+                color,
+            };
+            apply_text_to_block_kind(&mut kind, &text);
+            bed.block_type = "paragraph".to_string();
+            bed.kind = kind;
+            bed.dirty = true;
+            true
+        };
+        if reverted {
+            self.sync_active_block_to_detail(ui);
+        }
+        reverted
+    }
+
+    /// Commits the current non-Code block on `Enter`, splitting text after cursor (or inserting an
+    /// empty sibling block below when at end) in 0ms, triggers coalesced background Notion sync,
+    /// and moves inline editing focus directly into the newly created sibling block.
+    pub fn split_active_block_on_enter(&mut self, ui: &mut UiState) -> bool {
+        let Some(bed) = ui.block_editor.as_ref() else {
+            return false;
+        };
+        if bed.is_code() {
+            return false;
+        }
+        let page_id = bed.page_id.clone();
+        let current_block_id = bed.block_id.clone();
+        let current_kind = bed.kind.clone();
+        let current_type = bed.block_type.clone();
+        let text = bed.composer.text().to_string();
+        let split_pos = bed.composer.cursor().min(text.len());
+        let split_pos = if text.is_char_boundary(split_pos) {
+            split_pos
+        } else {
+            text.len()
+        };
+        let before = text[..split_pos].to_string();
+        let after = text[split_pos..].to_string();
+
+        self.ensure_page_confirmed_baseline(ui, &page_id);
+
+        let mut updated_current_kind = current_kind.clone();
+        apply_text_to_block_kind(&mut updated_current_kind, &before);
+
+        // Determine sibling block kind (Notion-native: headings/quotes/callouts continue as paragraph;
+        // lists and to-dos continue with the same list/to-do kind).
+        let (next_type, mut next_kind) = match &current_kind {
+            NotionBlockKind::BulletedListItem { color, .. } if !before.is_empty() || !after.is_empty() => (
+                "bulleted_list_item".to_string(),
+                NotionBlockKind::BulletedListItem {
+                    rich_text: Vec::new(),
+                    color: *color,
+                },
+            ),
+            NotionBlockKind::NumberedListItem { color, .. } if !before.is_empty() || !after.is_empty() => (
+                "numbered_list_item".to_string(),
+                NotionBlockKind::NumberedListItem {
+                    rich_text: Vec::new(),
+                    color: *color,
+                },
+            ),
+            NotionBlockKind::ToDo { color, .. } if !before.is_empty() || !after.is_empty() => (
+                "to_do".to_string(),
+                NotionBlockKind::ToDo {
+                    rich_text: Vec::new(),
+                    checked: false,
+                    color: *color,
+                },
+            ),
+            _ => (
+                "paragraph".to_string(),
+                NotionBlockKind::Paragraph {
+                    rich_text: Vec::new(),
+                    color: NotionColor::Default,
+                },
+            ),
+        };
+        apply_text_to_block_kind(&mut next_kind, &after);
+
+        ui.optimistic_block_seq = ui.optimistic_block_seq.saturating_add(1);
+        let new_block_id = format!("__optimistic_live_{}_{}", page_id, ui.optimistic_block_seq);
+        let parent_block_id = self
+            .active_page_detail
+            .as_ref()
+            .and_then(|d| find_parent_block_id_in_tree(&d.blocks, &current_block_id));
+
+        let new_block = NotionBlock {
+            id: new_block_id.clone(),
+            page_id: page_id.clone(),
+            parent_block_id,
+            block_type: next_type.clone(),
+            has_children: false,
+            archived: false,
+            kind: next_kind.clone(),
+            children: Vec::new(),
+        };
+
+        if let Some(ref mut detail) = self.active_page_detail {
+            if detail.page.id == page_id {
+                update_block_in_tree(
+                    &mut detail.blocks,
+                    &current_block_id,
+                    &current_type,
+                    &updated_current_kind,
+                );
+                if !insert_sibling_after_in_tree(&mut detail.blocks, &current_block_id, new_block) {
+                    return false;
+                }
+                detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
+                detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
+            }
+        } else {
+            return false;
+        }
+
+        // Sync the committed edit + split to Notion in background (safely coalesced).
+        self.sync_block_live_page(ui, &page_id);
+
+        // Move inline editing focus directly into the newly inserted sibling block at cursor 0.
+        let visible = self.visible_blocks(ui);
+        if let Some(new_vis_idx) = visible.iter().position(|vb| vb.block.id == new_block_id) {
+            let mut next_ed = InlineBlockEditor::from_visible(page_id, &visible[new_vis_idx]);
+            next_ed.composer.set_cursor(0);
+            next_ed.dirty = !after.is_empty();
+            if let Some(prev_ed) = ui.block_editor.as_ref() {
+                next_ed.last_wrap_width = prev_ed.last_wrap_width;
+                next_ed.last_text_x = prev_ed.last_text_x;
+            }
+            ui.block_editor = Some(next_ed);
+            ui.selected_block = new_vis_idx;
+            ui.canvas_follow_selected = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Seamlessly moves inline block editing to the previous (`direction < 0`, cursor at end)
+    /// or next (`direction > 0`, cursor at start) editable block, flushing/optimistically saving
+    /// the current block first.
+    pub fn navigate_block_editor(&mut self, ui: &mut UiState, direction: isize) -> bool {
+        let Some((page_id, current_id, was_dirty)) = ui
+            .block_editor
+            .as_ref()
+            .map(|b| (b.page_id.clone(), b.block_id.clone(), b.dirty))
+        else {
+            return false;
+        };
+
+        self.sync_active_block_to_detail(ui);
+        let visible = self.visible_blocks(ui);
+        let Some(cur_idx) = visible.iter().position(|vb| vb.block.id == current_id) else {
+            return false;
+        };
+
+        let target_idx = if direction < 0 {
+            (0..cur_idx)
+                .rev()
+                .find(|&i| is_block_inline_editable(&visible[i].block.kind))
+        } else {
+            ((cur_idx + 1)..visible.len())
+                .find(|&i| is_block_inline_editable(&visible[i].block.kind))
+        };
+
+        let Some(next_idx) = target_idx else {
+            if let Some(bed) = ui.block_editor.as_mut() {
+                if direction < 0 {
+                    bed.composer.set_cursor(0);
+                } else {
+                    bed.composer.move_doc_end(false);
+                }
+            }
+            return false;
+        };
+
+        if was_dirty {
+            self.sync_block_live_page(ui, &page_id);
+        }
+
+        let target_vblk = visible[next_idx].clone();
+        let mut next_ed = InlineBlockEditor::from_visible(page_id, &target_vblk);
+        if direction < 0 {
+            next_ed.composer.move_doc_end(false);
+        } else {
+            next_ed.composer.set_cursor(0);
+        }
+        if let Some(lay) = ui
+            .canvas_block_layouts
+            .iter()
+            .find(|l| l.block_id == target_vblk.block.id)
+        {
+            next_ed.last_text_x = lay.first_text_x;
+            next_ed.last_first_screen_row = lay.text_first_screen_row;
+            next_ed.last_wrap_width = lay.text_width.max(1);
+        }
+        ui.block_editor = Some(next_ed);
+        ui.selected_block = next_idx;
+        ui.canvas_follow_selected = true;
+        true
+    }
+
+    /// Commits the active block editor's changes into `active_page_detail`, dispatches background
+    /// sync if dirty, and optionally closes `ui.block_editor`.
+    pub fn commit_and_sync_block_editor(&mut self, ui: &mut UiState, close_after: bool) -> bool {
+        let Some((page_id, dirty)) = ui
+            .block_editor
+            .as_ref()
+            .map(|b| (b.page_id.clone(), b.dirty))
+        else {
+            return false;
+        };
+        self.sync_active_block_to_detail(ui);
+        let synced = if dirty {
+            self.sync_block_live_page(ui, &page_id)
+        } else {
+            false
+        };
+        if close_after {
+            ui.block_editor = None;
+            ui.cursor_pos = None;
+        } else if let Some(bed) = ui.block_editor.as_mut() {
+            bed.dirty = false;
+        }
+        synced
+    }
+
+    /// Coalesced background diff-sync for Notion Native Block-Live edits. Safe to call even while
+    /// a previous sync is in flight or when new blocks still have `__optimistic_live_*` IDs.
+    pub fn sync_block_live_page(&mut self, ui: &mut UiState, page_id: &str) -> bool {
+        let Some(detail) = self.active_page_detail.as_ref().filter(|d| d.page.id == page_id) else {
+            return false;
+        };
+        let edited_markdown = crate::page_edit::editor_markdown_for_detail(detail);
+        let confirmed = ui.page_confirmed_blocks.get(page_id).cloned();
+
+        // Skip redundant sync if markdown matches confirmed baseline exactly.
+        if let Some(ref base_blocks) = confirmed {
+            let base_md = if crate::parser::has_column_blocks(base_blocks) {
+                crate::parser::blocks_to_editor_markdown(base_blocks)
+            } else {
+                crate::parser::blocks_to_markdown(base_blocks)
+            };
+            if base_md.trim() == edited_markdown.trim() {
+                return false;
+            }
+        }
+
+        let next_gen = ui
+            .page_edit_generations
+            .get(page_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        ui.page_edit_generations.insert(page_id.to_string(), next_gen);
+
+        let known_blocks = confirmed
+            .filter(|blocks| !blocks.is_empty() && all_blocks_have_server_ids(blocks));
+
+        if ui.page_sync_in_flight.contains(page_id) {
+            ui.pending_page_sync.insert(
+                page_id.to_string(),
+                (next_gen, edited_markdown, known_blocks.unwrap_or_default()),
+            );
+            return true;
+        }
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            return false;
+        }
+
+        ui.page_sync_in_flight.insert(page_id.to_string());
+        ui.pending_page_sync.remove(page_id);
+        self.spawn_page_diff_sync(
+            ui,
+            page_id.to_string(),
+            next_gen,
+            edited_markdown,
+            known_blocks,
+        );
+        true
+    }
+
     /// Submits an edited Markdown document (e.g. from external `$EDITOR`) with 0ms optimistic
     /// update + SQLite cache + fast diff-based background sync.
     pub fn submit_page_edit_markdown(&mut self, ui: &mut UiState, edited_markdown: String) -> bool {
@@ -1156,11 +1991,18 @@ impl AppState {
         edited_markdown: String,
         known_existing: Option<Vec<NotionBlock>>,
     ) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            ui.page_sync_in_flight.remove(&page_id);
+            if let Some(ed) = ui.inline_editor.as_mut().filter(|e| e.page_id == page_id) {
+                ed.sync_in_flight = false;
+            }
+            return;
+        };
         let client = self.client.clone();
         let storage = self.storage.clone();
         let ui_tx = self.ui_tx.clone();
         ui.tasks.begin("edit");
-        tokio::spawn(async move {
+        handle.spawn(async move {
             match crate::cli::op_diff_sync_page_markdown(
                 &client,
                 &storage,
@@ -1219,8 +2061,11 @@ impl AppState {
         let page_id = self.active_page_id.clone().unwrap_or_default();
         let ws_id = self.workspace_id.clone();
         let req_seq = ui.next_page_refresh_seq(&page_id);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         ui.tasks.begin("todo");
-        tokio::spawn(async move {
+        handle.spawn(async move {
             match client.set_todo_checked(&bid, &page_id, next_checked).await {
                 Ok(updated_block) => {
                     let st = storage.clone();
@@ -1336,6 +2181,17 @@ impl AppState {
                     || ui.pending_page_sync.contains_key(&detail.page.id);
                 if syncing_own_edit {
                     return false;
+                }
+                if ui
+                    .block_editor
+                    .as_ref()
+                    .is_some_and(|b| b.page_id == detail.page.id)
+                {
+                    if all_blocks_have_server_ids(&detail.blocks) {
+                        ui.page_confirmed_blocks
+                            .insert(detail.page.id.clone(), detail.blocks.clone());
+                    }
+                    return self.merge_page_summary(&detail.page);
                 }
                 let summary_changed = self.merge_page_summary(&detail.page);
                 let active_editor_matches = ui
@@ -1591,7 +2447,15 @@ impl AppState {
                 let editing_this_page = ui
                     .inline_editor
                     .as_ref()
-                    .is_some_and(|ed| ed.page_id == detail.page.id);
+                    .is_some_and(|ed| ed.page_id == detail.page.id)
+                    || ui
+                        .block_editor
+                        .as_ref()
+                        .is_some_and(|b| b.page_id == detail.page.id);
+                if all_blocks_have_server_ids(&detail.blocks) {
+                    ui.page_confirmed_blocks
+                        .insert(detail.page.id.clone(), detail.blocks.clone());
+                }
                 if self.active_page_id.as_deref() == Some(detail.page.id.as_str())
                     && !editing_this_page
                 {
@@ -1654,10 +2518,19 @@ impl AppState {
                     synced_detail.markdown = synced_markdown.clone();
                 }
 
+                if all_blocks_have_server_ids(&synced_detail.blocks) {
+                    ui.page_confirmed_blocks
+                        .insert(page_id.clone(), synced_detail.blocks.clone());
+                }
+
                 let active_inline_matches = ui
                     .inline_editor
                     .as_ref()
                     .is_some_and(|ed| ed.page_id == page_id);
+                let active_block_matches = ui
+                    .block_editor
+                    .as_ref()
+                    .is_some_and(|b| b.page_id == page_id);
 
                 if active_inline_matches {
                     let mut still_dirty = false;
@@ -1695,6 +2568,28 @@ impl AppState {
                         // DO NOT overwrite local editor or optimistic detail, and do NOT auto-sync!
                         ui.success("Saved to Notion");
                     }
+                } else if active_block_matches {
+                    if let Some((pending_gen, pending_md, _)) = ui.pending_page_sync.remove(&page_id)
+                    {
+                        if pending_gen > generation {
+                            let known = (!synced_detail.blocks.is_empty())
+                                .then_some(synced_detail.blocks.clone());
+                            ui.page_sync_in_flight.insert(page_id.clone());
+                            self.spawn_page_diff_sync(ui, page_id.clone(), pending_gen, pending_md, known);
+                        }
+                    }
+                    // Reconcile newly minted server IDs into the live optimistic tree without
+                    // losing any unsaved text or freshly created empty sibling block under the cursor.
+                    if let Some(ref mut local_detail) = self.active_page_detail {
+                        if local_detail.page.id == page_id {
+                            reconcile_server_block_ids(
+                                &mut local_detail.blocks,
+                                &synced_detail.blocks,
+                                ui.block_editor.as_mut(),
+                            );
+                        }
+                    }
+                    ui.success("Saved to Notion");
                 } else if generation < current_gen {
                     if let Some((pending_gen, pending_md, _)) = ui.pending_page_sync.remove(&page_id)
                     {
@@ -1740,6 +2635,12 @@ impl AppState {
                     } else {
                         ed.remote_blocks.clear();
                     }
+                    ui.error(format!("Sync failed: {error}"));
+                } else if ui
+                    .block_editor
+                    .as_ref()
+                    .is_some_and(|b| b.page_id == page_id)
+                {
                     ui.error(format!("Sync failed: {error}"));
                 } else {
                     self.preserve_failed_page_edit(ui, &page_id, &edited_markdown, &error);
@@ -1876,6 +2777,10 @@ impl AppState {
                     ui.inline_editor = None;
                     ui.cursor_pos = None;
                 }
+                if ui.block_editor.as_ref().is_some_and(|b| b.page_id == id) {
+                    ui.block_editor = None;
+                    ui.cursor_pos = None;
+                }
                 self.snap_sidebar_selection(ui);
                 self.clamp_db_selection(ui);
                 self.clamp_canvas_selection(ui);
@@ -1936,6 +2841,10 @@ impl AppState {
                 self.active_page_id = None;
                 self.active_page_detail = None;
                 ui.inline_editor = None;
+                ui.block_editor = None;
+                ui.canvas_block_layouts.clear();
+                ui.canvas_link_hits.clear();
+                ui.page_confirmed_blocks.clear();
                 ui.cursor_pos = None;
                 ui.page_refresh_seq.clear();
                 ui.bump_preview_request_seq();
@@ -2540,6 +3449,105 @@ fn set_todo_in_tree(blocks: &mut [NotionBlock], target_id: &str, checked: bool) 
         }
     }
     false
+}
+
+fn all_blocks_have_server_ids(blocks: &[NotionBlock]) -> bool {
+    blocks.iter().all(|b| {
+        !b.id.trim().is_empty()
+            && !b.id.starts_with("__optimistic_")
+            && all_blocks_have_server_ids(&b.children)
+    })
+}
+
+fn update_block_in_tree(
+    blocks: &mut [NotionBlock],
+    target_id: &str,
+    new_type: &str,
+    new_kind: &NotionBlockKind,
+) -> bool {
+    for blk in blocks {
+        if blk.id == target_id {
+            blk.block_type = new_type.to_string();
+            blk.kind = new_kind.clone();
+            return true;
+        }
+        if update_block_in_tree(&mut blk.children, target_id, new_type, new_kind) {
+            return true;
+        }
+    }
+    false
+}
+
+fn find_parent_block_id_in_tree(blocks: &[NotionBlock], target_id: &str) -> Option<String> {
+    for blk in blocks {
+        if blk.id == target_id {
+            return blk.parent_block_id.clone();
+        }
+        if let Some(found) = find_parent_block_id_in_tree(&blk.children, target_id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn insert_sibling_after_in_tree(
+    blocks: &mut Vec<NotionBlock>,
+    after_id: &str,
+    new_block: NotionBlock,
+) -> bool {
+    if let Some(pos) = blocks.iter().position(|b| b.id == after_id) {
+        blocks.insert(pos + 1, new_block);
+        return true;
+    }
+    for blk in blocks.iter_mut() {
+        if insert_sibling_after_in_tree(&mut blk.children, after_id, new_block.clone()) {
+            blk.has_children = true;
+            return true;
+        }
+    }
+    false
+}
+
+/// Replaces matching `__optimistic_*` block IDs in `local_blocks` with their newly confirmed
+/// Notion server IDs from `server_blocks`, keeping `active_editor.block_id` synchronized.
+fn reconcile_server_block_ids(
+    local_blocks: &mut [NotionBlock],
+    server_blocks: &[NotionBlock],
+    mut active_editor: Option<&mut InlineBlockEditor>,
+) {
+    let mut used_server_ids: HashSet<String> = local_blocks
+        .iter()
+        .filter(|b| !b.id.starts_with("__optimistic_") && !b.id.is_empty())
+        .map(|b| b.id.clone())
+        .collect();
+    for local in local_blocks.iter_mut() {
+        if local.id.starts_with("__optimistic_") {
+            let local_key = crate::parser::block_comparison_key(local);
+            if let Some(srv) = server_blocks.iter().find(|s| {
+                !s.id.is_empty()
+                    && !used_server_ids.contains(&s.id)
+                    && crate::parser::block_comparison_key(s) == local_key
+            }) {
+                let old_id = local.id.clone();
+                local.id = srv.id.clone();
+                used_server_ids.insert(srv.id.clone());
+                if let Some(ref mut bed) = active_editor {
+                    if bed.block_id == old_id {
+                        bed.block_id = srv.id.clone();
+                    }
+                }
+            }
+        }
+        if !local.children.is_empty() {
+            if let Some(srv) = server_blocks.iter().find(|s| s.id == local.id) {
+                reconcile_server_block_ids(
+                    &mut local.children,
+                    &srv.children,
+                    active_editor.as_deref_mut(),
+                );
+            }
+        }
+    }
 }
 
 fn update_block_media_url_in_tree(blocks: &mut [NotionBlock], target_id: &str, url: &str) -> bool {

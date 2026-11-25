@@ -218,18 +218,20 @@ fn draw_status_bar(
         };
         let focus_tag = match ui.focus {
             Focus::Sidebar => "Sidebar",
-            Focus::Canvas if ui.inline_editor.is_some() => "Editing",
+            Focus::Canvas if ui.inline_editor.is_some() || ui.block_editor.is_some() => "Editing",
             Focus::Canvas if app.active_view == CanvasView::Database => "Database",
             Focus::Canvas => "Page",
             Focus::Comments => "Comments",
             Focus::Overlay => "Overlay",
         };
-        let hints = if ui.inline_editor.is_some() {
+        let hints = if ui.block_editor.is_some() {
+            "Enter New Block · Shift+Enter Newline · ↑/↓ Prev/Next Block · Ctrl+S Save · Esc Done"
+        } else if ui.inline_editor.is_some() {
             "Ctrl+S Save · Esc Done/Discard · Ctrl+Z/Y Undo/Redo · Ctrl+V Paste · Ctrl+E $EDITOR"
         } else {
             match app.active_view {
                 CanvasView::Page => {
-                    "a Append · e Edit · n New · f Fav · C Comments · w Width · Ctrl+K Find · ? Help"
+                    "Click/Enter Edit Block · a Append · e Full Edit · n New · C Comments · Ctrl+K Find · ? Help"
                 }
                 CanvasView::Database => {
                     "1 Table · 2 Board · 3 List · f Filter · s Sort · m Move · n New · Ctrl+K Find"

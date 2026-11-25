@@ -28,7 +28,10 @@ use crate::{
         NotionPageDetail, NotionPropertyValue, RichTextKind, RichTextSpan,
     },
     ui::{
-        app::{AppState, CanvasView, Focus, InlineSyncStatus, UiState, VisibleBlock},
+        app::{
+            AppState, CanvasBlockLayout, CanvasLinkHit, CanvasView, Focus, InlineBlockEditor,
+            InlineSyncStatus, UiState, VisibleBlock,
+        },
         composer::{text_layout, truncate_display},
         hitmap::{ButtonId, HitMap, HitTarget},
         theme::Theme,
@@ -255,6 +258,8 @@ fn draw_page_canvas(
 
     let Some(detail) = app.active_page_detail.as_ref() else {
         ui.canvas_scroll = 0;
+        ui.canvas_block_layouts.clear();
+        ui.canvas_link_hits.clear();
         draw_empty_page_welcome(frame, content_area, &theme);
         return;
     };
@@ -264,18 +269,31 @@ fn draw_page_canvas(
         .as_ref()
         .is_some_and(|ed| ed.page_id == detail.page.id)
     {
+        ui.canvas_block_layouts.clear();
+        ui.canvas_link_hits.clear();
         draw_inline_page_editor(frame, area, content_area, &theme, ui, hitmap);
         return;
     }
 
-    let (rendered_lines, inline_hits, selected_line_range) =
-        build_page_canvas_lines(app, detail, ui, &theme, content_area.width);
+    let scene = build_page_canvas_scene(app, detail, ui, &theme, content_area.width);
+    let rendered_lines = scene.lines;
+    let inline_hits = scene.inline_hits;
+    let selected_line_range = scene.selected_line_range;
 
-    // Keep the selected block visible when navigating with Up/Down/j/k, while allowing MouseScroll to roam freely
+    // Keep the selected block (or active block-editor cursor line) visible when navigating
+    // with keyboard, while allowing MouseScroll to roam freely.
     if ui.canvas_follow_selected {
-        if let Some((sel_start, sel_end)) = selected_line_range {
-            let view_h = content_area.height as usize;
-            let mut desired_scroll = ui.canvas_scroll as usize;
+        let view_h = content_area.height as usize;
+        let mut desired_scroll = ui.canvas_scroll as usize;
+        if let Some(ref active) = scene.active_block_edit {
+            let cursor_line = active.text_start_line.saturating_add(active.cursor_row);
+            if cursor_line < desired_scroll {
+                desired_scroll = cursor_line;
+            } else if cursor_line >= desired_scroll.saturating_add(view_h) {
+                desired_scroll = cursor_line.saturating_add(1).saturating_sub(view_h);
+            }
+            ui.canvas_scroll = desired_scroll.min(u16::MAX as usize) as u16;
+        } else if let Some((sel_start, sel_end)) = selected_line_range {
             if sel_start < desired_scroll {
                 desired_scroll = sel_start;
             } else if sel_end >= desired_scroll.saturating_add(view_h) {
@@ -293,10 +311,42 @@ fn draw_page_canvas(
     let scroll = (ui.canvas_scroll as usize).min(max_scroll);
     ui.canvas_scroll = scroll as u16;
 
+    // Record screen geometry of visible blocks & inline links for direct click-to-edit and link clicks.
+    ui.canvas_block_layouts.clear();
+    ui.canvas_link_hits.clear();
+    let view_h = content_area.height as usize;
+    let view_end = scroll.saturating_add(view_h);
+    for meta in &scene.block_meta {
+        if meta.end_line >= scroll && meta.start_line < view_end {
+            let first_screen_row = content_area
+                .y
+                .saturating_add(meta.start_line.saturating_sub(scroll) as u16);
+            let last_screen_row = content_area.y.saturating_add(
+                meta.end_line
+                    .saturating_sub(scroll)
+                    .min(view_h.saturating_sub(1)) as u16,
+            );
+            let text_first_screen_row = content_area
+                .y
+                .saturating_add(meta.text_start_line.saturating_sub(scroll) as u16);
+            ui.canvas_block_layouts.push(CanvasBlockLayout {
+                visible_idx: meta.visible_idx,
+                block_id: meta.block_id.clone(),
+                first_screen_row,
+                last_screen_row,
+                text_first_screen_row,
+                first_text_x: content_area.x.saturating_add(meta.first_prefix_w),
+                cont_text_x: content_area.x.saturating_add(meta.cont_prefix_w),
+                text_width: meta.text_width,
+                has_leading_toggle: meta.has_leading_toggle,
+            });
+        }
+    }
+
     for (row_offset, (line, target)) in rendered_lines
         .iter()
         .skip(scroll)
-        .take(content_area.height as usize)
+        .take(view_h)
         .enumerate()
     {
         let line_idx = scroll + row_offset;
@@ -313,6 +363,43 @@ fn draw_page_canvas(
                     hitmap.add_line(content_area.x.saturating_add(rel_x), y, clamped_w, hit);
                 }
             }
+        }
+        for &(ll_idx, rel_x, w, ref url) in &scene.inline_links {
+            if ll_idx == line_idx && rel_x < content_area.width {
+                let clamped_w = w.min(content_area.width.saturating_sub(rel_x));
+                if clamped_w > 0 {
+                    ui.canvas_link_hits.push(CanvasLinkHit {
+                        rect: Rect::new(content_area.x.saturating_add(rel_x), y, clamped_w, 1),
+                        url: url.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Update active in-place block editor screen geometry and expose exact hardware terminal cursor.
+    if let (Some(active), Some(bed)) = (scene.active_block_edit, ui.block_editor.as_mut()) {
+        bed.last_text_x = content_area.x.saturating_add(active.prefix_w);
+        bed.last_first_screen_row = content_area
+            .y
+            .saturating_add(active.text_start_line.saturating_sub(scroll) as u16);
+        bed.last_screen_rows = active.total_text_rows;
+        bed.last_wrap_width = active.wrap_w;
+        bed.last_visual_lines = active.visual_lines;
+        bed.last_cursor_visual_row = active.cursor_row;
+
+        let cursor_line_idx = active.text_start_line.saturating_add(active.cursor_row);
+        if ui.focus == Focus::Canvas && cursor_line_idx >= scroll && cursor_line_idx < view_end {
+            let cy = content_area
+                .y
+                .saturating_add((cursor_line_idx - scroll) as u16)
+                .min(content_area.bottom().saturating_sub(1));
+            let cx = content_area
+                .x
+                .saturating_add(active.prefix_w)
+                .saturating_add(active.cursor_col as u16)
+                .min(content_area.right().saturating_sub(1));
+            ui.cursor_pos = Some((cx, cy));
         }
     }
 
@@ -815,6 +902,38 @@ fn classify_markdown_line(
     (logical_start, base_default, base_default, true)
 }
 
+struct BlockRenderMeta {
+    visible_idx: usize,
+    block_id: String,
+    start_line: usize,
+    end_line: usize,
+    text_start_line: usize,
+    first_prefix_w: u16,
+    cont_prefix_w: u16,
+    text_width: u16,
+    has_leading_toggle: bool,
+}
+
+struct ActiveBlockRenderInfo {
+    text_start_line: usize,
+    prefix_w: u16,
+    wrap_w: u16,
+    visual_lines: Vec<(usize, usize)>,
+    cursor_row: usize,
+    cursor_col: usize,
+    total_text_rows: u16,
+}
+
+struct PageCanvasScene {
+    lines: Vec<(Line<'static>, Option<HitTarget>)>,
+    inline_hits: Vec<(usize, u16, u16, HitTarget)>,
+    selected_line_range: Option<(usize, usize)>,
+    block_meta: Vec<BlockRenderMeta>,
+    inline_links: Vec<(usize, u16, u16, String)>,
+    active_block_edit: Option<ActiveBlockRenderInfo>,
+}
+
+#[allow(dead_code)]
 #[allow(clippy::type_complexity)]
 fn build_page_canvas_lines(
     app: &AppState,
@@ -827,13 +946,31 @@ fn build_page_canvas_lines(
     Vec<(usize, u16, u16, HitTarget)>,
     Option<(usize, usize)>,
 ) {
+    let scene = build_page_canvas_scene(app, detail, ui, theme, content_width);
+    (scene.lines, scene.inline_hits, scene.selected_line_range)
+}
+
+fn build_page_canvas_scene(
+    app: &AppState,
+    detail: &NotionPageDetail,
+    ui: &UiState,
+    theme: &Theme,
+    content_width: u16,
+) -> PageCanvasScene {
     let content_w = content_width as usize;
     let visible = app.visible_blocks(ui);
     let selected_idx = ui.selected_block.min(visible.len().saturating_sub(1));
     let canvas_focused = ui.focus == Focus::Canvas;
+    let active_bed = ui
+        .block_editor
+        .as_ref()
+        .filter(|b| b.page_id == detail.page.id);
 
     let mut rendered_lines: Vec<(Line<'static>, Option<HitTarget>)> = Vec::new();
     let mut inline_hits: Vec<(usize, u16, u16, HitTarget)> = Vec::new();
+    let mut block_meta: Vec<BlockRenderMeta> = Vec::new();
+    let mut inline_links: Vec<(usize, u16, u16, String)> = Vec::new();
+    let mut active_block_edit: Option<ActiveBlockRenderInfo> = None;
 
     // Generous breathing room at top
     rendered_lines.push((Line::from(""), None));
@@ -1028,26 +1165,619 @@ fn build_page_canvas_lines(
         }
     } else {
         for (idx, vblk) in visible.iter().enumerate() {
-            let is_sel = canvas_focused && idx == selected_idx;
+            let is_active_edit = active_bed.is_some_and(|b| b.block_id == vblk.block.id);
+            let is_sel = canvas_focused && (is_active_edit || (active_bed.is_none() && idx == selected_idx));
             let start_line = rendered_lines.len();
-            render_block_lines(
-                vblk,
-                idx,
-                is_sel,
-                content_w,
-                ui,
-                theme,
-                &mut rendered_lines,
-                &mut inline_hits,
-            );
-            let end_line = rendered_lines.len().saturating_sub(1);
-            if idx == selected_idx && rendered_lines.len() > start_line {
-                selected_line_range = Some((start_line, end_line));
+            if let Some(bed) = active_bed.filter(|_| is_active_edit) {
+                let info = render_active_block_editor_lines(
+                    bed,
+                    vblk,
+                    idx,
+                    content_w,
+                    theme,
+                    &mut rendered_lines,
+                );
+                let end_line = rendered_lines.len().saturating_sub(1);
+                let has_leading_toggle = matches!(
+                    bed.kind,
+                    NotionBlockKind::ToDo { .. }
+                        | NotionBlockKind::Toggle { .. }
+                        | NotionBlockKind::Heading1 { is_toggleable: true, .. }
+                        | NotionBlockKind::Heading2 { is_toggleable: true, .. }
+                        | NotionBlockKind::Heading3 { is_toggleable: true, .. }
+                );
+                if rendered_lines.len() > start_line {
+                    block_meta.push(BlockRenderMeta {
+                        visible_idx: idx,
+                        block_id: vblk.block.id.clone(),
+                        start_line,
+                        end_line,
+                        text_start_line: info.text_start_line,
+                        first_prefix_w: info.prefix_w,
+                        cont_prefix_w: info.prefix_w,
+                        text_width: info.wrap_w,
+                        has_leading_toggle,
+                    });
+                    selected_line_range = Some((start_line, end_line));
+                }
+                active_block_edit = Some(info);
+            } else {
+                render_block_lines(
+                    vblk,
+                    idx,
+                    is_sel,
+                    content_w,
+                    ui,
+                    theme,
+                    &mut rendered_lines,
+                    &mut inline_hits,
+                );
+                let end_line = rendered_lines.len().saturating_sub(1);
+                if rendered_lines.len() > start_line {
+                    let (first_prefix_w, cont_prefix_w, has_leading_toggle, text_line_offset) =
+                        rendered_block_prefix_metrics(vblk, content_w);
+                    let text_start_line = start_line.saturating_add(text_line_offset).min(end_line);
+                    let text_width = (content_w.saturating_sub(first_prefix_w as usize)).max(1) as u16;
+                    block_meta.push(BlockRenderMeta {
+                        visible_idx: idx,
+                        block_id: vblk.block.id.clone(),
+                        start_line,
+                        end_line,
+                        text_start_line,
+                        first_prefix_w,
+                        cont_prefix_w,
+                        text_width,
+                        has_leading_toggle,
+                    });
+                    collect_block_inline_link_hits(
+                        vblk,
+                        start_line,
+                        end_line,
+                        theme,
+                        &rendered_lines,
+                        &mut inline_links,
+                    );
+                }
+                if active_bed.is_none() && idx == selected_idx && rendered_lines.len() > start_line {
+                    selected_line_range = Some((start_line, end_line));
+                }
             }
         }
     }
 
-    (rendered_lines, inline_hits, selected_line_range)
+    PageCanvasScene {
+        lines: rendered_lines,
+        inline_hits,
+        selected_line_range,
+        block_meta,
+        inline_links,
+        active_block_edit,
+    }
+}
+
+/// Renders the currently focused Notion block IN PLACE with live soft-wrapping, exact prefix
+/// alignment, and active cursor tracking while all sibling blocks stay rendered around it.
+fn render_active_block_editor_lines(
+    bed: &InlineBlockEditor,
+    vblk: &VisibleBlock,
+    idx: usize,
+    max_width: usize,
+    theme: &Theme,
+    out: &mut Vec<(Line<'static>, Option<HitTarget>)>,
+) -> ActiveBlockRenderInfo {
+    let indent = "  ".repeat(vblk.depth);
+    let edit_bg = theme.bg_selected;
+    let edit_gutter = Span::styled(
+        "▎ ",
+        Style::default()
+            .fg(theme.accent)
+            .bg(edit_bg)
+            .add_modifier(Modifier::BOLD),
+    );
+    let indent_span = Span::styled(indent.clone(), Style::default().bg(edit_bg));
+
+    let (first_prefix, cont_prefix, body_style, hit, is_heading1, code_lang): (
+        Vec<Span<'static>>,
+        Vec<Span<'static>>,
+        Style,
+        HitTarget,
+        bool,
+        Option<String>,
+    ) = match &bed.kind {
+        NotionBlockKind::Heading1 { is_toggleable, .. } => {
+            let p = if *is_toggleable {
+                if vblk.is_toggle_open { "▾ " } else { "▸ " }
+            } else {
+                ""
+            };
+            let first = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled(p.to_string(), Style::default().fg(theme.accent).bg(edit_bg)),
+            ];
+            let cont = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled(" ".repeat(p.width()), Style::default().bg(edit_bg)),
+            ];
+            let hit = if *is_toggleable {
+                HitTarget::ToggleBlock(idx)
+            } else {
+                HitTarget::CanvasBlock(idx)
+            };
+            (
+                first,
+                cont,
+                Style::default()
+                    .fg(theme.fg_primary)
+                    .bg(edit_bg)
+                    .add_modifier(Modifier::BOLD),
+                hit,
+                true,
+                None,
+            )
+        }
+        NotionBlockKind::Heading2 { is_toggleable, .. } => {
+            let p = if *is_toggleable {
+                if vblk.is_toggle_open { "▾ " } else { "▸ " }
+            } else {
+                ""
+            };
+            let first = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled(p.to_string(), Style::default().fg(theme.accent).bg(edit_bg)),
+            ];
+            let cont = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled(" ".repeat(p.width()), Style::default().bg(edit_bg)),
+            ];
+            let hit = if *is_toggleable {
+                HitTarget::ToggleBlock(idx)
+            } else {
+                HitTarget::CanvasBlock(idx)
+            };
+            (
+                first,
+                cont,
+                Style::default()
+                    .fg(theme.accent_soft)
+                    .bg(edit_bg)
+                    .add_modifier(Modifier::BOLD),
+                hit,
+                false,
+                None,
+            )
+        }
+        NotionBlockKind::Heading3 { is_toggleable, .. } => {
+            let p = if *is_toggleable {
+                if vblk.is_toggle_open { "▾ " } else { "▸ " }
+            } else {
+                ""
+            };
+            let first = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled(p.to_string(), Style::default().fg(theme.accent).bg(edit_bg)),
+            ];
+            let cont = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled(" ".repeat(p.width()), Style::default().bg(edit_bg)),
+            ];
+            let hit = if *is_toggleable {
+                HitTarget::ToggleBlock(idx)
+            } else {
+                HitTarget::CanvasBlock(idx)
+            };
+            (
+                first,
+                cont,
+                Style::default()
+                    .fg(theme.fg_secondary)
+                    .bg(edit_bg)
+                    .add_modifier(Modifier::BOLD),
+                hit,
+                false,
+                None,
+            )
+        }
+        NotionBlockKind::BulletedListItem { .. } => {
+            let first = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled("• ", theme.accent_style().bg(edit_bg)),
+            ];
+            let cont = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled("  ", Style::default().bg(edit_bg)),
+            ];
+            (
+                first,
+                cont,
+                Style::default().fg(theme.fg_primary).bg(edit_bg),
+                HitTarget::CanvasBlock(idx),
+                false,
+                None,
+            )
+        }
+        NotionBlockKind::NumberedListItem { .. } => {
+            let num = vblk.numbered_index.max(1);
+            let marker = format!("{num}. ");
+            let pad = " ".repeat(marker.width());
+            let first = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled(marker, theme.accent_style().bg(edit_bg)),
+            ];
+            let cont = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled(pad, Style::default().bg(edit_bg)),
+            ];
+            (
+                first,
+                cont,
+                Style::default().fg(theme.fg_primary).bg(edit_bg),
+                HitTarget::CanvasBlock(idx),
+                false,
+                None,
+            )
+        }
+        NotionBlockKind::ToDo { checked, .. } => {
+            let (glyph, gstyle, bstyle) = if *checked {
+                (
+                    "[✓] ",
+                    Style::default()
+                        .fg(theme.success)
+                        .bg(edit_bg)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.fg_muted)
+                        .bg(edit_bg)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                )
+            } else {
+                (
+                    "[ ] ",
+                    Style::default().fg(theme.fg_muted).bg(edit_bg),
+                    Style::default().fg(theme.fg_primary).bg(edit_bg),
+                )
+            };
+            let first = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled(glyph, gstyle),
+            ];
+            let cont = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled(" ".repeat(glyph.width()), Style::default().bg(edit_bg)),
+            ];
+            (first, cont, bstyle, HitTarget::TodoToggle(idx), false, None)
+        }
+        NotionBlockKind::Toggle { .. } => {
+            let arrow = if vblk.is_toggle_open { "▾ " } else { "▸ " };
+            let first = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled(
+                    arrow,
+                    theme.accent_style().bg(edit_bg).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            let cont = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                Span::styled("  ", Style::default().bg(edit_bg)),
+            ];
+            (
+                first,
+                cont,
+                Style::default()
+                    .fg(theme.fg_primary)
+                    .bg(edit_bg)
+                    .add_modifier(Modifier::BOLD),
+                HitTarget::ToggleBlock(idx),
+                false,
+                None,
+            )
+        }
+        NotionBlockKind::Callout { icon, color, .. } => {
+            let ic = icon.as_deref().unwrap_or("💡");
+            let accent_col = if *color == NotionColor::Default {
+                theme.accent
+            } else {
+                theme.notion_text_color(*color)
+            };
+            let bar = Span::styled("┃ ", Style::default().fg(accent_col).bg(edit_bg));
+            let icon_seg = format!("{ic}  ");
+            let icon_pad = " ".repeat(icon_seg.width());
+            let first = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                bar.clone(),
+                Span::styled(icon_seg, Style::default().bg(edit_bg)),
+            ];
+            let cont = vec![
+                edit_gutter.clone(),
+                indent_span.clone(),
+                bar,
+                Span::styled(icon_pad, Style::default().bg(edit_bg)),
+            ];
+            (
+                first,
+                cont,
+                Style::default().fg(theme.fg_primary).bg(edit_bg),
+                HitTarget::CanvasBlock(idx),
+                false,
+                None,
+            )
+        }
+        NotionBlockKind::Quote { .. } => {
+            let bar = Span::styled("│ ", Style::default().fg(theme.fg_muted).bg(edit_bg));
+            let prefix = vec![edit_gutter.clone(), indent_span.clone(), bar];
+            (
+                prefix.clone(),
+                prefix,
+                theme.quote_style().bg(edit_bg),
+                HitTarget::CanvasBlock(idx),
+                false,
+                None,
+            )
+        }
+        NotionBlockKind::Code { language, .. } => {
+            let bar = Span::styled("│ ", Style::default().fg(theme.code_fg).bg(edit_bg));
+            let prefix = vec![edit_gutter.clone(), indent_span.clone(), bar];
+            (
+                prefix.clone(),
+                prefix,
+                Style::default().fg(theme.code_fg).bg(edit_bg),
+                HitTarget::CanvasBlock(idx),
+                false,
+                Some(language.clone()),
+            )
+        }
+        _ => {
+            let prefix = vec![edit_gutter.clone(), indent_span.clone()];
+            (
+                prefix.clone(),
+                prefix,
+                Style::default().fg(theme.fg_primary).bg(edit_bg),
+                HitTarget::CanvasBlock(idx),
+                false,
+                None,
+            )
+        }
+    };
+
+    if let Some(ref lang) = code_lang {
+        let badge = format!("  {indent}╭─ {lang} (editing · Shift+Enter/Enter newline) ");
+        out.push((
+            Line::from(Span::styled(
+                truncate_width(&badge, max_width),
+                Style::default()
+                    .fg(theme.accent_soft)
+                    .bg(edit_bg)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(edit_bg)),
+            Some(hit),
+        ));
+    }
+
+    let prefix_w: usize = first_prefix.iter().map(Span::width).sum();
+    let wrap_w = max_width.saturating_sub(prefix_w).max(1);
+    let text = bed.composer.text();
+    let cursor = bed.composer.cursor();
+    let selection = bed.composer.selection_range();
+    let (visual, cursor_row, cursor_col) = text_layout(text, wrap_w, cursor);
+    let text_start_line = out.len();
+
+    if text.is_empty() {
+        let placeholder = if code_lang.is_some() {
+            "Type code..."
+        } else {
+            "Type text, or # / - / [] / > ..."
+        };
+        let mut spans = first_prefix;
+        spans.push(Span::styled(
+            truncate_display(placeholder, wrap_w),
+            theme
+                .muted_style()
+                .bg(edit_bg)
+                .add_modifier(Modifier::ITALIC),
+        ));
+        out.push((Line::from(spans).style(Style::default().bg(edit_bg)), Some(hit)));
+    } else {
+        for (v_idx, &(start, end)) in visual.iter().enumerate() {
+            let mut spans = if v_idx == 0 {
+                first_prefix.clone()
+            } else {
+                cont_prefix.clone()
+            };
+            let slice = text.get(start..end).unwrap_or("");
+            let mut run = String::new();
+            let mut run_selected = false;
+            for (offset, ch) in slice.char_indices() {
+                let pos = start + offset;
+                let selected = selection
+                    .map(|(from, to)| pos >= from && pos < to)
+                    .unwrap_or(false);
+                if !run.is_empty() && selected != run_selected {
+                    let st = if run_selected {
+                        theme.selection().add_modifier(Modifier::REVERSED)
+                    } else {
+                        body_style
+                    };
+                    spans.push(Span::styled(std::mem::take(&mut run), st));
+                }
+                run_selected = selected;
+                if ch == '\t' {
+                    run.push_str("    ");
+                } else {
+                    run.push(ch);
+                }
+            }
+            if !run.is_empty() {
+                let st = if run_selected {
+                    theme.selection().add_modifier(Modifier::REVERSED)
+                } else {
+                    body_style
+                };
+                spans.push(Span::styled(run, st));
+            }
+            out.push((Line::from(spans).style(Style::default().bg(edit_bg)), Some(hit)));
+        }
+    }
+
+    let total_text_rows = out.len().saturating_sub(text_start_line).max(1) as u16;
+
+    if code_lang.is_some() {
+        let footer_prefix_w = 2 + indent.width();
+        let footer = if footer_prefix_w + 2 > max_width {
+            let lead = " ".repeat(max_width.saturating_sub(2));
+            format!("{lead}╰─")
+        } else {
+            let dashes = max_width.saturating_sub(footer_prefix_w + 1).min(20);
+            format!("  {indent}╰{}", "─".repeat(dashes))
+        };
+        out.push((
+            Line::from(Span::styled(footer, Style::default().fg(theme.accent))),
+            Some(hit),
+        ));
+    } else if is_heading1 {
+        out.push((Line::from(""), None));
+    }
+
+    ActiveBlockRenderInfo {
+        text_start_line,
+        prefix_w: prefix_w.min(u16::MAX as usize) as u16,
+        wrap_w: wrap_w.min(u16::MAX as usize) as u16,
+        visual_lines: visual,
+        cursor_row,
+        cursor_col,
+        total_text_rows,
+    }
+}
+
+/// Computes `(first_prefix_w, cont_prefix_w, has_leading_toggle, text_line_offset)` for a
+/// rendered (non-editing) block so mouse clicks map accurately to the clicked text column.
+fn rendered_block_prefix_metrics(vblk: &VisibleBlock, max_width: usize) -> (u16, u16, bool, usize) {
+    let indent_w = vblk.depth.saturating_mul(2);
+    let base = 2usize.saturating_add(indent_w);
+    match &vblk.block.kind {
+        NotionBlockKind::Heading1 { is_toggleable, .. }
+        | NotionBlockKind::Heading2 { is_toggleable, .. }
+        | NotionBlockKind::Heading3 { is_toggleable, .. } => {
+            let w = base.saturating_add(if *is_toggleable { 2 } else { 0 });
+            (w as u16, w as u16, *is_toggleable, 0)
+        }
+        NotionBlockKind::Paragraph { .. } => (base as u16, base as u16, false, 0),
+        NotionBlockKind::BulletedListItem { .. } => {
+            let w = base.saturating_add(2);
+            (w as u16, w as u16, false, 0)
+        }
+        NotionBlockKind::NumberedListItem { .. } => {
+            let marker = format!("{}. ", vblk.numbered_index.max(1));
+            let w = base.saturating_add(marker.width());
+            (w as u16, w as u16, false, 0)
+        }
+        NotionBlockKind::ToDo { .. } => {
+            let w = base.saturating_add(4);
+            (w as u16, w as u16, true, 0)
+        }
+        NotionBlockKind::Toggle { .. } => {
+            let w = base.saturating_add(2);
+            (w as u16, w as u16, true, 0)
+        }
+        NotionBlockKind::Callout { icon, .. } => {
+            let ic = icon.as_deref().unwrap_or("💡");
+            let cont = base.saturating_add(2);
+            let first = cont.saturating_add(ic.width()).saturating_add(2);
+            (first as u16, cont as u16, false, 0)
+        }
+        NotionBlockKind::Quote { .. } => {
+            let w = base.saturating_add(2);
+            (w as u16, w as u16, false, 0)
+        }
+        NotionBlockKind::Code { language, .. } => {
+            let is_html = crate::ui::action::is_html_code_language(language);
+            let badge = format!("  {}╭─ {language} (y to copy) ", "  ".repeat(vblk.depth));
+            let combined_w = badge.width() + if is_html { "[▶ Preview HTML]".width() } else { 0 };
+            let header_rows = if combined_w <= max_width {
+                1
+            } else {
+                let badge_rows = badge.width().div_ceil(max_width.max(1));
+                badge_rows + usize::from(is_html)
+            };
+            let w = base.saturating_add(2);
+            (w as u16, w as u16, false, header_rows)
+        }
+        _ => (base as u16, base as u16, false, 0),
+    }
+}
+
+/// Records clickable screen coordinates for inline rich-text hyperlinks inside rendered blocks.
+fn collect_block_inline_link_hits(
+    vblk: &VisibleBlock,
+    start_line: usize,
+    end_line: usize,
+    theme: &Theme,
+    rendered_lines: &[(Line<'static>, Option<HitTarget>)],
+    out_links: &mut Vec<(usize, u16, u16, String)>,
+) {
+    let rich_text: &[RichTextSpan] = match &vblk.block.kind {
+        NotionBlockKind::Paragraph { rich_text, .. }
+        | NotionBlockKind::Heading1 { rich_text, .. }
+        | NotionBlockKind::Heading2 { rich_text, .. }
+        | NotionBlockKind::Heading3 { rich_text, .. }
+        | NotionBlockKind::BulletedListItem { rich_text, .. }
+        | NotionBlockKind::NumberedListItem { rich_text, .. }
+        | NotionBlockKind::ToDo { rich_text, .. }
+        | NotionBlockKind::Toggle { rich_text, .. }
+        | NotionBlockKind::Callout { rich_text, .. }
+        | NotionBlockKind::Quote { rich_text, .. } => rich_text,
+        _ => return,
+    };
+    let link_spans: Vec<(&str, &str)> = rich_text
+        .iter()
+        .filter_map(|sp| {
+            let url = sp.href.as_deref().map(str::trim).filter(|u| !u.is_empty())?;
+            let text = sp.plain_text.as_str();
+            (!text.is_empty()).then_some((text, url))
+        })
+        .collect();
+    if link_spans.is_empty() {
+        return;
+    }
+
+    for (l_idx, (line, _)) in rendered_lines
+        .iter()
+        .enumerate()
+        .take(end_line.saturating_add(1))
+        .skip(start_line)
+    {
+        let mut x = 0usize;
+        for sp in &line.spans {
+            let w = sp.width();
+            if w > 0
+                && sp.style.fg == Some(theme.accent_soft)
+                && sp.style.add_modifier.contains(Modifier::UNDERLINED)
+            {
+                let content = sp.content.as_ref();
+                if let Some((_, url)) = link_spans
+                    .iter()
+                    .find(|(lt, _)| lt.contains(content) || content.contains(lt))
+                {
+                    out_links.push((l_idx, x as u16, w as u16, (*url).to_string()));
+                }
+            }
+            x = x.saturating_add(w);
+        }
+    }
 }
 
 fn push_wrapped_block(

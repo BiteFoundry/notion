@@ -102,6 +102,7 @@ pub fn key_to_action(
         }
         return match key.code {
             KeyCode::Esc => Some(Action::CancelInlineEdit),
+            KeyCode::Enter if shift => Some(Action::SoftNewline),
             KeyCode::Enter => Some(Action::Newline),
             KeyCode::Tab => Some(Action::Tab),
             KeyCode::Backspace => Some(Action::Backspace),
@@ -192,6 +193,7 @@ pub fn key_to_action(
     if !is_database_active && focus == Focus::Canvas {
         match key.code {
             KeyCode::Char(' ') | KeyCode::Char('x') => return Some(Action::ToggleActiveBlock),
+            KeyCode::Char('i') => return Some(Action::OpenBlockEditor),
             KeyCode::Char('h') => return Some(Action::ToggleShowLinkUrls),
             KeyCode::Char('f') => return Some(Action::ToggleFavorite),
             _ => {}
