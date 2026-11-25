@@ -34,6 +34,11 @@ fn parse_rich_text_item(item: &Value) -> RichTextSpan {
                 .and_then(|t| t.get("content"))
                 .and_then(Value::as_str)
         })
+        .or_else(|| {
+            item.get("equation")
+                .and_then(|e| e.get("expression"))
+                .and_then(Value::as_str)
+        })
         .unwrap_or_default()
         .to_string();
 
@@ -1657,7 +1662,60 @@ pub(crate) fn block_inline_markdown<'a>(block_type: &str, line: &'a str) -> &'a 
     .trim()
 }
 
-/// Converts inline Markdown (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `[text](url)`)
+fn unescape_inline_chars(slice: &[char]) -> String {
+    let mut out = String::with_capacity(slice.len());
+    let mut k = 0usize;
+    while k < slice.len() {
+        if slice[k] == '\\' && k + 1 < slice.len() && slice[k + 1].is_ascii_punctuation() {
+            out.push(slice[k + 1]);
+            k += 2;
+        } else {
+            out.push(slice[k]);
+            k += 1;
+        }
+    }
+    out
+}
+
+fn find_closing_delim(chars: &[char], from: usize, pat: &[char]) -> Option<usize> {
+    let len = chars.len();
+    let plen = pat.len();
+    let mut j = from;
+    while j + plen <= len {
+        if chars[j] == '\\' && j + 1 < len && chars[j + 1].is_ascii_punctuation() {
+            j += 2;
+            continue;
+        }
+        if j > from && &chars[j..j + plen] == pat {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
+}
+
+fn find_closing_underscore(chars: &[char], from: usize, count: usize) -> Option<usize> {
+    let len = chars.len();
+    let mut j = from;
+    while j + count <= len {
+        if chars[j] == '\\' && j + 1 < len && chars[j + 1].is_ascii_punctuation() {
+            j += 2;
+            continue;
+        }
+        if j > from
+            && chars[j..j + count].iter().all(|&c| c == '_')
+            && !chars[j - 1].is_whitespace()
+            && (j + count >= len || !chars[j + count].is_alphanumeric())
+        {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Converts inline Markdown (`**bold**`, `__bold__`, `*italic*`, `_italic_`, `***both***`,
+/// `___both___`, `` `code` ``, `~~strike~~`, `$equation$`, `[text](url)`, and `\<punct>` escapes)
 /// into a Notion API `rich_text` JSON array.
 pub fn parse_inline_markdown_rich_text(input: &str) -> Vec<Value> {
     inline_markdown_spans(input).into_iter().map(|(_, span)| span).collect()
@@ -1670,18 +1728,35 @@ pub(crate) fn inline_markdown_spans(input: &str) -> Vec<(std::ops::Range<usize>,
     let len = chars.len();
     let mut i = 0usize;
     let mut plain_buf = String::new();
+    let mut plain_start: Option<usize> = None;
 
-    let flush_plain = |buf: &mut String, end: usize, out: &mut Vec<_>| {
-        if !buf.is_empty() {
-            let start = end - buf.chars().count();
-            out.push((start..end, json!({
-                "type": "text",
-                "text": { "content": std::mem::take(buf) }
-            })));
-        }
-    };
+    let flush_plain =
+        |buf: &mut String, start_opt: &mut Option<usize>, end: usize, out: &mut Vec<_>| {
+            if !buf.is_empty() {
+                let start = start_opt.take().unwrap_or(end);
+                out.push((
+                    start..end,
+                    json!({
+                        "type": "text",
+                        "text": { "content": std::mem::take(buf) }
+                    }),
+                ));
+            } else {
+                *start_opt = None;
+            }
+        };
 
     while i < len {
+        // Backslash escape for CommonMark ASCII punctuation: \* \_ \$ \\ etc.
+        if chars[i] == '\\' && i + 1 < len && chars[i + 1].is_ascii_punctuation() {
+            if plain_start.is_none() {
+                plain_start = Some(i);
+            }
+            plain_buf.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+
         // Inline link: [label](url)
         if chars[i] == '[' {
             if let Some(close_br) = (i + 1..len).find(|&j| chars[j] == ']') {
@@ -1690,7 +1765,7 @@ pub(crate) fn inline_markdown_spans(input: &str) -> Vec<(std::ops::Range<usize>,
                         let label: String = chars[i + 1..close_br].iter().collect();
                         let href: String = chars[close_br + 2..close_par].iter().collect();
                         if href.starts_with("http://") || href.starts_with("https://") {
-                            flush_plain(&mut plain_buf, i, &mut spans);
+                            flush_plain(&mut plain_buf, &mut plain_start, i, &mut spans);
                             spans.push((i..close_par + 1, json!({
                                 "type": "text",
                                 "text": { "content": label, "link": { "url": href } }
@@ -1707,7 +1782,7 @@ pub(crate) fn inline_markdown_spans(input: &str) -> Vec<(std::ops::Range<usize>,
         if chars[i] == '`' {
             if let Some(end) = (i + 1..len).find(|&j| chars[j] == '`') {
                 let code: String = chars[i + 1..end].iter().collect();
-                flush_plain(&mut plain_buf, i, &mut spans);
+                flush_plain(&mut plain_buf, &mut plain_start, i, &mut spans);
                 spans.push((i..end + 1, json!({
                     "type": "text",
                     "text": { "content": code },
@@ -1718,13 +1793,109 @@ pub(crate) fn inline_markdown_spans(input: &str) -> Vec<(std::ops::Range<usize>,
             }
         }
 
+        // Inline math: $expression$ -> Notion equation rich_text span
+        if chars[i] == '$'
+            && i + 1 < len
+            && chars[i + 1] != '$'
+            && !chars[i + 1].is_whitespace()
+        {
+            let mut j = i + 1;
+            let mut found_end = None;
+            while j < len {
+                if chars[j] == '\n' {
+                    break;
+                }
+                if chars[j] == '\\' && j + 1 < len && chars[j + 1] == '$' {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == '$' {
+                    if j > i + 1
+                        && !chars[j - 1].is_whitespace()
+                        && (j + 1 >= len
+                            || (chars[j + 1] != '$' && !chars[j + 1].is_ascii_digit()))
+                    {
+                        found_end = Some(j);
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(end) = found_end {
+                let expr: String = chars[i + 1..end].iter().collect();
+                flush_plain(&mut plain_buf, &mut plain_start, i, &mut spans);
+                spans.push((i..end + 1, json!({
+                    "type": "equation",
+                    "equation": { "expression": expr }
+                })));
+                i = end + 1;
+                continue;
+            }
+        }
+
+        // Bold + Italic: ***text***
+        if i + 2 < len && chars[i] == '*' && chars[i + 1] == '*' && chars[i + 2] == '*' {
+            if let Some(end) = find_closing_delim(&chars, i + 3, &['*', '*', '*']) {
+                let text = unescape_inline_chars(&chars[i + 3..end]);
+                flush_plain(&mut plain_buf, &mut plain_start, i, &mut spans);
+                spans.push((i..end + 3, json!({
+                    "type": "text",
+                    "text": { "content": text },
+                    "annotations": { "bold": true, "italic": true }
+                })));
+                i = end + 3;
+                continue;
+            }
+        }
+
+        // Bold + Italic: ___text___ (word-boundary safe)
+        if i + 2 < len
+            && chars[i] == '_'
+            && chars[i + 1] == '_'
+            && chars[i + 2] == '_'
+            && (i == 0 || !chars[i - 1].is_alphanumeric())
+            && i + 3 < len
+            && !chars[i + 3].is_whitespace()
+        {
+            if let Some(end) = find_closing_underscore(&chars, i + 3, 3) {
+                let text = unescape_inline_chars(&chars[i + 3..end]);
+                flush_plain(&mut plain_buf, &mut plain_start, i, &mut spans);
+                spans.push((i..end + 3, json!({
+                    "type": "text",
+                    "text": { "content": text },
+                    "annotations": { "bold": true, "italic": true }
+                })));
+                i = end + 3;
+                continue;
+            }
+        }
+
         // Bold: **text**
         if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
-            if let Some(end) = (i + 2..len.saturating_sub(1))
-                .find(|&j| chars[j] == '*' && chars[j + 1] == '*')
-            {
-                let text: String = chars[i + 2..end].iter().collect();
-                flush_plain(&mut plain_buf, i, &mut spans);
+            if let Some(end) = find_closing_delim(&chars, i + 2, &['*', '*']) {
+                let text = unescape_inline_chars(&chars[i + 2..end]);
+                flush_plain(&mut plain_buf, &mut plain_start, i, &mut spans);
+                spans.push((i..end + 2, json!({
+                    "type": "text",
+                    "text": { "content": text },
+                    "annotations": { "bold": true }
+                })));
+                i = end + 2;
+                continue;
+            }
+        }
+
+        // Bold: __text__ (word-boundary safe)
+        if i + 1 < len
+            && chars[i] == '_'
+            && chars[i + 1] == '_'
+            && (i == 0 || !chars[i - 1].is_alphanumeric())
+            && i + 2 < len
+            && !chars[i + 2].is_whitespace()
+        {
+            if let Some(end) = find_closing_underscore(&chars, i + 2, 2) {
+                let text = unescape_inline_chars(&chars[i + 2..end]);
+                flush_plain(&mut plain_buf, &mut plain_start, i, &mut spans);
                 spans.push((i..end + 2, json!({
                     "type": "text",
                     "text": { "content": text },
@@ -1737,11 +1908,9 @@ pub(crate) fn inline_markdown_spans(input: &str) -> Vec<(std::ops::Range<usize>,
 
         // Strikethrough: ~~text~~
         if i + 1 < len && chars[i] == '~' && chars[i + 1] == '~' {
-            if let Some(end) = (i + 2..len.saturating_sub(1))
-                .find(|&j| chars[j] == '~' && chars[j + 1] == '~')
-            {
-                let text: String = chars[i + 2..end].iter().collect();
-                flush_plain(&mut plain_buf, i, &mut spans);
+            if let Some(end) = find_closing_delim(&chars, i + 2, &['~', '~']) {
+                let text = unescape_inline_chars(&chars[i + 2..end]);
+                flush_plain(&mut plain_buf, &mut plain_start, i, &mut spans);
                 spans.push((i..end + 2, json!({
                     "type": "text",
                     "text": { "content": text },
@@ -1753,27 +1922,48 @@ pub(crate) fn inline_markdown_spans(input: &str) -> Vec<(std::ops::Range<usize>,
         }
 
         // Italic: *text*
-        if chars[i] == '*' {
-            if let Some(end) = (i + 1..len).find(|&j| chars[j] == '*') {
-                if end > i + 1 {
-                    let text: String = chars[i + 1..end].iter().collect();
-                    flush_plain(&mut plain_buf, i, &mut spans);
-                    spans.push((i..end + 1, json!({
-                        "type": "text",
-                        "text": { "content": text },
-                        "annotations": { "italic": true }
-                    })));
-                    i = end + 1;
-                    continue;
-                }
+        if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*') {
+            if let Some(end) = find_closing_delim(&chars, i + 1, &['*']) {
+                let text = unescape_inline_chars(&chars[i + 1..end]);
+                flush_plain(&mut plain_buf, &mut plain_start, i, &mut spans);
+                spans.push((i..end + 1, json!({
+                    "type": "text",
+                    "text": { "content": text },
+                    "annotations": { "italic": true }
+                })));
+                i = end + 1;
+                continue;
             }
         }
 
+        // Italic: _text_ (word-boundary safe)
+        if chars[i] == '_'
+            && (i == 0 || !chars[i - 1].is_alphanumeric())
+            && i + 1 < len
+            && chars[i + 1] != '_'
+            && !chars[i + 1].is_whitespace()
+        {
+            if let Some(end) = find_closing_underscore(&chars, i + 1, 1) {
+                let text = unescape_inline_chars(&chars[i + 1..end]);
+                flush_plain(&mut plain_buf, &mut plain_start, i, &mut spans);
+                spans.push((i..end + 1, json!({
+                    "type": "text",
+                    "text": { "content": text },
+                    "annotations": { "italic": true }
+                })));
+                i = end + 1;
+                continue;
+            }
+        }
+
+        if plain_start.is_none() {
+            plain_start = Some(i);
+        }
         plain_buf.push(chars[i]);
         i += 1;
     }
 
-    flush_plain(&mut plain_buf, i, &mut spans);
+    flush_plain(&mut plain_buf, &mut plain_start, i, &mut spans);
     if spans.is_empty() {
         spans.push((0..0, json!({ "type": "text", "text": { "content": "" } })));
     }
@@ -1839,11 +2029,56 @@ pub(crate) fn is_markdown_table_separator(line: &str) -> bool {
         })
 }
 
+/// Restores `<br>` / `<br/>` / `<br />` (outside inline code) back to `\n` for symmetric
+/// round-trip with `escape_table_cell`.
+fn unescape_table_cell_breaks(cell: &str) -> String {
+    let bytes = cell.as_bytes();
+    let mut out = String::with_capacity(cell.len());
+    let mut i = 0usize;
+    let mut in_code = false;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            in_code = !in_code;
+            out.push('`');
+            i += 1;
+            continue;
+        }
+        if !in_code && bytes[i] == b'<' {
+            let rest = &bytes[i + 1..];
+            if rest.len() >= 3
+                && (rest[0] == b'b' || rest[0] == b'B')
+                && (rest[1] == b'r' || rest[1] == b'R')
+            {
+                let mut k = 2;
+                while k < rest.len() && rest[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k < rest.len() && rest[k] == b'/' {
+                    k += 1;
+                    while k < rest.len() && rest[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                }
+                if k < rest.len() && rest[k] == b'>' {
+                    out.push('\n');
+                    i += 1 + k + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = cell[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn build_table_row_block(cells: &[String], width: usize) -> Value {
     let mut notion_cells = Vec::with_capacity(width);
     for idx in 0..width {
-        let cell_text = cells.get(idx).map(String::as_str).unwrap_or("");
-        notion_cells.push(Value::Array(parse_inline_markdown_rich_text(cell_text)));
+        let raw_cell = cells.get(idx).map(String::as_str).unwrap_or("");
+        let cell_text = unescape_table_cell_breaks(raw_cell);
+        notion_cells.push(Value::Array(parse_inline_markdown_rich_text(&cell_text)));
     }
     json!({
         "object": "block",
@@ -1957,6 +2192,51 @@ pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
             continue;
         }
 
+        // Display math block: $$expr$$ (single-line) or $$\nexpr\n$$ (multi-line)
+        if let Some(after_open) = trimmed.strip_prefix("$$") {
+            if let Some(single) = after_open.strip_suffix("$$") {
+                if !single.trim().is_empty() {
+                    active_list_root = None;
+                    blocks.push(json!({
+                        "object": "block",
+                        "type": "equation",
+                        "equation": { "expression": single.trim() }
+                    }));
+                    i += 1;
+                    continue;
+                }
+            }
+            let mut expr_lines = Vec::new();
+            if !after_open.trim().is_empty() {
+                expr_lines.push(after_open.trim());
+            }
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < lines.len() {
+                let t = lines[j].trim();
+                if let Some(before_close) = t.strip_suffix("$$") {
+                    if !before_close.trim().is_empty() {
+                        expr_lines.push(before_close.trim());
+                    }
+                    closed = true;
+                    j += 1;
+                    break;
+                }
+                expr_lines.push(lines[j]);
+                j += 1;
+            }
+            if closed {
+                active_list_root = None;
+                blocks.push(json!({
+                    "object": "block",
+                    "type": "equation",
+                    "equation": { "expression": expr_lines.join("\n").trim() }
+                }));
+                i = j;
+                continue;
+            }
+        }
+
         // Divider --- or ***
         if trimmed == "---" || trimmed == "***" || trimmed == "___" {
             active_list_root = None;
@@ -1969,8 +2249,13 @@ pub fn markdown_to_notion_blocks(markdown: &str) -> Vec<Value> {
             continue;
         }
 
-        // Headings
-        if let Some(rest) = trimmed.strip_prefix("### ") {
+        // Headings (Notion supports heading_1..heading_3; map H4..H6 to heading_3)
+        if let Some(rest) = trimmed
+            .strip_prefix("###### ")
+            .or_else(|| trimmed.strip_prefix("##### "))
+            .or_else(|| trimmed.strip_prefix("#### "))
+            .or_else(|| trimmed.strip_prefix("### "))
+        {
             active_list_root = None;
             blocks.push(json!({
                 "object": "block",
@@ -3141,5 +3426,138 @@ mod tests {
         let ser = serde_json::to_value(&minimal).unwrap();
         assert!(ser.get("created_by").is_none());
         assert!(ser.get("last_edited_by").is_none());
+    }
+
+    #[test]
+    fn table_br_roundtrip_h4_math_inline() {
+        // 1. Table cell `\n` -> escape_table_cell -> markdown_to_notion_blocks restores `\n` (0 raw `<br>`)
+        let escaped = escape_table_cell("Line1\nLine2");
+        assert_eq!(escaped, "Line1<br>Line2");
+        let table_md = format!(
+            "| Col A | Col B | Col C |\n| --- | --- | --- |\n| {escaped} | A<br/>B | C<br />D |\n| `<br>` | **Bold**<br>_Italic_ | $a+b$ |"
+        );
+        let blocks = markdown_to_notion_blocks(&table_md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "table");
+        let rows = blocks[0]["table"]["children"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        let cell_1_0 = rows[1]["table_row"]["cells"][0][0]["text"]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(cell_1_0, "Line1\nLine2");
+        assert!(!cell_1_0.contains("<br"));
+        assert_eq!(
+            rows[1]["table_row"]["cells"][1][0]["text"]["content"],
+            "A\nB"
+        );
+        assert_eq!(
+            rows[1]["table_row"]["cells"][2][0]["text"]["content"],
+            "C\nD"
+        );
+        // Inline code `<br>` stays literal
+        assert_eq!(
+            rows[2]["table_row"]["cells"][0][0]["text"]["content"],
+            "<br>"
+        );
+        assert_eq!(
+            rows[2]["table_row"]["cells"][0][0]["annotations"]["code"],
+            true
+        );
+        // Mixed formatting + <br> in cell
+        let mixed_cell = rows[2]["table_row"]["cells"][1].as_array().unwrap();
+        assert_eq!(mixed_cell[0]["text"]["content"], "Bold");
+        assert_eq!(mixed_cell[0]["annotations"]["bold"], true);
+        assert_eq!(mixed_cell[1]["text"]["content"], "\n");
+        assert_eq!(mixed_cell[2]["text"]["content"], "Italic");
+        assert_eq!(mixed_cell[2]["annotations"]["italic"], true);
+        // Inline math in table cell
+        assert_eq!(rows[2]["table_row"]["cells"][2][0]["type"], "equation");
+        assert_eq!(
+            rows[2]["table_row"]["cells"][2][0]["equation"]["expression"],
+            "a+b"
+        );
+
+        // 2. H4..H6 down-mapped to heading_3 + single-line and multi-line `$$...$$` equation blocks
+        let doc_md = "#### H4 Title\n##### H5 Title\n###### H6 Title\n\n$$x+y$$\n\n$$\nE = mc^2\n+ 1\n$$";
+        let doc_blocks = markdown_to_notion_blocks(doc_md);
+        assert_eq!(doc_blocks.len(), 5);
+        assert_eq!(doc_blocks[0]["type"], "heading_3");
+        assert_eq!(
+            doc_blocks[0]["heading_3"]["rich_text"][0]["text"]["content"],
+            "H4 Title"
+        );
+        assert_eq!(doc_blocks[1]["type"], "heading_3");
+        assert_eq!(
+            doc_blocks[1]["heading_3"]["rich_text"][0]["text"]["content"],
+            "H5 Title"
+        );
+        assert_eq!(doc_blocks[2]["type"], "heading_3");
+        assert_eq!(
+            doc_blocks[2]["heading_3"]["rich_text"][0]["text"]["content"],
+            "H6 Title"
+        );
+        assert_eq!(doc_blocks[3]["type"], "equation");
+        assert_eq!(doc_blocks[3]["equation"]["expression"], "x+y");
+        assert_eq!(doc_blocks[4]["type"], "equation");
+        assert_eq!(doc_blocks[4]["equation"]["expression"], "E = mc^2\n+ 1");
+
+        // Round-trip parsed Notion equation block back through blocks_to_markdown -> markdown_to_notion_blocks
+        let parsed_eq = parse_notion_block(&doc_blocks[4], "p1", None);
+        let exported = blocks_to_markdown(&[parsed_eq]);
+        let reimported = markdown_to_notion_blocks(&exported);
+        assert_eq!(reimported.len(), 1);
+        assert_eq!(reimported[0]["type"], "equation");
+        assert_eq!(reimported[0]["equation"]["expression"], "E = mc^2\n+ 1");
+
+        // 3. Inline Markdown: _italic_, __bold__, ***both***, ___both___, $a+b$, escapes, intraword _, currency $
+        let rich = parse_inline_markdown_rich_text(
+            "pre _italic_ __bold__ ***both*** ___also___ $a+b$ \\*lit\\* snake_case_var $5 and $10",
+        );
+        assert!(rich.iter().any(|v| v["text"]["content"] == "italic" && v["annotations"]["italic"] == true));
+        assert!(rich.iter().any(|v| v["text"]["content"] == "bold" && v["annotations"]["bold"] == true));
+        assert!(rich.iter().any(|v| {
+            v["text"]["content"] == "both"
+                && v["annotations"]["bold"] == true
+                && v["annotations"]["italic"] == true
+        }));
+        assert!(rich.iter().any(|v| {
+            v["text"]["content"] == "also"
+                && v["annotations"]["bold"] == true
+                && v["annotations"]["italic"] == true
+        }));
+        assert!(rich
+            .iter()
+            .any(|v| v["type"] == "equation" && v["equation"]["expression"] == "a+b"));
+        let plain_joined: String = rich
+            .iter()
+            .filter(|v| v.get("annotations").is_none() && v["type"] == "text")
+            .filter_map(|v| v["text"]["content"].as_str())
+            .collect();
+        assert!(plain_joined.contains("*lit*"));
+        assert!(plain_joined.contains("snake_case_var"));
+        assert!(plain_joined.contains("$5 and $10"));
+
+        // 4. Unicode scalar offset contract preserved with multi-byte chars & backslash escapes
+        let src = "한글 \\*esc\\* _기울임_ $x^2$ 끝";
+        let chars: Vec<char> = src.chars().collect();
+        let spans_with_ranges = inline_markdown_spans(src);
+        assert_eq!(spans_with_ranges.first().unwrap().0.start, 0);
+        assert_eq!(spans_with_ranges.last().unwrap().0.end, chars.len());
+        for pair in spans_with_ranges.windows(2) {
+            assert_eq!(
+                pair[0].0.end, pair[1].0.start,
+                "Unicode scalar ranges must be contiguous"
+            );
+        }
+        // Verify parsed equation rich_text preserves plain_text fallback via parse_rich_text_array
+        let rt_eq = parse_rich_text_array(Some(&json!(parse_inline_markdown_rich_text("$a+b$"))));
+        assert_eq!(rt_eq.len(), 1);
+        assert_eq!(rt_eq[0].plain_text, "a+b");
+        assert_eq!(
+            rt_eq[0].kind,
+            RichTextKind::Equation {
+                expression: "a+b".into()
+            }
+        );
     }
 }

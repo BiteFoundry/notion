@@ -28,9 +28,20 @@ pub fn is_html_media(item: &NotionMediaRef) -> bool {
         || sniff_content_kind(None, Some(&item.url), None) == ContentKind::Html
 }
 
+pub fn is_markdown_media(item: &NotionMediaRef) -> bool {
+    let lower_mime = item.mime_type.to_ascii_lowercase();
+    if lower_mime.contains("markdown") {
+        return true;
+    }
+    sniff_content_kind(Some(&item.mime_type), Some(&item.display_name), None)
+        == ContentKind::Markdown
+        || sniff_content_kind(None, Some(&item.url), None) == ContentKind::Markdown
+}
+
 pub fn is_raster_image_media(item: &NotionMediaRef) -> bool {
     item.is_image
         && !is_html_media(item)
+        && !is_markdown_media(item)
         && crate::img_preview::is_image_mime_or_name(&item.mime_type, Some(&item.display_name))
 }
 
@@ -103,7 +114,7 @@ impl AttachmentsState {
                 if let Some(detail) = app.active_page_detail.as_ref() {
                     let selected_idx = self.selected.min(len.saturating_sub(1));
                     if let Some(item) = self.media(app).get(selected_idx) {
-                        if is_html_media(item) {
+                        if is_html_media(item) || is_markdown_media(item) {
                             return OverlayOutcome::CloseAndDispatch(Action::FetchHtmlPreview {
                                 title: item.display_name.clone(),
                                 url: item.url.clone(),
@@ -179,6 +190,8 @@ impl AttachmentsState {
             };
             let icon = if is_html_media(item) {
                 "🌐"
+            } else if is_markdown_media(item) {
+                "[MD]"
             } else if is_raster_image_media(item) {
                 "🖼"
             } else {

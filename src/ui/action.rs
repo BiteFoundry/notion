@@ -625,11 +625,16 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     NotionBlockKind::File { url, name, .. } => {
                         let bid = vblk.block.id.clone();
                         let u = url.clone();
-                        if is_html_or_xml_ref(&u, name.as_deref()) {
+                        if is_previewable_markup_ref(&u, name.as_deref()) {
+                            let fallback = if is_markdown_file_ref(&u, name.as_deref()) {
+                                "Markdown File"
+                            } else {
+                                "HTML File"
+                            };
                             let title = name
                                 .clone()
                                 .filter(|s| !s.trim().is_empty())
-                                .unwrap_or_else(|| "HTML File".to_string());
+                                .unwrap_or_else(|| fallback.to_string());
                             let pid = app.active_page_id.clone();
                             return dispatch(
                                 Action::FetchHtmlPreview {
@@ -1028,12 +1033,17 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                             return dispatch(Action::OpenHtmlPreview { title, html }, app, ui);
                         }
                         NotionBlockKind::File { url, name, .. }
-                            if is_html_or_xml_ref(url, name.as_deref()) =>
+                            if is_previewable_markup_ref(url, name.as_deref()) =>
                         {
+                            let fallback = if is_markdown_file_ref(url, name.as_deref()) {
+                                "Markdown File"
+                            } else {
+                                "HTML File"
+                            };
                             let title = name
                                 .clone()
                                 .filter(|s| !s.trim().is_empty())
-                                .unwrap_or_else(|| "HTML File".to_string());
+                                .unwrap_or_else(|| fallback.to_string());
                             let u = url.clone();
                             let bid = vblk.block.id.clone();
                             let pid = Some(detail.page.id.clone());
@@ -1172,12 +1182,28 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     }
                 };
                 match fetched {
-                    Ok((bytes, _mime)) => {
+                    Ok((bytes, mime)) => {
+                        let effective_mime = if sniff_content_kind(
+                            Some(&mime),
+                            Some(&title),
+                            Some(&bytes),
+                        ) == ContentKind::Markdown
+                            || (sniff_content_kind(None, Some(&url), None) == ContentKind::Markdown
+                                && !bitefoundry_html::looks_like_html_bytes(&bytes)
+                                && !bitefoundry_html::looks_like_svg_bytes(&bytes))
+                        {
+                            Some("text/markdown".to_string())
+                        } else if mime.trim().is_empty() {
+                            None
+                        } else {
+                            Some(mime)
+                        };
                         let html = String::from_utf8_lossy(&bytes).into_owned();
                         let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded {
                             seq: req_seq,
                             title,
                             html,
+                            mime: effective_mime,
                         });
                     }
                     Err(err) => {
@@ -1192,7 +1218,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::ServeActiveHtml => {
             if let Some(Overlay::HtmlPreview(ov)) = ui.overlays.last() {
                 let title = ov.title.clone();
-                let raw_html = ov.session.raw_html().to_string();
+                let raw_html = ov.session.serve_html();
                 let server = app.html_server.clone();
                 let ui_tx = app.ui_tx.clone();
                 ui.tasks.begin("html-serve");
@@ -1856,6 +1882,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                                             seq: req_seq,
                                             title: display_name,
                                             html: xml_src,
+                                            mime: Some(mime),
                                         });
                                     } else {
                                         match sniff_content_kind(
@@ -1863,13 +1890,14 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                                             Some(&display_name),
                                             Some(&bytes),
                                         ) {
-                                            ContentKind::Html => {
+                                            ContentKind::Html | ContentKind::Markdown => {
                                                 let html =
                                                     String::from_utf8_lossy(&bytes).into_owned();
                                                 let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded {
                                                     seq: req_seq,
                                                     title: display_name,
                                                     html,
+                                                    mime: Some(mime),
                                                 });
                                             }
                                             _ => {
@@ -2506,11 +2534,16 @@ fn handle_mouse_click(
                     NotionBlockKind::File { url, name, .. } => {
                         let block_id = vblk.block.id.clone();
                         let u = url.clone();
-                        if is_html_or_xml_ref(&u, name.as_deref()) {
+                        if is_previewable_markup_ref(&u, name.as_deref()) {
+                            let fallback = if is_markdown_file_ref(&u, name.as_deref()) {
+                                "Markdown File"
+                            } else {
+                                "HTML File"
+                            };
                             let title = name
                                 .clone()
                                 .filter(|s| !s.trim().is_empty())
-                                .unwrap_or_else(|| "HTML File".to_string());
+                                .unwrap_or_else(|| fallback.to_string());
                             let pid = app.active_page_id.clone();
                             return dispatch(
                                 Action::FetchHtmlPreview {
@@ -2678,6 +2711,15 @@ pub(crate) fn is_html_code_language(language: &str) -> bool {
 pub(crate) fn is_html_file_ref(url: &str, name: Option<&str>) -> bool {
     name.is_some_and(|n| sniff_content_kind(None, Some(n), None) == ContentKind::Html)
         || sniff_content_kind(None, Some(url), None) == ContentKind::Html
+}
+
+pub(crate) fn is_markdown_file_ref(url: &str, name: Option<&str>) -> bool {
+    name.is_some_and(|n| sniff_content_kind(None, Some(n), None) == ContentKind::Markdown)
+        || sniff_content_kind(None, Some(url), None) == ContentKind::Markdown
+}
+
+fn is_previewable_markup_ref(url: &str, name: Option<&str>) -> bool {
+    is_html_or_xml_ref(url, name) || is_markdown_file_ref(url, name)
 }
 
 fn is_html_or_xml_ref(url: &str, name: Option<&str>) -> bool {
@@ -5767,6 +5809,7 @@ mod tests {
                 seq: stale_seq,
                 title: "Stale".into(),
                 html: "<p>stale</p>".into(),
+                mime: None,
             },
         );
         assert!(ui.overlays.is_empty(), "stale HtmlPreviewLoaded must not hijack screen");
@@ -5813,5 +5856,330 @@ mod tests {
         assert!(ui.inline_editor.is_none());
         assert!(app.active_page_detail.as_ref().unwrap().page.archived);
         assert!(app.active_database_rows.iter().all(|r| r.id != "page-root" || r.archived));
+    }
+
+    #[tokio::test]
+    async fn test_markdown_file_block_preview_and_raw_toggle() {
+        use axum::{http::header, routing::get, Router};
+        use bitefoundry_html::SourceKind;
+        use ratatui::{backend::TestBackend, Terminal};
+        use tokio::net::TcpListener;
+
+        let md_body = "# Title\n\n**bold** | [link](https://example.com)\n";
+        let router = Router::new().route(
+            "/files/README.md",
+            get(move || async move {
+                (
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    md_body,
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let md_url = format!("http://{addr}/files/README.md");
+        let (mut app, mut ui) = make_test_app_and_ui();
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.ui_tx = ui_tx;
+        app.active_view = CanvasView::Page;
+        app.active_page_id = Some("page-md".into());
+        app.active_page_detail = Some(NotionPageDetail {
+            page: NotionPage {
+                id: "page-md".into(),
+                title: "Markdown Attachment Page".into(),
+                ..Default::default()
+            },
+            blocks: vec![NotionBlock {
+                id: "blk-md-1".into(),
+                page_id: "page-md".into(),
+                kind: NotionBlockKind::File {
+                    url: md_url.clone(),
+                    name: Some("README.md".into()),
+                    caption: Vec::new(),
+                },
+                ..Default::default()
+            }],
+            comments: Vec::new(),
+            comments_error: None,
+            markdown: String::new(),
+            media: vec![
+                NotionMediaRef {
+                    block_id: "blk-md-1".into(),
+                    url: md_url.clone(),
+                    display_name: "README.md".into(),
+                    mime_type: "text/markdown".into(),
+                    is_image: false,
+                },
+                NotionMediaRef {
+                    block_id: "blk-md-2".into(),
+                    url: md_url.clone(),
+                    display_name: "README.md".into(),
+                    mime_type: "application/octet-stream".into(),
+                    is_image: false,
+                },
+            ],
+        });
+
+        // 1. Canvas File block chip and Attachments overlay both display `[MD]`
+        let area = Rect::new(0, 0, 100, 28);
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+        let canvas_text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            canvas_text.contains("[MD] README.md"),
+            "canvas file block should show [MD] badge"
+        );
+
+        let mut att = crate::ui::overlays::attachments::AttachmentsState::default();
+        terminal
+            .draw(|frame| {
+                let mut hm = crate::ui::HitMap::new();
+                att.draw(frame, area, &app, &ui, &mut hm);
+            })
+            .unwrap();
+        let att_text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            att_text.contains("[MD] README.md"),
+            "attachments tray should show [MD] badge"
+        );
+
+        // 2. Pressing `v` on both `text/markdown` and `application/octet-stream` `.md` items dispatches FetchHtmlPreview
+        for idx in [0usize, 1usize] {
+            att.selected = idx;
+            match att.handle(&Action::Input('v'), &app) {
+                OverlayOutcome::CloseAndDispatch(Action::FetchHtmlPreview { title, url, .. }) => {
+                    assert_eq!(title, "README.md");
+                    assert_eq!(url, md_url);
+                }
+                other => panic!("expected FetchHtmlPreview for README.md idx {idx}, got {other:?}"),
+            }
+        }
+
+        // 3. Clicking canvas MediaChip dispatches FetchHtmlPreview and opens Overlay::HtmlPreview with SourceKind::Markdown
+        let chip_rect = ui
+            .hitmap
+            .region_of(HitTarget::MediaChip(0))
+            .expect("MediaChip(0) should be in hitmap");
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::MediaChip(0),
+                col: chip_rect.x + 2,
+                row: chip_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+            .await
+            .expect("timed out waiting for HtmlPreviewLoaded")
+            .expect("ui_rx closed");
+        app.handle_ui_msg(&mut ui, msg);
+
+        let Some(Overlay::HtmlPreview(ov)) = ui.overlays.last_mut() else {
+            panic!("expected Overlay::HtmlPreview for README.md");
+        };
+        assert_eq!(ov.session.source_kind(), SourceKind::Markdown);
+        assert!(!ov.session.js_active, "Markdown preview must not spawn QuickJS");
+
+        // Rendered mode: Title, bold, link shown; 0 raw `**`
+        let html_theme =
+            crate::ui::overlays::html_preview::HtmlPreviewOverlay::html_theme_from(&ui.theme);
+        let rendered_text: String = ov
+            .session
+            .render(80, &html_theme, false)
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(rendered_text.contains("Title"));
+        assert!(rendered_text.contains("bold"));
+        assert!(rendered_text.contains("link"));
+        assert!(
+            !rendered_text.contains("**"),
+            "rendered Markdown preview must not leak raw **: {rendered_text}"
+        );
+
+        // `r` toggles raw mode and shows raw `# Title`
+        assert_eq!(ov.handle(&Action::Input('r')), OverlayOutcome::Handled);
+        assert!(ov.session.raw_mode);
+        let raw_text: String = ov
+            .session
+            .render(80, &html_theme, false)
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            raw_text.contains("# Title"),
+            "raw mode must show raw `# Title`: {raw_text}"
+        );
+
+        // `o` dispatches ServeActiveHtml and session.serve_html() produces standalone HTML
+        assert_eq!(
+            ov.handle(&Action::Input('o')),
+            OverlayOutcome::Dispatch(Action::ServeActiveHtml)
+        );
+        let served_html = ov.session.serve_html();
+        assert!(served_html.contains("<!DOCTYPE html>"));
+        assert!(served_html.contains("<strong>bold</strong>"));
+
+        server_handle.abort();
+    }
+
+    #[test]
+    fn test_equation_block_inline_math_and_comment_rich_text_rendering() {
+        use crate::models::{RichTextAnnotations, RichTextKind};
+        use ratatui::{backend::TestBackend, style::Modifier, Terminal};
+
+        let (mut app, mut ui) = make_test_app_and_ui();
+        ui.theme = crate::ui::theme::Theme::clean_dark();
+        app.active_view = CanvasView::Page;
+        app.active_page_id = Some("page-math".into());
+        ui.comments_drawer_open = true;
+
+        app.active_page_detail = Some(NotionPageDetail {
+            page: NotionPage {
+                id: "page-math".into(),
+                title: "Math & Comments".into(),
+                ..Default::default()
+            },
+            blocks: vec![
+                NotionBlock {
+                    id: "blk-eq".into(),
+                    page_id: "page-math".into(),
+                    kind: NotionBlockKind::Equation {
+                        expression: "E = mc^2\n+ p^2 c^2".into(),
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "blk-p".into(),
+                    page_id: "page-math".into(),
+                    kind: NotionBlockKind::Paragraph {
+                        rich_text: vec![
+                            RichTextSpan::plain("Inline "),
+                            RichTextSpan {
+                                plain_text: "a+b".into(),
+                                kind: RichTextKind::Equation {
+                                    expression: "a+b".into(),
+                                },
+                                ..Default::default()
+                            },
+                        ],
+                        color: NotionColor::Default,
+                    },
+                    ..Default::default()
+                },
+            ],
+            comments: vec![NotionComment {
+                id: "c1".into(),
+                page_id: "page-math".into(),
+                discussion_id: "d1".into(),
+                author: "Alice".into(),
+                body: "BoldWord and CodeWord".into(),
+                rich_text: vec![
+                    RichTextSpan {
+                        plain_text: "BoldWord".into(),
+                        annotations: RichTextAnnotations {
+                            bold: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    RichTextSpan::plain(" and "),
+                    RichTextSpan {
+                        plain_text: "CodeWord".into(),
+                        annotations: RichTextAnnotations {
+                            code: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                ],
+                created_time: "2026-01-01T12:00:00Z".into(),
+            }],
+            comments_error: None,
+            markdown: String::new(),
+            media: Vec::new(),
+        });
+
+        let area = Rect::new(0, 0, 120, 30);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let find_word_cell = |word: &str| {
+            let first_ch = word.chars().next().unwrap().to_string();
+            for y in 0..area.height {
+                let row: String = (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect();
+                if let Some(byte_idx) = row.find(word) {
+                    let col = row[..byte_idx].chars().count() as u16;
+                    if buf[(col, y)].symbol() == first_ch {
+                        return Some(&buf[(col, y)]);
+                    }
+                }
+            }
+            None
+        };
+
+        // Block equation (line 1 & line 2) and inline equation carry distinct ITALIC math styling
+        let eq_cell = find_word_cell("E = mc^2").expect("block equation line 1 rendered");
+        assert!(
+            eq_cell.modifier.contains(Modifier::ITALIC),
+            "block equation must have distinct italic math styling"
+        );
+        let eq_line2 = find_word_cell("+ p^2 c^2").expect("block equation line 2 rendered");
+        assert!(eq_line2.modifier.contains(Modifier::ITALIC));
+
+        let inline_math_cell = find_word_cell("a+b").expect("inline equation rendered");
+        assert!(
+            inline_math_cell.modifier.contains(Modifier::ITALIC),
+            "inline equation must have distinct italic math styling"
+        );
+        assert_ne!(
+            inline_math_cell.fg,
+            ui.theme.code_fg,
+            "math styling should be visually distinct from plain code_fg"
+        );
+
+        // Comment rich-text annotations respected in drawer
+        let bold_comment = find_word_cell("BoldWord").expect("bold comment span rendered");
+        assert!(
+            bold_comment.modifier.contains(Modifier::BOLD),
+            "comment rich_text bold annotation must be applied"
+        );
+        let code_comment = find_word_cell("CodeWord").expect("code comment span rendered");
+        assert_eq!(
+            code_comment.fg,
+            ui.theme.code_fg,
+            "comment rich_text code annotation must apply code_fg"
+        );
     }
 }

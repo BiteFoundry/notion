@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use bitefoundry_html::{HtmlEffect, HtmlTheme, HtmlViewSession};
+use bitefoundry_html::{HtmlEffect, HtmlTheme, HtmlViewSession, SourceKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -102,6 +102,33 @@ impl HtmlPreviewOverlay {
         }
     }
 
+    pub fn new_markdown(title: impl Into<String>, raw_md: String) -> Self {
+        let title_str = title.into();
+        let session = HtmlViewSession::new_markdown(
+            (!title_str.trim().is_empty()).then_some(title_str.clone()),
+            raw_md,
+        );
+        let resolved_title = session
+            .title()
+            .filter(|t| !t.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if title_str.trim().is_empty() {
+                    "Markdown Preview".to_string()
+                } else {
+                    title_str
+                }
+            });
+        Self {
+            title: resolved_title,
+            session,
+            body_rect: Rect::default(),
+            last_max_scroll: 0,
+            graphic_cache: HashMap::new(),
+            last_graphic_env: None,
+        }
+    }
+
     pub fn accepts_text(&self) -> bool {
         self.session.editing_input.is_some()
     }
@@ -112,10 +139,11 @@ impl HtmlPreviewOverlay {
         }
         let raw = self.session.toggle_raw_mode();
         self.session.scroll_y = 0;
-        self.session.last_status = Some(if raw {
-            "Raw HTML source view".to_string()
-        } else {
-            "Rendered interactive view".to_string()
+        self.session.last_status = Some(match (self.session.source_kind(), raw) {
+            (SourceKind::Markdown, true) => "Raw Markdown source view".to_string(),
+            (SourceKind::Markdown, false) => "Rendered Markdown view".to_string(),
+            (SourceKind::Html, true) => "Raw HTML source view".to_string(),
+            (SourceKind::Html, false) => "Rendered interactive view".to_string(),
         });
     }
 
@@ -222,7 +250,7 @@ impl HtmlPreviewOverlay {
                 let effs = self.session.activate_focused();
                 self.apply_effects(effs)
             }
-            Action::Input('m') | Action::Input('M') => {
+            Action::Input('m') | Action::Input('M') | Action::Input('r') | Action::Input('R') => {
                 self.toggle_raw_mode();
                 OverlayOutcome::Handled
             }
@@ -349,19 +377,18 @@ impl HtmlPreviewOverlay {
         let pills_w = (mode_pill.width() + 1 + serve_pill.width() + 1 + close_pill.width()) as u16;
         let show_pills = rect.width > pills_w + 8;
 
-        let js_badge = if self.session.js_active {
-            "JS"
-        } else {
-            "Static"
+        let (icon, mode_badge) = match self.session.source_kind() {
+            SourceKind::Markdown => ("📝", "MD"),
+            SourceKind::Html => ("🌐", if self.session.js_active { "JS" } else { "Static" }),
         };
         let title_budget = rect
             .width
             .saturating_sub(2 + if show_pills { pills_w + 2 } else { 0 })
             as usize;
         let header = format!(
-            " 🌐 {} · {} ",
+            " {icon} {} · {} ",
             crate::ui::truncate_width(&self.title, 34),
-            js_badge
+            mode_badge
         );
 
         let block = Block::default()

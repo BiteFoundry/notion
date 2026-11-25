@@ -157,6 +157,10 @@ impl Overlay {
         Overlay::HtmlPreview(HtmlPreviewOverlay::new(title, html))
     }
 
+    pub fn markdown_preview(title: impl Into<String>, markdown: String) -> Self {
+        Overlay::HtmlPreview(HtmlPreviewOverlay::new_markdown(title, markdown))
+    }
+
     pub fn help() -> Self {
         Overlay::Help(HelpOverlay)
     }

@@ -301,6 +301,7 @@ pub enum UiMsg {
         seq: u64,
         title: String,
         html: String,
+        mime: Option<String>,
     },
     HtmlServed {
         url: String,
@@ -1894,7 +1895,12 @@ impl AppState {
                     ov.error = Some(error);
                 }
             }
-            UiMsg::HtmlPreviewLoaded { seq, title, html } => {
+            UiMsg::HtmlPreviewLoaded {
+                seq,
+                title,
+                html,
+                mime,
+            } => {
                 ui.tasks.finish("html", None);
                 if seq != ui.preview_request_seq {
                     return;
@@ -1907,8 +1913,18 @@ impl AppState {
                     ui.active_pixel_graphic = None;
                     ui.pending_pixel_graphics.clear();
                 }
-                ui.overlays.push(Overlay::html_preview(title, html));
-                ui.info("Opened interactive HTML viewer");
+                let kind = bitefoundry_html::sniff_content_kind(
+                    mime.as_deref(),
+                    Some(&title),
+                    Some(html.as_bytes()),
+                );
+                if kind == bitefoundry_html::ContentKind::Markdown {
+                    ui.overlays.push(Overlay::markdown_preview(title, html));
+                    ui.info("Opened Markdown viewer");
+                } else {
+                    ui.overlays.push(Overlay::html_preview(title, html));
+                    ui.info("Opened interactive HTML viewer");
+                }
             }
             UiMsg::HtmlServed { url } => {
                 ui.tasks.finish("html-serve", None);

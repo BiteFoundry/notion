@@ -8,7 +8,7 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -21,7 +21,7 @@ use crate::{
     config::PageWidthMode,
     models::{
         spans_plain_text, DatabaseViewMode, NotionBlockKind, NotionColor, NotionDatabase,
-        NotionPageDetail, NotionPropertyValue, RichTextSpan,
+        NotionPageDetail, NotionPropertyValue, RichTextKind, RichTextSpan,
     },
     ui::{
         app::{AppState, CanvasView, Focus, InlineSyncStatus, UiState, VisibleBlock},
@@ -1527,6 +1527,14 @@ fn render_block_lines(
                         .bg(theme.bg_card)
                         .add_modifier(Modifier::BOLD),
                 )
+            } else if crate::ui::action::is_markdown_file_ref(url, name.as_deref()) {
+                Span::styled(
+                    format!(" 📝 [MD] {label} (Enter/v: preview) "),
+                    Style::default()
+                        .fg(theme.accent_soft)
+                        .bg(theme.bg_card)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
                 Span::styled(
                     format!(" 📎 {label} "),
@@ -1552,15 +1560,26 @@ fn render_block_lines(
             ));
         }
         NotionBlockKind::Equation { expression } => {
-            out.push((
-                Line::from(vec![
-                    cursor_gutter,
-                    Span::raw(indent),
-                    Span::styled(format!(" ∑  {expression} "), theme.code_style()),
-                ])
-                .style(sel_bg),
-                Some(HitTarget::CanvasBlock(idx)),
-            ));
+            let badge_style = math_badge_style(theme);
+            let expr_style = math_style(theme);
+            let expr_lines: Vec<&str> = if expression.is_empty() {
+                vec![""]
+            } else {
+                expression.lines().collect()
+            };
+            for (line_idx, expr_line) in expr_lines.into_iter().enumerate() {
+                let prefix = if line_idx == 0 { " ∑ " } else { " │ " };
+                out.push((
+                    Line::from(vec![
+                        cursor_gutter.clone(),
+                        Span::raw(indent.clone()),
+                        Span::styled(prefix, badge_style),
+                        Span::styled(format!(" {expr_line} "), expr_style),
+                    ])
+                    .style(sel_bg),
+                    Some(HitTarget::CanvasBlock(idx)),
+                ));
+            }
         }
         NotionBlockKind::TableOfContents { .. } => {
             out.push((
@@ -1709,6 +1728,38 @@ fn render_unicode_table(
     ));
 }
 
+fn math_style(theme: &Theme) -> Style {
+    if theme.no_color {
+        Style::default().add_modifier(Modifier::ITALIC | Modifier::BOLD)
+    } else if theme.ansi16_only {
+        Style::default()
+            .fg(Color::Magenta)
+            .bg(theme.bg_code)
+            .add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default()
+            .fg(theme.notion_text_color(NotionColor::Purple))
+            .bg(theme.bg_code)
+            .add_modifier(Modifier::ITALIC)
+    }
+}
+
+fn math_badge_style(theme: &Theme) -> Style {
+    if theme.no_color {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else if theme.ansi16_only {
+        Style::default()
+            .fg(Color::LightMagenta)
+            .bg(theme.bg_code)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(theme.accent)
+            .bg(theme.bg_code)
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
 fn style_rich_text(
     spans: &[RichTextSpan],
     base: Style,
@@ -1717,6 +1768,32 @@ fn style_rich_text(
 ) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     for sp in spans {
+        if let RichTextKind::Equation { expression } = &sp.kind {
+            let expr = if expression.is_empty() {
+                sp.plain_text.as_str()
+            } else {
+                expression.as_str()
+            };
+            let mut st = math_style(theme);
+            if sp.annotations.bold {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            if sp.annotations.underline {
+                st = st.add_modifier(Modifier::UNDERLINED);
+            }
+            if sp.annotations.strikethrough {
+                st = st.add_modifier(Modifier::CROSSED_OUT);
+            }
+            if sp.annotations.color != NotionColor::Default {
+                if sp.annotations.is_background {
+                    st = theme.notion_pill_style(sp.annotations.color);
+                } else {
+                    st = st.fg(theme.notion_text_color(sp.annotations.color));
+                }
+            }
+            out.push(Span::styled(format!(" {expr} "), st));
+            continue;
+        }
         let mut st = base;
         if sp.annotations.bold {
             st = st.add_modifier(Modifier::BOLD);
@@ -1751,6 +1828,37 @@ fn style_rich_text(
         }
     }
     out
+}
+
+fn rich_text_to_indented_lines(
+    spans: &[RichTextSpan],
+    indent: &str,
+    base: Style,
+    theme: &Theme,
+    show_hrefs: bool,
+) -> Vec<Line<'static>> {
+    let styled = style_rich_text(spans, base, theme, show_hrefs);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = vec![Span::raw(indent.to_string())];
+    for sp in styled {
+        let content = sp.content.into_owned();
+        let st = sp.style;
+        let mut parts = content.split('\n');
+        if let Some(first) = parts.next() {
+            if !first.is_empty() {
+                cur.push(Span::styled(first.to_string(), st));
+            }
+        }
+        for next in parts {
+            lines.push(Line::from(std::mem::take(&mut cur)));
+            cur.push(Span::raw(indent.to_string()));
+            if !next.is_empty() {
+                cur.push(Span::styled(next.to_string(), st));
+            }
+        }
+    }
+    lines.push(Line::from(cur));
+    lines
 }
 
 fn draw_comments_drawer(
@@ -1846,10 +1954,23 @@ fn draw_comments_drawer(
                 ),
                 Span::styled(short_timestamp(&c.created_time), theme.muted_style()),
             ]));
-            lines.push(Line::from(Span::styled(
-                format!("  {}", c.body),
-                Style::default().fg(theme.fg_primary),
-            )));
+            let body_base = Style::default().fg(theme.fg_primary);
+            if !c.rich_text.is_empty() {
+                lines.extend(rich_text_to_indented_lines(
+                    &c.rich_text,
+                    "  ",
+                    body_base,
+                    &theme,
+                    ui.show_inline_hrefs,
+                ));
+            } else {
+                for body_line in c.body.split('\n') {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {body_line}"),
+                        body_base,
+                    )));
+                }
+            }
             lines.push(Line::from(""));
         }
         let wrap_w = chunks[1].width.max(1) as usize;

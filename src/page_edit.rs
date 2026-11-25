@@ -1268,7 +1268,9 @@ pub(crate) fn edited_rich_text(original: &[Value], edited: &str) -> Result<Vec<V
     let styled_ranges: Vec<_> = inline_markdown_spans(edited)
         .into_iter()
         .filter_map(|(range, value)| {
-            (value.get("annotations").is_some() || value["text"].get("link").is_some())
+            (value.get("annotations").is_some()
+                || value["text"].get("link").is_some()
+                || value.get("type").and_then(Value::as_str) == Some("equation"))
                 .then_some(range)
         })
         .collect();
