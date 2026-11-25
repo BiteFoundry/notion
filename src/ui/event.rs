@@ -89,6 +89,7 @@ pub fn key_to_action(
                 KeyCode::Char('e') | KeyCode::Char('E') => {
                     return Some(Action::RequestExternalEditor);
                 }
+                KeyCode::Char('m') | KeyCode::Char('M') => return Some(Action::ToggleEditorMode),
                 KeyCode::Char('v') | KeyCode::Char('V') => return Some(Action::PasteClipboard),
                 KeyCode::Char('b') | KeyCode::Char('B') => return Some(Action::ToggleSidebar),
                 KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Char('p') | KeyCode::Char('P') => {
@@ -191,6 +192,9 @@ pub fn key_to_action(
 
     // Page-canvas-specific keys
     if !is_database_active && focus == Focus::Canvas {
+        if ctrl && !alt && matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M')) {
+            return Some(Action::ToggleEditorMode);
+        }
         match key.code {
             KeyCode::Char(' ') | KeyCode::Char('x') => return Some(Action::ToggleActiveBlock),
             KeyCode::Char('i') => return Some(Action::OpenBlockEditor),

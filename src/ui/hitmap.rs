@@ -22,6 +22,7 @@ pub enum ButtonId {
     NewChildPage,
     EditPage,
     EditExternal,
+    ToggleEditorMode,
     FinishInlineEdit,
     SaveInlineEdit,
     OpenWeb,

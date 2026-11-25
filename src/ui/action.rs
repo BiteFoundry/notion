@@ -85,6 +85,7 @@ pub enum Action {
     OpenQuickAppend,
     OpenPageEditor,
     OpenBlockEditor,
+    ToggleEditorMode,
     FinishInlineEdit,
     CancelInlineEdit,
     SaveInlineEdit,
@@ -1292,6 +1293,62 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 } else if !app.open_inline_editor(ui) {
                     ui.warning("Open a page to edit");
                 }
+            }
+        }
+        Action::ToggleEditorMode => {
+            if ui.block_editor.is_some() {
+                let selected_idx = ui.selected_block;
+                let visible_len = app.visible_blocks(ui).len();
+                let target_snippet = ui
+                    .block_editor
+                    .as_ref()
+                    .map(|b| b.composer.text().to_string())
+                    .unwrap_or_default();
+                app.commit_and_sync_block_editor(ui, true);
+                if app.open_inline_editor(ui) {
+                    app.position_inline_editor_near_block(
+                        ui,
+                        selected_idx,
+                        visible_len,
+                        &target_snippet,
+                    );
+                } else {
+                    ui.warning("Open a page to edit");
+                }
+            } else if ui.inline_editor.is_some() {
+                if app.close_inline_editor_and_flush(ui) {
+                    if !app.open_block_editor(ui, ui.selected_block, BlockCursorInit::End) {
+                        let visible = app.visible_blocks(ui);
+                        if let Some(first_editable) = visible
+                            .iter()
+                            .position(|vb| is_block_inline_editable(&vb.block.kind))
+                        {
+                            app.open_block_editor(ui, first_editable, BlockCursorInit::End);
+                        }
+                    }
+                }
+            } else if app.active_view == CanvasView::Page && app.active_page_detail.is_some() {
+                let selected_idx = ui.selected_block;
+                let visible = app.visible_blocks(ui);
+                let visible_len = visible.len();
+                let target_snippet = visible
+                    .get(selected_idx)
+                    .map(|vb| crate::ui::app::block_editable_text(&vb.block.kind))
+                    .unwrap_or_default();
+                if app.open_inline_editor(ui) {
+                    if selected_idx > 0 {
+                        app.position_inline_editor_near_block(
+                            ui,
+                            selected_idx,
+                            visible_len,
+                            &target_snippet,
+                        );
+                    }
+                } else {
+                    ui.warning("Open a page to edit");
+                }
+            } else {
+                ui.warning("Open a page to edit");
             }
         }
         Action::FinishInlineEdit => {
@@ -3077,6 +3134,7 @@ fn handle_mouse_click(
             }
             ButtonId::EditPage => return dispatch(Action::OpenPageEditor, app, ui),
             ButtonId::EditExternal => return dispatch(Action::RequestExternalEditor, app, ui),
+            ButtonId::ToggleEditorMode => return dispatch(Action::ToggleEditorMode, app, ui),
             ButtonId::FinishInlineEdit => return dispatch(Action::FinishInlineEdit, app, ui),
             ButtonId::SaveInlineEdit => return dispatch(Action::SaveInlineEdit, app, ui),
             ButtonId::OpenWeb => return dispatch(Action::OpenActiveInBrowser, app, ui),
@@ -7346,5 +7404,285 @@ mod tests {
         dispatch(Action::Backspace, &mut app, &mut ui);
         assert_eq!(ui.block_editor.as_ref().unwrap().block_type, "paragraph");
         assert_eq!(ui.block_editor.as_ref().unwrap().composer.text(), "Keep Me");
+    }
+
+    #[test]
+    fn test_ctrl_m_toggles_between_rendered_block_live_and_markdown_source_preserving_edits() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use unicode_width::UnicodeWidthStr;
+
+        let (mut app, mut ui) = make_test_app_and_ui();
+        ui.focus = Focus::Canvas;
+        app.active_view = CanvasView::Page;
+        app.active_page_id = Some("page-toggle".into());
+        app.active_page_detail = Some(NotionPageDetail {
+            page: NotionPage {
+                id: "page-toggle".into(),
+                title: "Mode Toggle Page".into(),
+                ..Default::default()
+            },
+            blocks: vec![
+                NotionBlock {
+                    id: "b-h1".into(),
+                    page_id: "page-toggle".into(),
+                    block_type: "heading_1".into(),
+                    kind: NotionBlockKind::Heading1 {
+                        rich_text: vec![RichTextSpan::plain("Section Title")],
+                        is_toggleable: false,
+                        color: NotionColor::Default,
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "b-p".into(),
+                    page_id: "page-toggle".into(),
+                    block_type: "paragraph".into(),
+                    kind: NotionBlockKind::Paragraph {
+                        rich_text: vec![RichTextSpan::plain("Hello 안녕")],
+                        color: NotionColor::Default,
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "b-todo".into(),
+                    page_id: "page-toggle".into(),
+                    block_type: "to_do".into(),
+                    kind: NotionBlockKind::ToDo {
+                        rich_text: vec![RichTextSpan::plain("Check item")],
+                        checked: false,
+                        color: NotionColor::Default,
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "b-quote".into(),
+                    page_id: "page-toggle".into(),
+                    block_type: "quote".into(),
+                    kind: NotionBlockKind::Quote {
+                        rich_text: vec![RichTextSpan::plain("Quoted line")],
+                        color: NotionColor::Default,
+                    },
+                    ..Default::default()
+                },
+                NotionBlock {
+                    id: "b-callout".into(),
+                    page_id: "page-toggle".into(),
+                    block_type: "callout".into(),
+                    kind: NotionBlockKind::Callout {
+                        rich_text: vec![RichTextSpan::plain("Callout note")],
+                        icon: Some("💡".into()),
+                        color: NotionColor::Yellow,
+                    },
+                    ..Default::default()
+                },
+            ],
+            comments: Vec::new(),
+            comments_error: None,
+            markdown: "# Section Title\n\nHello 안녕\n\n- [ ] Check item\n\n> Quoted line\n\n> 💡 Callout note"
+                .into(),
+            media: Vec::new(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+
+        // 1. From rendered Page Canvas (before editing), Ctrl+M jumps straight into Markdown Source
+        let act_ctrl_m_canvas = crate::ui::event::key_to_action(
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
+            ui.focus(),
+            &ui.keymap,
+            ui.accepts_text_input(),
+            false,
+            ui.db_view_mode,
+        );
+        assert_eq!(act_ctrl_m_canvas, Some(Action::ToggleEditorMode));
+        dispatch(Action::ToggleEditorMode, &mut app, &mut ui);
+        assert!(ui.inline_editor.is_some());
+        assert!(ui.block_editor.is_none());
+
+        // Pressing Ctrl+M again toggles back into Rendered Block-Live WYSIWYG
+        let act_ctrl_m_src = crate::ui::event::key_to_action(
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
+            ui.focus(),
+            &ui.keymap,
+            ui.accepts_text_input(),
+            false,
+            ui.db_view_mode,
+        );
+        assert_eq!(act_ctrl_m_src, Some(Action::ToggleEditorMode));
+        dispatch(Action::ToggleEditorMode, &mut app, &mut ui);
+        assert!(ui.inline_editor.is_none());
+        assert!(ui.block_editor.is_some());
+
+        // 2. Edit paragraph block (index 1, mixed ASCII + Korean) in Block-Live WYSIWYG
+        assert!(app.open_block_editor(&mut ui, 1, BlockCursorInit::End));
+        for ch in " 세계!".chars() {
+            dispatch(Action::Input(ch), &mut app, &mut ui);
+        }
+        assert_eq!(
+            ui.block_editor.as_ref().unwrap().composer.text(),
+            "Hello 안녕 세계!"
+        );
+
+        // Draw Block-Live WYSIWYG and verify exact ASCII + Korean cursor column + status bar hint
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        let bed = ui.block_editor.as_ref().unwrap();
+        let (cx, _cy) = ui.cursor_pos.expect("block editor must expose cursor_pos");
+        assert_eq!(
+            cx,
+            bed.last_text_x + "Hello 안녕 세계!".width() as u16,
+            "Block-Live cursor X must account for ASCII + CJK/Korean display width"
+        );
+        let live_screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            live_screen.contains("Ctrl+M Src"),
+            "status bar should advertise Ctrl+M Src in Block-Live mode"
+        );
+        assert!(
+            live_screen.contains("[Src]"),
+            "rendered page should show clickable [Src] pill"
+        );
+        assert!(ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::ToggleEditorMode))
+            .is_some());
+
+        // 3. Press Ctrl+M in Block-Live WYSIWYG -> commits edits & opens full-page Markdown Source near same block
+        let act_to_src = crate::ui::event::key_to_action(
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
+            ui.focus(),
+            &ui.keymap,
+            ui.accepts_text_input(),
+            false,
+            ui.db_view_mode,
+        );
+        assert_eq!(act_to_src, Some(Action::ToggleEditorMode));
+        dispatch(Action::ToggleEditorMode, &mut app, &mut ui);
+
+        assert!(ui.block_editor.is_none());
+        let ed = ui
+            .inline_editor
+            .as_ref()
+            .expect("Ctrl+M from Block-Live must open full-page Markdown Source");
+        assert!(
+            ed.composer.text().contains("Hello 안녕 세계!"),
+            "full-page Markdown Source must contain Block-Live edits, got: {}",
+            ed.composer.text()
+        );
+        let (cursor_line, _) = ed.cursor_line_col();
+        let edited_line = ed
+            .composer
+            .text()
+            .lines()
+            .nth(cursor_line.saturating_sub(1))
+            .unwrap_or("");
+        assert!(
+            edited_line.contains("Hello 안녕 세계!"),
+            "cursor in Markdown Source should land on the edited block's line, got line {cursor_line}: {edited_line:?}"
+        );
+
+        // Render Markdown Source and verify clickable [Render] pill and status bar hint
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        let src_screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            src_screen.contains("[Render]"),
+            "full-page Markdown Source header bar should render [Render] pill"
+        );
+        assert!(
+            src_screen.contains("Ctrl+M Render"),
+            "status bar should advertise Ctrl+M Render in Source mode"
+        );
+        let render_pill_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::ToggleEditorMode))
+            .expect("[Render] pill must map to ButtonId::ToggleEditorMode");
+
+        // 4. Edit inside full-page Markdown Source, then click [Render] pill -> switches back to Block-Live with edits preserved
+        for ch in " [Source추가]".chars() {
+            dispatch(Action::Input(ch), &mut app, &mut ui);
+        }
+        assert!(ui
+            .inline_editor
+            .as_ref()
+            .unwrap()
+            .composer
+            .text()
+            .contains("Hello 안녕 세계! [Source추가]"));
+
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::Button(ButtonId::ToggleEditorMode),
+                col: render_pill_rect.x + 1,
+                row: render_pill_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+
+        assert!(ui.inline_editor.is_none());
+        let bed_after = ui
+            .block_editor
+            .as_ref()
+            .expect("clicking [Render] pill must switch back into Rendered Block-Live WYSIWYG");
+        assert!(
+            bed_after.composer.text().contains("Hello 안녕 세계! [Source추가]"),
+            "Block-Live editor must show the updated text from Markdown Source, got: {:?}",
+            bed_after.composer.text()
+        );
+        assert!(
+            app.active_page_detail
+                .as_ref()
+                .unwrap()
+                .markdown
+                .contains("Hello 안녕 세계! [Source추가]"),
+            "optimistic page detail must preserve Source edits"
+        );
+
+        // 5. Clicking [Src] pill from Block-Live switches back to Markdown Source cleanly too
+        terminal
+            .draw(|f| {
+                ui::draw(f, &mut app, &mut ui);
+            })
+            .unwrap();
+        let src_pill_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::ToggleEditorMode))
+            .expect("[Src] pill must map to ButtonId::ToggleEditorMode");
+        dispatch(
+            Action::MouseClick {
+                target: HitTarget::Button(ButtonId::ToggleEditorMode),
+                col: src_pill_rect.x + 1,
+                row: src_pill_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(ui.block_editor.is_none());
+        assert!(ui
+            .inline_editor
+            .as_ref()
+            .expect("clicking [Src] pill must open Markdown Source")
+            .composer
+            .text()
+            .contains("Hello 안녕 세계! [Source추가]"));
     }
 }

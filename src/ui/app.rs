@@ -1147,6 +1147,66 @@ impl AppState {
         true
     }
 
+    /// Positions the active `InlinePageEditor` cursor near `block_idx` (preferring an exact
+    /// line match on `target_snippet` closest to the proportional block line) and enables
+    /// `follow_cursor` so the viewport scrolls straight to that block.
+    pub fn position_inline_editor_near_block(
+        &self,
+        ui: &mut UiState,
+        block_idx: usize,
+        visible_len: usize,
+        target_snippet: &str,
+    ) {
+        let Some(ed) = ui.inline_editor.as_mut() else {
+            return;
+        };
+        let text = ed.composer.text();
+        let mut lines: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0usize;
+        for (i, ch) in text.char_indices() {
+            if ch == '\n' {
+                lines.push((start, i));
+                start = i + 1;
+            }
+        }
+        lines.push((start, text.len()));
+        if lines.is_empty() {
+            return;
+        }
+
+        let approx_line = if visible_len > 0 {
+            block_idx
+                .saturating_mul(lines.len())
+                .checked_div(visible_len)
+                .unwrap_or(0)
+                .min(lines.len().saturating_sub(1))
+        } else {
+            0
+        };
+
+        let needle = target_snippet
+            .lines()
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or("");
+
+        let target_line = if !needle.is_empty() {
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(_, &(s, e))| text.get(s..e).is_some_and(|line| line.contains(needle)))
+                .min_by_key(|(idx, _)| idx.abs_diff(approx_line))
+                .map(|(idx, _)| idx)
+                .unwrap_or(approx_line)
+        } else {
+            approx_line
+        };
+
+        let (_, line_end) = lines[target_line];
+        ed.composer.set_cursor(line_end);
+        ed.follow_cursor = true;
+    }
+
     /// Tracks a buffer mutation while the composer owns the draft and its undo history.
     pub fn record_inline_mutation(ui: &mut UiState) {
         let Some(ed) = ui.inline_editor.as_mut() else {

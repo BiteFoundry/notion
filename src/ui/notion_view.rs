@@ -464,12 +464,21 @@ fn draw_inline_page_editor(
     };
 
     let (ln, col) = ed.cursor_line_col();
+    let render_pill = "[Render]";
     let save_pill = "[Ctrl+S Save]";
     let done_pill = "[✓ Done]";
     let ext_pill = "[Ext $EDITOR]";
     let pos_text = format!("Ln {ln}, Col {col}");
 
     let mut right_items: Vec<(String, Option<ButtonId>, Style)> = vec![
+        (
+            render_pill.to_string(),
+            Some(ButtonId::ToggleEditorMode),
+            Style::default()
+                .fg(theme.accent)
+                .bg(bar_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
         (
             save_pill.to_string(),
             Some(ButtonId::SaveInlineEdit),
@@ -487,14 +496,14 @@ fn draw_inline_page_editor(
                 .add_modifier(Modifier::BOLD),
         ),
     ];
-    if content_area.width >= 66 {
+    if content_area.width >= 74 {
         right_items.push((
             ext_pill.to_string(),
             Some(ButtonId::EditExternal),
             Style::default().fg(theme.fg_muted).bg(bar_bg),
         ));
     }
-    if content_area.width >= 54 {
+    if content_area.width >= 62 {
         right_items.push((
             pos_text,
             None,
@@ -1089,11 +1098,12 @@ fn build_page_canvas_scene(
     } else {
         format!("[📎 Files:{}]", detail.media.len())
     };
-    let action_pills: [(&str, ButtonId, bool); 8] = [
+    let action_pills: [(&str, ButtonId, bool); 9] = [
         (fav_pill, ButtonId::ToggleFavorite, detail.page.is_favorite),
         ("[+ Append]", ButtonId::QuickAppend, false),
         ("[+ Child]", ButtonId::NewChildPage, false),
         ("[✎ Edit]", ButtonId::EditPage, false),
+        ("[Src]", ButtonId::ToggleEditorMode, false),
         ("[↗ Web]", ButtonId::OpenWeb, false),
         ("[🔗 Links]", ButtonId::LinkExtractor, false),
         (href_pill, ButtonId::ToggleHrefs, ui.show_inline_hrefs),

@@ -225,13 +225,13 @@ fn draw_status_bar(
             Focus::Overlay => "Overlay",
         };
         let hints = if ui.block_editor.is_some() {
-            "Enter New Block · Shift+Enter Newline · ↑/↓ Prev/Next Block · Ctrl+S Save · Esc Done"
+            "Enter New Block · Shift+Enter Newline · ↑/↓ Prev/Next Block · Ctrl+M Src · Ctrl+S Save · Esc Done"
         } else if ui.inline_editor.is_some() {
-            "Ctrl+S Save · Esc Done/Discard · Ctrl+Z/Y Undo/Redo · Ctrl+V Paste · Ctrl+E $EDITOR"
+            "Ctrl+M Render · Ctrl+S Save · Esc Done/Discard · Ctrl+Z/Y Undo/Redo · Ctrl+V Paste · Ctrl+E $EDITOR"
         } else {
             match app.active_view {
                 CanvasView::Page => {
-                    "Click/Enter Edit Block · a Append · e Full Edit · n New · C Comments · Ctrl+K Find · ? Help"
+                    "Click/Enter Edit Block · Ctrl+M Src · a Append · e Full Edit · n New · C Comments · Ctrl+K Find · ? Help"
                 }
                 CanvasView::Database => {
                     "1 Table · 2 Board · 3 List · f Filter · s Sort · m Move · n New · Ctrl+K Find"
