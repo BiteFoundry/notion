@@ -196,6 +196,9 @@ pub struct PendingPixelGraphic {
     pub cache_key: String,
     pub rect: Rect,
     pub protocol: TerminalImageProtocol,
+    /// Optional pre-encoded escape sequence payload (used by `HtmlPreviewOverlay` inline graphics
+    /// whose rendered images live in the overlay's own cache rather than `app.image_cache`).
+    pub payload: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,7 +360,7 @@ pub struct UiState {
     pub term_height: u16,
     pub graphics_caps: TerminalGraphicsCaps,
     pub kitty_keyboard_supported: bool,
-    pub pending_pixel_graphic: Option<PendingPixelGraphic>,
+    pub pending_pixel_graphics: Vec<PendingPixelGraphic>,
     pub active_pixel_graphic: Option<(String, Rect, TerminalImageProtocol)>,
 }
 
@@ -418,7 +421,7 @@ impl UiState {
             term_height: 36,
             graphics_caps: TerminalGraphicsCaps::default(),
             kitty_keyboard_supported: false,
-            pending_pixel_graphic: None,
+            pending_pixel_graphics: Vec::new(),
             active_pixel_graphic: None,
         }
     }
@@ -1902,7 +1905,7 @@ impl AppState {
                 ) {
                     ui.overlays.pop();
                     ui.active_pixel_graphic = None;
-                    ui.pending_pixel_graphic = None;
+                    ui.pending_pixel_graphics.clear();
                 }
                 ui.overlays.push(Overlay::html_preview(title, html));
                 ui.info("Opened interactive HTML viewer");

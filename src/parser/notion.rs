@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
-use bitefoundry_html::{is_safe_raster_image, sniff_content_kind, ContentKind};
+use bitefoundry_html::{sniff_content_kind, ContentKind};
 use serde_json::{json, Value};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -1055,10 +1055,10 @@ fn collect_media_refs_rec(blocks: &[NotionBlock], out: &mut Vec<NotionMediaRef>)
                 let url_kind = sniff_content_kind(None, Some(url), None);
                 let (mime_type, is_image) = match url_kind {
                     ContentKind::Html => ("text/html".to_string(), false),
-                    ContentKind::Svg => ("image/svg+xml".to_string(), false),
+                    ContentKind::Svg => ("image/svg+xml".to_string(), true),
                     _ => {
                         let mime = guess_mime_from_url(url, true);
-                        let safe = is_safe_raster_image(Some(&mime), Some(&display_name), None);
+                        let safe = crate::img_preview::is_image_mime_or_name(&mime, Some(&display_name));
                         (mime, safe)
                     }
                 };
@@ -1079,7 +1079,7 @@ fn collect_media_refs_rec(blocks: &[NotionBlock], out: &mut Vec<NotionMediaRef>)
                     .or_else(|| file_name_from_url(url))
                     .unwrap_or_else(|| format!("file-{}", out.len() + 1));
                 let mime_type = guess_mime_from_url_and_name(url, Some(&display_name), false);
-                let is_img = is_safe_raster_image(Some(&mime_type), Some(&display_name), None);
+                let is_img = crate::img_preview::is_image_mime_or_name(&mime_type, Some(&display_name));
                 out.push(NotionMediaRef {
                     block_id: blk.id.clone(),
                     url: url.clone(),

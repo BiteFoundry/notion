@@ -260,10 +260,14 @@ impl PixelLayerTracker {
     }
 }
 
-/// Pixel graphics may only render when `ImagePreview` is the topmost overlay (never beneath
-/// `HtmlPreview`, `Confirm`, `CommandPalette`, etc.).
-fn pixel_graphics_allowed_for_overlays(overlays: &[Overlay]) -> bool {
-    matches!(overlays.last(), Some(Overlay::ImagePreview(_)))
+/// Pixel graphics may only render when `ImagePreview` (for non-HTML keys) or `HtmlPreview`
+/// (for `html:` keys) is the topmost overlay (never beneath `Confirm`, `CommandPalette`, etc.).
+fn pixel_graphics_allowed_for_overlays(overlays: &[Overlay], cache_key: &str) -> bool {
+    match overlays.last() {
+        Some(Overlay::ImagePreview(_)) => !cache_key.starts_with("html:"),
+        Some(Overlay::HtmlPreview(_)) => cache_key.starts_with("html:"),
+        _ => false,
+    }
 }
 
 struct TerminalGuard {
@@ -637,42 +641,60 @@ fn draw_frame(
         })?;
 
         let term_size = (ui.term_width, ui.term_height);
+        let pending_list = std::mem::take(&mut ui.pending_pixel_graphics);
         let mut desired: Vec<ActivePixelGraphic> = Vec::new();
+        let mut desired_payloads: Vec<Option<String>> = Vec::new();
 
-        if pixel_graphics_allowed_for_overlays(&ui.overlays) {
-            if let Some(pg) = ui.pending_pixel_graphic.clone() {
-                let safe_max_h = ui.term_height.saturating_sub(1).saturating_sub(pg.rect.y);
-                let safe_max_w = ui.term_width.saturating_sub(pg.rect.x);
-                let fit_w = pg.rect.width.min(safe_max_w);
-                let fit_h = pg.rect.height.min(safe_max_h);
-                if fit_w > 0 && fit_h > 0 {
-                    let (base_key, crop) = parse_pixel_key(&pg.cache_key);
-                    if let Some(rendered) = app.image_cache.get(base_key) {
-                        if let Some(payload_len) = rendered.pixel_payload.as_deref().map(str::len) {
-                            let (draw_cols, draw_rows) = match crop {
-                                Some((sx, sy, vw, vh)) => rendered
-                                    .viewport_cell_dims(sx, sy, vw.min(fit_w), vh.min(fit_h))
-                                    .unwrap_or((fit_w, fit_h)),
-                                None if rendered.cols <= fit_w && rendered.rows <= fit_h => {
-                                    (rendered.cols, rendered.rows)
-                                }
-                                None => rendered
-                                    .viewport_cell_dims(0, 0, fit_w, fit_h)
-                                    .unwrap_or((fit_w, fit_h)),
-                            };
-                            let actual_w = draw_cols.min(fit_w);
-                            let actual_h = draw_rows.min(fit_h);
-                            if actual_w > 0 && actual_h > 0 {
-                                let clamped_rect = Rect::new(pg.rect.x, pg.rect.y, actual_w, actual_h);
-                                desired.push(ActivePixelGraphic {
-                                    cache_key: pg.cache_key,
-                                    rect: clamped_rect,
-                                    protocol: pg.protocol,
-                                    cols: actual_w,
-                                    rows: actual_h,
-                                    payload_len,
-                                });
+        for pg in pending_list {
+            if !pixel_graphics_allowed_for_overlays(&ui.overlays, &pg.cache_key) {
+                continue;
+            }
+            let safe_max_h = ui.term_height.saturating_sub(1).saturating_sub(pg.rect.y);
+            let safe_max_w = ui.term_width.saturating_sub(pg.rect.x);
+            let fit_w = pg.rect.width.min(safe_max_w);
+            let fit_h = pg.rect.height.min(safe_max_h);
+            if fit_w == 0 || fit_h == 0 {
+                continue;
+            }
+            if let Some(payload) = pg.payload {
+                let clamped_rect = Rect::new(pg.rect.x, pg.rect.y, fit_w, fit_h);
+                desired.push(ActivePixelGraphic {
+                    cache_key: pg.cache_key,
+                    rect: clamped_rect,
+                    protocol: pg.protocol,
+                    cols: fit_w,
+                    rows: fit_h,
+                    payload_len: payload.len(),
+                });
+                desired_payloads.push(Some(payload));
+            } else {
+                let (base_key, crop) = parse_pixel_key(&pg.cache_key);
+                if let Some(rendered) = app.image_cache.get(base_key) {
+                    if let Some(payload_len) = rendered.pixel_payload.as_deref().map(str::len) {
+                        let (draw_cols, draw_rows) = match crop {
+                            Some((sx, sy, vw, vh)) => rendered
+                                .viewport_cell_dims(sx, sy, vw.min(fit_w), vh.min(fit_h))
+                                .unwrap_or((fit_w, fit_h)),
+                            None if rendered.cols <= fit_w && rendered.rows <= fit_h => {
+                                (rendered.cols, rendered.rows)
                             }
+                            None => rendered
+                                .viewport_cell_dims(0, 0, fit_w, fit_h)
+                                .unwrap_or((fit_w, fit_h)),
+                        };
+                        let actual_w = draw_cols.min(fit_w);
+                        let actual_h = draw_rows.min(fit_h);
+                        if actual_w > 0 && actual_h > 0 {
+                            let clamped_rect = Rect::new(pg.rect.x, pg.rect.y, actual_w, actual_h);
+                            desired.push(ActivePixelGraphic {
+                                cache_key: pg.cache_key,
+                                rect: clamped_rect,
+                                protocol: pg.protocol,
+                                cols: actual_w,
+                                rows: actual_h,
+                                payload_len,
+                            });
+                            desired_payloads.push(None);
                         }
                     }
                 }
@@ -711,15 +733,32 @@ fn draw_frame(
             terminal.draw(|frame| {
                 cursor_pos = ui::draw(frame, app, ui);
             })?;
+            ui.pending_pixel_graphics.clear();
         }
 
-        let mut committed = desired;
+        let mut committed: Vec<ActivePixelGraphic> = Vec::new();
         if plan.emit_desired {
-            if let Some(graphic) = committed.first().cloned() {
-                let (base_key, crop) = parse_pixel_key(&graphic.cache_key);
-                let fit_w = graphic.rect.width;
-                let fit_h = graphic.rect.height;
-                let payload: Option<Cow<'_, str>> =
+            let any_kitty = desired
+                .iter()
+                .any(|g| g.protocol == TerminalImageProtocol::Kitty);
+            if any_kitty && !plan.delete_kitty {
+                terminal
+                    .backend_mut()
+                    .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
+                if guard.kitty_used || desired.len() > 1 {
+                    terminal
+                        .backend_mut()
+                        .write_all(img_preview::kitty_delete_all_sequence().as_bytes())?;
+                }
+            }
+            for (graphic, prebuilt_payload) in desired.into_iter().zip(desired_payloads.into_iter())
+            {
+                let payload: Option<Cow<'_, str>> = if let Some(p) = prebuilt_payload {
+                    Some(Cow::Owned(p))
+                } else {
+                    let (base_key, crop) = parse_pixel_key(&graphic.cache_key);
+                    let fit_w = graphic.rect.width;
+                    let fit_h = graphic.rect.height;
                     app.image_cache.get(base_key).and_then(|rendered| {
                         if let Some((sx, sy, vw, vh)) = crop {
                             rendered
@@ -739,12 +778,10 @@ fn draw_frame(
                                 .viewport_pixel_payload(0, 0, fit_w, fit_h)
                                 .map(|(p, _, _)| Cow::Owned(p))
                         }
-                    });
+                    })
+                };
                 if let Some(payload) = payload {
                     if graphic.protocol == TerminalImageProtocol::Kitty {
-                        terminal
-                            .backend_mut()
-                            .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
                         guard.kitty_used = true;
                         KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
                     }
@@ -753,21 +790,24 @@ fn draw_frame(
                         crossterm::cursor::MoveTo(graphic.rect.x, graphic.rect.y)
                     )?;
                     terminal.backend_mut().write_all(payload.as_bytes())?;
-                    terminal.backend_mut().flush()?;
-                    ui.active_pixel_graphic =
-                        Some((graphic.cache_key, graphic.rect, graphic.protocol));
-                } else {
-                    committed.clear();
-                    ui.active_pixel_graphic = None;
+                    committed.push(graphic);
                 }
+            }
+            if !committed.is_empty() {
+                terminal.backend_mut().flush()?;
+                ui.active_pixel_graphic = committed
+                    .first()
+                    .map(|g| (g.cache_key.clone(), g.rect, g.protocol));
             } else {
                 ui.active_pixel_graphic = None;
             }
-        } else if committed.is_empty() {
+        } else if desired.is_empty() {
             ui.active_pixel_graphic = None;
             if plan.delete_kitty {
                 guard.kitty_used = false;
             }
+        } else {
+            committed = desired;
         }
 
         guard.pixel_tracker.commit(committed, term_size);
@@ -1442,11 +1482,18 @@ mod tests {
         assert!(resize_plan.erase_and_redraw);
         assert!(resize_plan.emit_desired);
 
-        // Overlay z-order guard: only topmost ImagePreview allows pixel graphics
-        assert!(!pixel_graphics_allowed_for_overlays(&[]));
-        assert!(!pixel_graphics_allowed_for_overlays(&[
-            Overlay::html_preview("Doc", "<p>Hi</p>".into())
-        ]));
+        // Overlay z-order guard: ImagePreview allows hd: keys, HtmlPreview allows html: keys,
+        // and no graphics bleed beneath non-graphic overlays (Help/Confirm/etc.).
+        assert!(!pixel_graphics_allowed_for_overlays(&[], "hd:p1:0"));
+        assert!(!pixel_graphics_allowed_for_overlays(&[], "html:1:80:kitty"));
+        assert!(!pixel_graphics_allowed_for_overlays(
+            &[Overlay::html_preview("Doc", "<p>Hi</p>".into())],
+            "hd:p1:0"
+        ));
+        assert!(pixel_graphics_allowed_for_overlays(
+            &[Overlay::html_preview("Doc", "<p>Hi</p>".into())],
+            "html:1:80:kitty"
+        ));
         let preview = crate::ui::overlays::image_preview::ImagePreviewOverlay {
             items: Vec::new(),
             index: 0,
@@ -1455,13 +1502,32 @@ mod tests {
             scroll_x: 0,
             error: None,
         };
-        assert!(pixel_graphics_allowed_for_overlays(&[
-            Overlay::ImagePreview(preview.clone())
-        ]));
-        assert!(!pixel_graphics_allowed_for_overlays(&[
-            Overlay::ImagePreview(preview),
-            Overlay::html_preview("Replaced", "<p>HTML</p>".into()),
-        ]));
+        assert!(pixel_graphics_allowed_for_overlays(
+            &[Overlay::ImagePreview(preview.clone())],
+            "hd:p1:0"
+        ));
+        assert!(!pixel_graphics_allowed_for_overlays(
+            &[Overlay::ImagePreview(preview.clone())],
+            "html:1:80:kitty"
+        ));
+        assert!(!pixel_graphics_allowed_for_overlays(
+            &[
+                Overlay::ImagePreview(preview.clone()),
+                Overlay::html_preview("Replaced", "<p>HTML</p>".into()),
+            ],
+            "hd:p1:0"
+        ));
+        assert!(pixel_graphics_allowed_for_overlays(
+            &[
+                Overlay::ImagePreview(preview.clone()),
+                Overlay::html_preview("Replaced", "<p>HTML</p>".into()),
+            ],
+            "html:2:80:sixel"
+        ));
+        assert!(!pixel_graphics_allowed_for_overlays(
+            &[Overlay::ImagePreview(preview), Overlay::help()],
+            "hd:p1:0"
+        ));
     }
 
     #[cfg(windows)]

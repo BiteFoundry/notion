@@ -57,7 +57,7 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     let area = frame.area();
     ui.term_width = area.width;
     ui.term_height = area.height;
-    ui.pending_pixel_graphic = None;
+    ui.pending_pixel_graphics.clear();
     ui.cursor_pos = None;
 
     let mut hitmap = HitMap::new();
@@ -127,6 +127,7 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
         // Active overlay owns focus & terminal cursor instead of inline canvas editor
         ui.cursor_pos = None;
         for ov in &mut overlays {
+            ui.pending_pixel_graphics.clear();
             if let Some(pos) = ov.draw(frame, area, app, ui, &mut hitmap) {
                 ui.cursor_pos = Some(pos);
             }

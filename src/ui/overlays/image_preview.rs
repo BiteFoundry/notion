@@ -346,10 +346,11 @@ impl ImagePreviewOverlay {
                 let draw_h = total_rows.saturating_sub(sy).min(avail_h);
                 let px_x = inner.x + avail_w.saturating_sub(draw_w) / 2;
                 let px_y = inner.y + avail_h.saturating_sub(draw_h) / 2;
-                ui.pending_pixel_graphic = Some(PendingPixelGraphic {
+                ui.pending_pixel_graphics.push(PendingPixelGraphic {
                     cache_key: format!("{cache_key}#crop:{sx},{sy},{avail_w},{avail_h}"),
                     rect: Rect::new(px_x, px_y, draw_w, draw_h),
                     protocol: proto,
+                    payload: None,
                 });
             } else {
                 let view_w = total_cols.saturating_sub(sx).min(avail_w);
@@ -507,7 +508,7 @@ mod tests {
             // Initial draw at scroll_y = 0
             terminal
                 .draw(|frame| {
-                    ui.pending_pixel_graphic = None;
+                    ui.pending_pixel_graphics.clear();
                     hitmap.clear();
                     overlay.draw(frame, area, &app, &mut ui, &mut hitmap);
                 })
@@ -531,8 +532,9 @@ mod tests {
 
             if proto == TerminalImageProtocol::Sixel {
                 let pg0 = ui
-                    .pending_pixel_graphic
-                    .clone()
+                    .pending_pixel_graphics
+                    .first()
+                    .cloned()
                     .expect("expected pending pixel graphic for Sixel");
                 assert!(
                     pg0.cache_key.starts_with(&format!("{base_key}#crop:0,0,")),
@@ -557,7 +559,7 @@ mod tests {
 
             terminal
                 .draw(|frame| {
-                    ui.pending_pixel_graphic = None;
+                    ui.pending_pixel_graphics.clear();
                     hitmap.clear();
                     overlay.draw(frame, area, &app, &mut ui, &mut hitmap);
                 })
@@ -570,8 +572,9 @@ mod tests {
 
             if proto == TerminalImageProtocol::Sixel {
                 let pg_bottom = ui
-                    .pending_pixel_graphic
-                    .clone()
+                    .pending_pixel_graphics
+                    .first()
+                    .cloned()
                     .expect("expected pending pixel graphic at bottom for Sixel");
                 assert!(
                     pg_bottom

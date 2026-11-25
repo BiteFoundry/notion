@@ -580,7 +580,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         app.open_database(&id, ui, true);
                     }
                     NotionBlockKind::Image { url, .. } => {
-                        if is_html_svg_or_xml_ref(url, None) {
+                        if is_html_or_xml_ref(url, None) {
                             let title = url
                                 .rsplit('/')
                                 .next()
@@ -625,7 +625,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     NotionBlockKind::File { url, name, .. } => {
                         let bid = vblk.block.id.clone();
                         let u = url.clone();
-                        if is_html_svg_or_xml_ref(&u, name.as_deref()) {
+                        if is_html_or_xml_ref(&u, name.as_deref()) {
                             let title = name
                                 .clone()
                                 .filter(|s| !s.trim().is_empty())
@@ -1028,7 +1028,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                             return dispatch(Action::OpenHtmlPreview { title, html }, app, ui);
                         }
                         NotionBlockKind::File { url, name, .. }
-                            if is_html_svg_or_xml_ref(url, name.as_deref()) =>
+                            if is_html_or_xml_ref(url, name.as_deref()) =>
                         {
                             let title = name
                                 .clone()
@@ -1050,7 +1050,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                             );
                         }
                         NotionBlockKind::Image { url, caption, .. }
-                            if is_html_svg_or_xml_ref(url, None) =>
+                            if is_html_or_xml_ref(url, None) =>
                         {
                             let cap = spans_plain_text(caption);
                             let title = if cap.trim().is_empty() {
@@ -1077,10 +1077,11 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     }
                 }
                 let preferred_media_idx = visible.get(ui.selected_block).and_then(|vblk| {
-                    if let NotionBlockKind::Image { url, .. } = &vblk.block.kind {
-                        find_media_index_for_block(&detail, &vblk.block.id, url)
-                    } else {
-                        None
+                    match &vblk.block.kind {
+                        NotionBlockKind::Image { url, .. } | NotionBlockKind::File { url, .. } => {
+                            find_media_index_for_block(&detail, &vblk.block.id, url)
+                        }
+                        _ => None,
                     }
                 });
                 let overlay = ImagePreviewOverlay::from_notion_page(&detail, preferred_media_idx);
@@ -1122,7 +1123,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             ) {
                 ui.overlays.pop();
                 ui.active_pixel_graphic = None;
-                ui.pending_pixel_graphic = None;
+                ui.pending_pixel_graphics.clear();
             }
             ui.overlays.push(Overlay::html_preview(title, html));
         }
@@ -1171,15 +1172,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     }
                 };
                 match fetched {
-                    Ok((bytes, mime)) => {
-                        let raw = String::from_utf8_lossy(&bytes).into_owned();
-                        let html = if mime == "image/svg+xml"
-                            || media::looks_like_svg_document(&bytes)
-                        {
-                            format!("<div style=\"padding:16px\">{raw}</div>")
-                        } else {
-                            raw
-                        };
+                    Ok((bytes, _mime)) => {
+                        let html = String::from_utf8_lossy(&bytes).into_owned();
                         let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded {
                             seq: req_seq,
                             title,
@@ -1853,20 +1847,10 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                             let display_name = target.display_name.clone();
                             match fetched {
                                 Ok((bytes, mime)) => {
-                                    let is_svg = mime == "image/svg+xml"
-                                        || media::looks_like_svg_document(&bytes);
                                     let is_xml = mime == "application/xml"
                                         || mime == "text/xml"
                                         || media::looks_like_xml_bytes(&bytes);
-                                    if is_svg {
-                                        let svg_src = String::from_utf8_lossy(&bytes);
-                                        let html = format!("<div style=\"padding:16px\">{svg_src}</div>");
-                                        let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded {
-                                            seq: req_seq,
-                                            title: display_name,
-                                            html,
-                                        });
-                                    } else if is_xml {
+                                    if is_xml {
                                         let xml_src = String::from_utf8_lossy(&bytes).into_owned();
                                         let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded {
                                             seq: req_seq,
@@ -1882,17 +1866,6 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                                             ContentKind::Html => {
                                                 let html =
                                                     String::from_utf8_lossy(&bytes).into_owned();
-                                                let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded {
-                                                    seq: req_seq,
-                                                    title: display_name,
-                                                    html,
-                                                });
-                                            }
-                                            ContentKind::Svg => {
-                                                let svg_src = String::from_utf8_lossy(&bytes);
-                                                let html = format!(
-                                                    "<div style=\"padding:16px\">{svg_src}</div>"
-                                                );
                                                 let _ = ui_tx.send(UiMsg::HtmlPreviewLoaded {
                                                     seq: req_seq,
                                                     title: display_name,
@@ -2366,7 +2339,7 @@ fn handle_mouse_click(
                     OverlayOutcome::Close => {
                         let popped = ui.overlays.pop();
                         ui.active_pixel_graphic = None;
-                        ui.pending_pixel_graphic = None;
+                        ui.pending_pixel_graphics.clear();
                         if matches!(
                             popped,
                             Some(Overlay::ImagePreview(_) | Overlay::HtmlPreview(_))
@@ -2379,7 +2352,7 @@ fn handle_mouse_click(
                     OverlayOutcome::CloseAndDispatch(next) => {
                         let popped = ui.overlays.pop();
                         ui.active_pixel_graphic = None;
-                        ui.pending_pixel_graphic = None;
+                        ui.pending_pixel_graphics.clear();
                         if matches!(
                             popped,
                             Some(Overlay::ImagePreview(_) | Overlay::HtmlPreview(_))
@@ -2417,7 +2390,7 @@ fn handle_mouse_click(
             _ => {
                 let popped = ui.overlays.pop();
                 ui.active_pixel_graphic = None;
-                ui.pending_pixel_graphic = None;
+                ui.pending_pixel_graphics.clear();
                 if matches!(
                     popped,
                     Some(Overlay::ImagePreview(_) | Overlay::HtmlPreview(_))
@@ -2480,7 +2453,7 @@ fn handle_mouse_click(
                     NotionBlockKind::Image { url, caption, .. } => {
                         let block_id = vblk.block.id.clone();
                         let url = url.clone();
-                        if is_html_svg_or_xml_ref(&url, None) {
+                        if is_html_or_xml_ref(&url, None) {
                             let cap = spans_plain_text(caption);
                             let title = if cap.trim().is_empty() {
                                 "HTML Preview".to_string()
@@ -2533,7 +2506,7 @@ fn handle_mouse_click(
                     NotionBlockKind::File { url, name, .. } => {
                         let block_id = vblk.block.id.clone();
                         let u = url.clone();
-                        if is_html_svg_or_xml_ref(&u, name.as_deref()) {
+                        if is_html_or_xml_ref(&u, name.as_deref()) {
                             let title = name
                                 .clone()
                                 .filter(|s| !s.trim().is_empty())
@@ -2707,7 +2680,7 @@ pub(crate) fn is_html_file_ref(url: &str, name: Option<&str>) -> bool {
         || sniff_content_kind(None, Some(url), None) == ContentKind::Html
 }
 
-fn is_html_svg_or_xml_ref(url: &str, name: Option<&str>) -> bool {
+fn is_html_or_xml_ref(url: &str, name: Option<&str>) -> bool {
     if is_html_file_ref(url, name) {
         return true;
     }
@@ -2717,9 +2690,7 @@ fn is_html_svg_or_xml_ref(url: &str, name: Option<&str>) -> bool {
             .next()
             .unwrap_or(s)
             .to_ascii_lowercase();
-        lower.ends_with(".svg")
-            || lower.ends_with(".xml")
-            || sniff_content_kind(None, Some(s), None) == ContentKind::Svg
+        lower.ends_with(".xml")
     };
     name.is_some_and(check_ref) || check_ref(url)
 }
@@ -3513,7 +3484,7 @@ mod tests {
         assert_eq!(media_refs[1].mime_type, "text/html");
         assert!(!media_refs[1].is_image);
         assert_eq!(media_refs[2].mime_type, "image/svg+xml");
-        assert!(!media_refs[2].is_image);
+        assert!(media_refs[2].is_image);
 
         // 3. Render page canvas with these blocks and verify HitMap targets + ButtonIds
         let (mut app, mut ui) = make_test_app_and_ui();
@@ -3613,7 +3584,7 @@ mod tests {
         ui.overlays.clear();
 
         // 6. Pressing 'v' in Attachments overlay on `.html` item dispatches FetchHtmlPreview,
-        //    and on `.svg` item does NOT open ImagePreview!
+        //    and on `.svg` item opens native ImagePreviewOverlay!
         let mut att = crate::ui::overlays::attachments::AttachmentsState::default();
         match att.handle(&Action::Input('v'), &app) {
             OverlayOutcome::CloseAndDispatch(Action::FetchHtmlPreview { title, url, .. }) => {
@@ -3624,15 +3595,13 @@ mod tests {
         }
         att.selected = 2; // diagram.svg
         match att.handle(&Action::Input('v'), &app) {
-            OverlayOutcome::Dispatch(Action::ShowToast(msg)) => {
-                assert!(msg.contains("diagram.svg"));
-            }
-            other => panic!("expected ShowToast (not ImagePreview) for SVG attachment, got {other:?}"),
+            OverlayOutcome::CloseAndDispatch(Action::OpenImagePreviewAt(2)) => {}
+            other => panic!("expected OpenImagePreviewAt(2) for SVG attachment, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn test_open_media_url_refreshes_signed_s3_url_and_svg_preview_wraps_html() {
+    async fn test_open_media_url_refreshes_signed_s3_url_and_svg_renders_natively_in_image_preview() {
         use axum::{
             extract::Path as AxumPath,
             http::header,
@@ -3780,29 +3749,33 @@ mod tests {
             other => panic!("expected ImagePreviewOverlay with refreshed URL, got {other:?}"),
         }
 
-        // Now verify LoadPreviewImage on genuine SVG wraps it cleanly in <div style="padding:16px">...</div>
+        // Now verify LoadPreviewImage on genuine SVG renders natively via ImagePreviewOverlay (no <div> HTML wrapping!)
         if let Some(Overlay::ImagePreview(ref mut ov)) = ui.overlays.last_mut() {
             ov.index = 1; // diagram.svg
         }
         dispatch(Action::LoadPreviewImage, &mut app, &mut ui);
-        let mut got_svg_html = false;
+        let mut got_svg_rendered = false;
         for _ in 0..4 {
             let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
                 .await
-                .expect("timed out waiting for SVG HtmlPreviewLoaded")
+                .expect("timed out waiting for SVG ImageRendered")
                 .expect("ui_rx closed");
-            if let UiMsg::HtmlPreviewLoaded { ref title, ref html, .. } = msg {
-                assert_eq!(title, "diagram.svg");
-                assert!(html.starts_with("<div style=\"padding:16px\">"));
-                assert!(html.contains("<svg "));
-                got_svg_html = true;
+            if let UiMsg::ImageRendered { ref rendered, .. } = msg {
+                assert_eq!(rendered.format_label, "SVG");
+                assert_eq!(rendered.width_px, 24);
+                assert_eq!(rendered.height_px, 24);
+                assert!(!rendered.lines.is_empty() || rendered.pixel_payload.is_some());
+                got_svg_rendered = true;
                 app.handle_ui_msg(&mut ui, msg);
                 break;
             }
             app.handle_ui_msg(&mut ui, msg);
         }
-        assert!(got_svg_html, "expected SVG to open cleanly in HtmlPreviewOverlay");
-        assert!(matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))));
+        assert!(
+            got_svg_rendered,
+            "expected SVG to render natively via ImageRendered"
+        );
+        assert!(matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))));
 
         server_handle.abort();
     }

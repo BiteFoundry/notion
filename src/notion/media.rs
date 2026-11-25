@@ -188,7 +188,8 @@ pub async fn download_media_target(
         .and_then(|n| n.to_str())
         .unwrap_or(&safe_name)
         .to_string();
-    let is_image = is_safe_raster_image(Some(&mime_type), Some(&file_name), Some(&bytes));
+    let is_image = is_safe_raster_image(Some(&mime_type), Some(&file_name), Some(&bytes))
+        || sniff_content_kind(Some(&mime_type), Some(&file_name), Some(&bytes)) == ContentKind::Svg;
 
     Ok(DownloadedMedia {
         ok: true,

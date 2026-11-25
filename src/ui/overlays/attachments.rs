@@ -1,6 +1,6 @@
 //! Media & Files Tray Overlay (`A`) for embedded images, files, and PDFs on the active Notion page.
 
-use bitefoundry_html::{is_safe_raster_image, sniff_content_kind, ContentKind};
+use bitefoundry_html::{sniff_content_kind, ContentKind};
 use ratatui::{
     layout::Rect,
     style::Style,
@@ -31,7 +31,7 @@ pub fn is_html_media(item: &NotionMediaRef) -> bool {
 pub fn is_raster_image_media(item: &NotionMediaRef) -> bool {
     item.is_image
         && !is_html_media(item)
-        && is_safe_raster_image(Some(&item.mime_type), Some(&item.display_name), None)
+        && crate::img_preview::is_image_mime_or_name(&item.mime_type, Some(&item.display_name))
 }
 
 #[derive(Debug, Clone, Default)]

@@ -5,7 +5,9 @@
 //! - Keyboard focus cycling (`Tab` / `Shift+Tab`), activation (`Enter` / `Space`), inline `<input>`
 //!   editing, mouse `click_at`, Rendered ↔ Raw toggle (`m`), and lazy localhost Axum serving (`o`).
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use bitefoundry_html::{HtmlEffect, HtmlTheme, HtmlViewSession};
 use ratatui::{
@@ -20,19 +22,35 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::ui::{
-    action::Action,
-    app::{AppState, UiState},
-    hitmap::{ButtonId, HitMap, HitTarget},
-    overlays::{centered_rect, OverlayOutcome},
-    theme::Theme,
+use crate::{
+    img_preview::{self, FitBox, RenderedTerminalImage, TerminalImageProtocol},
+    ui::{
+        action::Action,
+        app::{AppState, PendingPixelGraphic, UiState},
+        hitmap::{ButtonId, HitMap, HitTarget},
+        overlays::{centered_rect, OverlayOutcome},
+        theme::Theme,
+    },
 };
+
+struct CachedHtmlGraphic {
+    source: Arc<[u8]>,
+    rendered: RenderedTerminalImage,
+}
 
 pub struct HtmlPreviewOverlay {
     pub title: String,
     pub session: HtmlViewSession,
     pub body_rect: Rect,
     pub last_max_scroll: u16,
+    graphic_cache: HashMap<(usize, u16, TerminalImageProtocol), CachedHtmlGraphic>,
+    last_graphic_env: Option<((u16, u16), (u8, u8, u8))>,
+}
+
+impl Drop for HtmlPreviewOverlay {
+    fn drop(&mut self) {
+        self.graphic_cache.clear();
+    }
 }
 
 impl fmt::Debug for HtmlPreviewOverlay {
@@ -44,6 +62,7 @@ impl fmt::Debug for HtmlPreviewOverlay {
             .field("scroll_y", &self.session.scroll_y)
             .field("focused_control", &self.session.focused_control)
             .field("editing_input", &self.session.editing_input)
+            .field("cached_graphics", &self.graphic_cache.len())
             .finish()
     }
 }
@@ -51,14 +70,9 @@ impl fmt::Debug for HtmlPreviewOverlay {
 impl HtmlPreviewOverlay {
     pub fn new(title: impl Into<String>, raw_html: String) -> Self {
         let title_str = title.into();
-        let normalized_html = if crate::notion::media::looks_like_svg_document(raw_html.as_bytes()) {
-            format!("<div style=\"padding:16px\">{raw_html}</div>")
-        } else {
-            raw_html
-        };
         let mut session = HtmlViewSession::new(
             (!title_str.trim().is_empty()).then_some(title_str.clone()),
-            normalized_html,
+            raw_html,
         );
         let resolved_title = session
             .title()
@@ -83,6 +97,8 @@ impl HtmlPreviewOverlay {
             session,
             body_rect: Rect::default(),
             last_max_scroll: 0,
+            graphic_cache: HashMap::new(),
+            last_graphic_env: None,
         }
     }
 
@@ -418,11 +434,15 @@ impl HtmlPreviewOverlay {
             inner.width
         };
 
-        let (rendered_lines, controls_len) = {
+        let (mut rendered_lines, controls_len, graphics) = {
             let rendered = self
                 .session
                 .render(content_w, &html_theme, ui.show_inline_hrefs);
-            (rendered.lines.clone(), rendered.controls.len())
+            (
+                rendered.lines.clone(),
+                rendered.controls.len(),
+                rendered.graphics.clone(),
+            )
         };
         let total_rows = rendered_lines.len();
         let max_scroll = total_rows.saturating_sub(body_h as usize).min(u16::MAX as usize) as u16;
@@ -431,12 +451,150 @@ impl HtmlPreviewOverlay {
         let sy = self.session.scroll_y;
 
         self.body_rect = Rect::new(inner.x, inner.y, content_w, body_h);
+
+        let mut pixel_skip_rects: Vec<Rect> = Vec::new();
+        if !graphics.is_empty() && content_w > 0 && body_h > 0 {
+            let proto = ui.graphics_caps.protocol;
+            let bg_rgb = img_preview::color_to_rgb(theme.bg_elevated, (24, 24, 30));
+            let env_sig = (ui.graphics_caps.cell_px, bg_rgb);
+            if self.last_graphic_env != Some(env_sig) {
+                self.graphic_cache.clear();
+                self.last_graphic_env = Some(env_sig);
+            }
+
+            let view_start = sy as usize;
+            let view_end = view_start.saturating_add(body_h as usize);
+
+            for g in &graphics {
+                if g.line_count == 0 {
+                    continue;
+                }
+                let g_start = g.line_start;
+                let g_end = g.line_start.saturating_add(g.line_count);
+                if g_end <= view_start || g_start >= view_end {
+                    continue;
+                }
+
+                let cache_key = (g.node_id.0, content_w, proto);
+                let cache_hit = self
+                    .graphic_cache
+                    .get(&cache_key)
+                    .is_some_and(|c| Arc::ptr_eq(&c.source, &g.image_bytes));
+                if !cache_hit {
+                    let slot_rows = g.line_count.min(u16::MAX as usize) as u16;
+                    let fit = FitBox::fixed(content_w, slot_rows);
+                    let decoded = if proto == TerminalImageProtocol::Halfblock {
+                        img_preview::decode_and_render_halfblocks_with_cell_px(
+                            &g.image_bytes,
+                            fit,
+                            bg_rgb,
+                            ui.graphics_caps.cell_px,
+                        )
+                    } else {
+                        img_preview::decode_and_render_for_protocol(
+                            &g.image_bytes,
+                            fit,
+                            bg_rgb,
+                            ui.graphics_caps,
+                        )
+                    };
+                    if let Ok(rendered_img) = decoded {
+                        self.graphic_cache.insert(
+                            cache_key,
+                            CachedHtmlGraphic {
+                                source: Arc::clone(&g.image_bytes),
+                                rendered: rendered_img,
+                            },
+                        );
+                    }
+                }
+
+                let Some(cached) = self.graphic_cache.get(&cache_key) else {
+                    continue;
+                };
+
+                if proto == TerminalImageProtocol::Halfblock {
+                    let slot_end = g_end.min(rendered_lines.len());
+                    let slot_len = slot_end.saturating_sub(g_start);
+                    for row_off in 0..slot_len {
+                        let dst = g_start + row_off;
+                        if let Some(hb_line) = cached.rendered.lines.get(row_off) {
+                            rendered_lines[dst] = hb_line.clone();
+                        } else {
+                            rendered_lines[dst] = Line::default();
+                        }
+                    }
+                } else {
+                    let vis_start = g_start.max(view_start);
+                    let vis_end = g_end.min(view_end);
+                    let crop_top = (vis_start - g_start) as u16;
+                    let vis_rows = (vis_end - vis_start) as u16;
+                    let screen_y = self
+                        .body_rect
+                        .y
+                        .saturating_add((vis_start - view_start) as u16);
+
+                    if let Some((raw_payload, draw_cols, draw_rows)) = cached
+                        .rendered
+                        .viewport_pixel_payload(0, crop_top, content_w, vis_rows)
+                    {
+                        let actual_cols = draw_cols.min(content_w);
+                        let actual_rows = draw_rows.min(vis_rows);
+                        if actual_cols > 0 && actual_rows > 0 {
+                            let payload = if proto == TerminalImageProtocol::Kitty {
+                                let unique_id = img_preview::KITTY_PREVIEW_IMAGE_ID
+                                    .saturating_add(1)
+                                    .saturating_add((g.node_id.0 % 60_000) as u32);
+                                let old_id =
+                                    format!(",i={},", img_preview::KITTY_PREVIEW_IMAGE_ID);
+                                let new_id = format!(",i={unique_id},");
+                                raw_payload.replacen(&old_id, &new_id, 1)
+                            } else {
+                                raw_payload
+                            };
+                            let g_rect =
+                                Rect::new(self.body_rect.x, screen_y, actual_cols, actual_rows);
+                            pixel_skip_rects.push(g_rect);
+                            ui.pending_pixel_graphics.push(PendingPixelGraphic {
+                                cache_key: format!(
+                                    "html:{}:{}:{}#crop:0,{},{},{}",
+                                    g.node_id.0,
+                                    content_w,
+                                    proto.as_str(),
+                                    crop_top,
+                                    content_w,
+                                    vis_rows
+                                ),
+                                rect: g_rect,
+                                protocol: proto,
+                                payload: Some(payload),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         frame.render_widget(
             Paragraph::new(rendered_lines)
                 .style(Style::default().bg(theme.bg_elevated).fg(theme.fg_primary))
                 .scroll((sy, 0)),
             self.body_rect,
         );
+
+        if !pixel_skip_rects.is_empty() {
+            let buf = frame.buffer_mut();
+            for g_rect in pixel_skip_rects {
+                for row in g_rect.y..g_rect.bottom() {
+                    for col in g_rect.x..g_rect.right() {
+                        if let Some(cell) = buf.cell_mut((col, row)) {
+                            cell.set_symbol(" ");
+                            cell.set_skip(true);
+                        }
+                    }
+                }
+            }
+        }
 
         if show_scrollbar {
             let sb_area = Rect::new(inner.right().saturating_sub(1), inner.y, 1, body_h);
@@ -669,5 +827,101 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
         assert!(joined.contains("Hidden detail text"));
+    }
+
+    #[test]
+    fn test_html_preview_inline_svg_renders_halfblock_and_preserves_button_click_coordinates() {
+        let html = r##"<!DOCTYPE html>
+<html>
+<body>
+  <h1>Graphic Report</h1>
+  <svg width="120" height="60"><rect width="120" height="60" fill="#e11d48"/></svg>
+  <button onclick="alert('Clicked Below SVG!')">Confirm Action</button>
+</body>
+</html>"##;
+
+        let (app, mut ui) = make_test_state();
+        ui.graphics_caps = img_preview::TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Halfblock,
+            cell_px: (8, 16),
+            cell_px_exact: true,
+        };
+
+        let mut ov = HtmlPreviewOverlay::new("graphic.html", html.to_string());
+        let area = Rect::new(0, 0, 100, 32);
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        let mut hitmap = HitMap::new();
+
+        terminal
+            .draw(|frame| {
+                ui.pending_pixel_graphics.clear();
+                hitmap.clear();
+                ov.draw(frame, area, &app, &mut ui, &mut hitmap);
+            })
+            .unwrap();
+
+        let html_theme = HtmlPreviewOverlay::html_theme_from(&ui.theme);
+        let rendered = ov.session.render(ov.body_rect.width, &html_theme, false);
+        assert_eq!(rendered.graphics.len(), 1, "expected 1 inline SVG graphic");
+        let graphic = &rendered.graphics[0];
+        assert!(graphic.line_count >= 3);
+
+        // Verify reserved slot contains Halfblock `▀` glyphs in the rendered TestBackend buffer
+        let buf = terminal.backend().buffer();
+        let mut halfblock_cells = 0usize;
+        for line_idx in graphic.line_start..graphic.line_start + graphic.line_count {
+            let row = ov.body_rect.y + line_idx as u16;
+            if row < ov.body_rect.bottom() {
+                for col in ov.body_rect.x..ov.body_rect.right() {
+                    if buf[(col, row)].symbol() == "▀" {
+                        halfblock_cells += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            halfblock_cells > 0,
+            "expected Halfblock '▀' glyphs inside reserved SVG slot"
+        );
+
+        // Verify <button> below the SVG retains exact click coordinates via click_at(line, col)
+        assert_eq!(rendered.controls.len(), 1);
+        let btn = rendered.controls[0].clone();
+        assert!(
+            btn.line >= graphic.line_start + graphic.line_count,
+            "button line {} must sit below graphic slot {}..{}",
+            btn.line,
+            graphic.line_start,
+            graphic.line_start + graphic.line_count
+        );
+        let click_col = ov.body_rect.x + btn.col_start + 1;
+        let click_row = ov.body_rect.y + btn.line as u16;
+        assert_eq!(
+            ov.handle_click(click_col, click_row),
+            OverlayOutcome::Dispatch(Action::ShowToast("Clicked Below SVG!".to_string()))
+        );
+
+        // Also verify pixel protocol (Kitty) pushes to pending_pixel_graphics and marks cells skip=true
+        ui.graphics_caps.protocol = TerminalImageProtocol::Kitty;
+        let mut frame_cell_skipped = false;
+        terminal
+            .draw(|frame| {
+                ui.pending_pixel_graphics.clear();
+                hitmap.clear();
+                ov.draw(frame, area, &app, &mut ui, &mut hitmap);
+                if let Some(pg) = ui.pending_pixel_graphics.first() {
+                    frame_cell_skipped = frame.buffer_mut()[(pg.rect.x, pg.rect.y)].skip;
+                }
+            })
+            .unwrap();
+        assert_eq!(ui.pending_pixel_graphics.len(), 1);
+        let pg = &ui.pending_pixel_graphics[0];
+        assert!(pg.cache_key.starts_with("html:"));
+        assert_eq!(pg.protocol, TerminalImageProtocol::Kitty);
+        assert!(pg.payload.as_deref().is_some_and(|p| p.starts_with("\x1b_G")));
+        assert!(
+            frame_cell_skipped,
+            "pixel graphic cells must be marked skip=true in frame buffer"
+        );
     }
 }
