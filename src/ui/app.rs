@@ -1362,7 +1362,17 @@ impl AppState {
         }
         if let Some(ed) = ui.inline_editor.take() {
             ui.canvas_scroll = ed.scroll_y;
-            ui.canvas_follow_selected = false;
+            let visible_len = self.visible_blocks(ui).len();
+            if visible_len > 0 {
+                let total_lines = ed.composer.text().lines().count().max(1);
+                let cursor_line = ed.composer.cursor_line_col().0.saturating_sub(1);
+                let target_blk = (cursor_line.saturating_mul(visible_len) / total_lines)
+                    .min(visible_len.saturating_sub(1));
+                ui.selected_block = target_blk;
+                ui.canvas_follow_selected = true;
+            } else {
+                ui.canvas_follow_selected = false;
+            }
         }
         ui.cursor_pos = None;
         true
@@ -1826,6 +1836,7 @@ impl AppState {
         if close_after {
             ui.block_editor = None;
             ui.cursor_pos = None;
+            ui.canvas_follow_selected = true;
         } else if let Some(bed) = ui.block_editor.as_mut() {
             bed.dirty = false;
         }
