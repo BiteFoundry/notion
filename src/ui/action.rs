@@ -1309,6 +1309,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             let Some(page_id) = app.active_page_id.clone() else {
                 return false;
             };
+            // Render the appended blocks in memory immediately (never persisted with synthetic IDs).
+            app.apply_optimistic_append_local(&page_id, &text, ui);
             let req_seq = ui.next_page_refresh_seq(&page_id);
             let client = app.client.clone();
             let storage = app.storage.clone();
@@ -1318,7 +1320,27 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 let res = crate::cli::op_append_blocks(&client, &storage, &page_id, &text).await;
                 match res {
                     Ok(_) => {
-                        if let Ok(detail) =
+                        let ws_id = client.auth().active_workspace_id().await;
+                        let st = storage.clone();
+                        let pid = page_id.clone();
+                        let cached_detail = tokio::task::spawn_blocking(move || {
+                            if st.load_cached_children(&ws_id, &pid)?.is_some() {
+                                st.load_page_detail(&ws_id, &pid)
+                            } else {
+                                Ok(None)
+                            }
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .flatten();
+                        if let Some(detail) = cached_detail {
+                            let _ = ui_tx.send(UiMsg::PageRefreshed {
+                                detail: Box::new(detail),
+                                seq: req_seq,
+                                task_label: "append",
+                            });
+                        } else if let Ok(detail) =
                             crate::sync::sync_page_detail_force(&client, &storage, &page_id).await
                         {
                             let _ = ui_tx.send(UiMsg::PageRefreshed {
@@ -1334,8 +1356,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         }
                     }
                     Err(err) => {
-                        let _ = ui_tx.send(UiMsg::TaskFailed {
-                            label: "append".into(),
+                        let _ = ui_tx.send(UiMsg::AppendFailed {
+                            page_id,
                             error: err.to_string(),
                         });
                     }
@@ -1381,13 +1403,16 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 .await;
                 match res {
                     Ok(created) => {
-                        if has_body {
-                            if let Ok(blocks) = client.fetch_block_tree(&created.id, None).await {
-                                let ws_id = client.auth().active_workspace_id().await;
-                                let _ = storage.replace_page_blocks(&ws_id, &created.id, &blocks);
-                            }
-                        }
-                        let _ = ui_tx.send(UiMsg::PageCreated(created));
+                        let preview_detail = (!in_database).then(|| {
+                            Box::new(crate::ui::app::build_created_page_preview(
+                                created.clone(),
+                                &body,
+                            ))
+                        });
+                        let _ = ui_tx.send(UiMsg::PageCreated {
+                            page: created,
+                            preview_detail,
+                        });
                     }
                     Err(err) => {
                         let _ = ui_tx.send(UiMsg::TaskFailed {
@@ -1640,7 +1665,6 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             // `storage` so a mid-resync workspace switch aborts instead of polluting SQLite.
             let client = app.client.clone();
             let storage = app.storage.clone();
-            let sync_ctrl = app.sync_ctrl.clone();
             let ui_tx = app.ui_tx.clone();
             let expected_ws = app.workspace_id.clone();
             ui.tasks.begin("full resync");
@@ -1655,12 +1679,16 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 )
                 .await
                 {
-                    Ok((_, _, _, outcome)) => {
-                        if client.auth().active_workspace_id().await == expected_ws {
-                            sync_ctrl.request(SyncCommand::RefreshTree);
-                        }
-                        let _ = ui_tx.send(UiMsg::TaskDone {
-                            label: "full resync".into(),
+                    Ok((ws_id, pages, databases, outcome)) => {
+                        let summaries = pages
+                            .iter()
+                            .map(crate::models::NotionPageSummary::from)
+                            .collect();
+                        let _ = ui_tx.send(UiMsg::WorkspaceTreeRefreshed {
+                            workspace_id: ws_id,
+                            pages: summaries,
+                            databases,
+                            task_label: "full resync",
                             toast: format!("Full resync read {} items", outcome.fetched),
                         });
                     }

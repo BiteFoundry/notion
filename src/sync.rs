@@ -509,43 +509,56 @@ where
         let mut resolved_map = existing_owners;
         let mut newly_resolved: Vec<(String, String)> = Vec::new();
 
-        for orig_bid in unresolved_blocks {
-            if resolved_map.contains_key(&orig_bid) {
+        // Resolve container blocks in bounded parallel chunks of 3 (matching Notion's ~3 req/s
+        // rate limit) while sharing resolved ancestors across chunks.
+        for chunk in unresolved_blocks.chunks(3) {
+            let pending: Vec<String> = chunk
+                .iter()
+                .filter(|bid| !resolved_map.contains_key(bid.as_str()))
+                .cloned()
+                .collect();
+            if pending.is_empty() {
                 continue;
             }
-            let mut cur_id = orig_bid.clone();
-            let mut visited_hops: Vec<String> = vec![cur_id.clone()];
-            let mut found_owner: Option<String> = None;
+            let known_snapshot = &resolved_map;
+            let futs = pending.into_iter().map(|orig_bid| async move {
+                let mut cur_id = orig_bid;
+                let mut visited_hops: Vec<String> = vec![cur_id.clone()];
+                let mut found_owner: Option<String> = None;
 
-            for _ in 0..6 {
-                let Ok((ptype, pid)) = client.get_block_parent_raw(&cur_id).await else {
-                    break;
-                };
-                match (ptype.as_str(), pid) {
-                    ("page_id", Some(owner_page_id)) if !owner_page_id.trim().is_empty() => {
-                        found_owner = Some(owner_page_id);
+                for _ in 0..6 {
+                    let Ok((ptype, pid)) = client.get_block_parent_raw(&cur_id).await else {
                         break;
-                    }
-                    ("block_id", Some(next_bid))
-                        if !next_bid.trim().is_empty()
-                            && !visited_hops.iter().any(|h| h == &next_bid) =>
-                    {
-                        if let Some(cached_owner) = resolved_map.get(&next_bid).cloned() {
-                            found_owner = Some(cached_owner);
+                    };
+                    match (ptype.as_str(), pid) {
+                        ("page_id", Some(owner_page_id)) if !owner_page_id.trim().is_empty() => {
+                            found_owner = Some(owner_page_id);
                             break;
                         }
-                        visited_hops.push(next_bid.clone());
-                        cur_id = next_bid;
+                        ("block_id", Some(next_bid))
+                            if !next_bid.trim().is_empty()
+                                && !visited_hops.iter().any(|h| h == &next_bid) =>
+                        {
+                            if let Some(cached_owner) = known_snapshot.get(&next_bid).cloned() {
+                                found_owner = Some(cached_owner);
+                                break;
+                            }
+                            visited_hops.push(next_bid.clone());
+                            cur_id = next_bid;
+                        }
+                        _ => break,
                     }
-                    _ => break,
                 }
-            }
+                (visited_hops, found_owner)
+            });
 
-            if let Some(owner_page_id) = found_owner {
-                for hop_id in visited_hops {
-                    if !resolved_map.contains_key(&hop_id) {
-                        resolved_map.insert(hop_id.clone(), owner_page_id.clone());
-                        newly_resolved.push((hop_id, owner_page_id.clone()));
+            for (visited_hops, found_owner) in futures::future::join_all(futs).await {
+                if let Some(owner_page_id) = found_owner {
+                    for hop_id in visited_hops {
+                        if !resolved_map.contains_key(&hop_id) {
+                            resolved_map.insert(hop_id.clone(), owner_page_id.clone());
+                            newly_resolved.push((hop_id, owner_page_id.clone()));
+                        }
                     }
                 }
             }
@@ -910,6 +923,7 @@ struct InFlightActive {
     db_max_rows: usize,
     show_busy: bool,
     emit_unchanged: bool,
+    interactive: bool,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -919,6 +933,7 @@ struct PendingActive {
     db_max_rows: usize,
     show_busy: bool,
     emit_unchanged: bool,
+    interactive: bool,
 }
 
 enum ActiveOutcome {
@@ -954,6 +969,8 @@ struct TreeDone {
 
 const DEEP_PAGE_REQUEST_THRESHOLD: usize = 5;
 const DEEP_PAGE_MAX_DELAY_MS: u64 = 30_000;
+/// Maximum uncached sibling pages (or database rows) quietly warmed after an interactive load.
+const SIBLING_PAGE_PREFETCH_LIMIT: usize = 2;
 
 /// Estimates the HTTP request count of a direct page detail refresh (`GET /pages/{id}` +
 /// root `GET /blocks/{id}/children` + `GET /comments` + recursive nested container fetches).
@@ -1137,6 +1154,7 @@ pub fn spawn_sync_engine(
         let mut pending_active: Option<PendingActive> = None;
         let mut in_flight_tree: Option<tokio::task::JoinHandle<()>> = None;
         let mut pending_tree: Option<bool> = None;
+        let mut in_flight_prefetch: Option<tokio::task::JoinHandle<()>> = None;
         let mut loud_active_busy = false;
         let mut loud_tree_busy = false;
         let mut retry_active = false;
@@ -1153,12 +1171,19 @@ pub fn spawn_sync_engine(
                             explicit_db: bool,
                             show_busy: bool,
                             emit_unchanged: bool,
+                            interactive: bool,
                             in_flight_active: &mut Option<InFlightActive>,
                             pending_active: &mut Option<PendingActive>,
+                            in_flight_prefetch: &mut Option<tokio::task::JoinHandle<()>>,
                             loud_active_busy: &mut bool,
                             loud_tree_busy: bool,
                             active_timer_armed: &mut bool,
                             next_active_id: &mut u64| {
+            // Foreground user/active work always takes priority over background prefetch.
+            if let Some(prefetch) = in_flight_prefetch.take() {
+                prefetch.abort();
+            }
+
             let db_max_rows = match &target {
                 ActiveTarget::Database(did) => {
                     let mut exp = expanded_db.lock().unwrap();
@@ -1187,6 +1212,7 @@ pub fn spawn_sync_engine(
                     {
                         // Share the single in-flight network fetch and upgrade delivery/busy semantics.
                         cur.emit_unchanged |= emit_unchanged;
+                        cur.interactive |= interactive;
                         if show_busy && !cur.show_busy {
                             cur.show_busy = true;
                             *loud_active_busy = true;
@@ -1209,6 +1235,7 @@ pub fn spawn_sync_engine(
                     }
                     // Upgrade an in-flight Conditional check (or truncated DB poll) for the same item.
                     cur.emit_unchanged |= emit_unchanged;
+                    cur.interactive |= interactive;
                     let merged_busy = pending_active
                         .as_ref()
                         .filter(|p| p.target == target)
@@ -1217,6 +1244,10 @@ pub fn spawn_sync_engine(
                         .as_ref()
                         .filter(|p| p.target == target)
                         .map_or(emit_unchanged, |p| p.emit_unchanged || emit_unchanged);
+                    let merged_interactive = pending_active
+                        .as_ref()
+                        .filter(|p| p.target == target)
+                        .map_or(interactive, |p| p.interactive || interactive);
                     let merged_db_max = pending_active
                         .as_ref()
                         .filter(|p| p.target == target)
@@ -1227,6 +1258,7 @@ pub fn spawn_sync_engine(
                         db_max_rows: merged_db_max,
                         show_busy: merged_busy,
                         emit_unchanged: merged_emit,
+                        interactive: merged_interactive,
                     });
                     return;
                 }
@@ -1288,6 +1320,7 @@ pub fn spawn_sync_engine(
                 db_max_rows,
                 show_busy,
                 emit_unchanged,
+                interactive,
                 handle,
             });
         };
@@ -1349,8 +1382,10 @@ pub fn spawn_sync_engine(
                                     explicit_db,
                                     true,
                                     true,
+                                    false,
                                     &mut in_flight_active,
                                     &mut pending_active,
+                                    &mut in_flight_prefetch,
                                     &mut loud_active_busy,
                                     loud_tree_busy,
                                     &mut active_timer_armed,
@@ -1380,8 +1415,10 @@ pub fn spawn_sync_engine(
                                 false,
                                 false,
                                 true,
+                                false,
                                 &mut in_flight_active,
                                 &mut pending_active,
+                                &mut in_flight_prefetch,
                                 &mut loud_active_busy,
                                 loud_tree_busy,
                                 &mut active_timer_armed,
@@ -1400,8 +1437,10 @@ pub fn spawn_sync_engine(
                                 true,
                                 false,
                                 true,
+                                false,
                                 &mut in_flight_active,
                                 &mut pending_active,
+                                &mut in_flight_prefetch,
                                 &mut loud_active_busy,
                                 loud_tree_busy,
                                 &mut active_timer_armed,
@@ -1449,8 +1488,10 @@ pub fn spawn_sync_engine(
                                 explicit_db,
                                 true,
                                 true,
+                                false,
                                 &mut in_flight_active,
                                 &mut pending_active,
+                                &mut in_flight_prefetch,
                                 &mut loud_active_busy,
                                 loud_tree_busy,
                                 &mut active_timer_armed,
@@ -1465,8 +1506,10 @@ pub fn spawn_sync_engine(
                                 coalesced_explicit_db,
                                 false,
                                 true,
+                                true,
                                 &mut in_flight_active,
                                 &mut pending_active,
+                                &mut in_flight_prefetch,
                                 &mut loud_active_busy,
                                 loud_tree_busy,
                                 &mut active_timer_armed,
@@ -1475,6 +1518,9 @@ pub fn spawn_sync_engine(
                         } else {
                             // Focus cleared (e.g., last daemon TUI client detached): stop active polling.
                             *expanded_db.lock().unwrap() = None;
+                            if let Some(prefetch) = in_flight_prefetch.take() {
+                                prefetch.abort();
+                            }
                             if let Some(cur) = in_flight_active.take() {
                                 cur.handle.abort();
                                 if cur.show_busy {
@@ -1511,8 +1557,10 @@ pub fn spawn_sync_engine(
                                         false,
                                         false,
                                         true,
+                                        false,
                                         &mut in_flight_active,
                                         &mut pending_active,
+                                        &mut in_flight_prefetch,
                                         &mut loud_active_busy,
                                         loud_tree_busy,
                                         &mut active_timer_armed,
@@ -1526,8 +1574,10 @@ pub fn spawn_sync_engine(
                                         true,
                                         false,
                                         true,
+                                        false,
                                         &mut in_flight_active,
                                         &mut pending_active,
+                                        &mut in_flight_prefetch,
                                         &mut loud_active_busy,
                                         loud_tree_busy,
                                         &mut active_timer_armed,
@@ -1623,8 +1673,10 @@ pub fn spawn_sync_engine(
                             next_explicit,
                             next.show_busy,
                             next.emit_unchanged,
+                            next.interactive,
                             &mut in_flight_active,
                             &mut pending_active,
+                            &mut in_flight_prefetch,
                             &mut loud_active_busy,
                             loud_tree_busy,
                             &mut active_timer_armed,
@@ -1642,6 +1694,16 @@ pub fn spawn_sync_engine(
                                 .as_mut()
                                 .reset(tokio::time::Instant::now() + delay);
                             active_timer_armed = true;
+                        }
+                        if ok && cur.interactive && client.rate_limit_remaining().is_zero() {
+                            if let Some(prev) = in_flight_prefetch.take() {
+                                prev.abort();
+                            }
+                            in_flight_prefetch = Some(spawn_sibling_prefetch(
+                                client.clone(),
+                                storage.clone(),
+                                cur.target,
+                            ));
                         }
                     }
                 }
@@ -1693,8 +1755,10 @@ pub fn spawn_sync_engine(
                             false,
                             false,
                             false,
+                            false,
                             &mut in_flight_active,
                             &mut pending_active,
+                            &mut in_flight_prefetch,
                             &mut loud_active_busy,
                             loud_tree_busy,
                             &mut active_timer_armed,
@@ -1715,6 +1779,9 @@ pub fn spawn_sync_engine(
             }
         }
 
+        if let Some(prefetch) = in_flight_prefetch.take() {
+            prefetch.abort();
+        }
         if let Some(cur) = in_flight_active.take() {
             cur.handle.abort();
         }
@@ -1726,6 +1793,98 @@ pub fn spawn_sync_engine(
     SyncController::from_channels(focus_tx, cmd_tx)
 }
 
+fn is_page_uncached(storage: &Storage, ws_id: &str, page_id: &str) -> bool {
+    storage
+        .get_page_detail_synced_edited_time(ws_id, page_id)
+        .ok()
+        .flatten()
+        .is_none()
+        && storage
+            .load_cached_children(ws_id, page_id)
+            .ok()
+            .flatten()
+            .is_none()
+}
+
+fn pick_prefetch_candidates(
+    storage: &Storage,
+    ws_id: &str,
+    target: &ActiveTarget,
+    limit: usize,
+) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    match target {
+        ActiveTarget::Page(active_id) => {
+            let Ok(pages) = storage.list_page_summaries(ws_id) else {
+                return Vec::new();
+            };
+            let Some(active_parent) = pages
+                .iter()
+                .find(|p| p.id == *active_id)
+                .map(|p| (p.parent_type.as_str(), p.parent_id.as_deref()))
+            else {
+                return Vec::new();
+            };
+            pages
+                .iter()
+                .filter(|p| {
+                    !p.archived
+                        && p.id != *active_id
+                        && (p.parent_type.as_str(), p.parent_id.as_deref()) == active_parent
+                        && is_page_uncached(storage, ws_id, &p.id)
+                })
+                .take(limit)
+                .map(|p| p.id.clone())
+                .collect()
+        }
+        ActiveTarget::Database(db_id) => {
+            let Ok(rows) = storage.list_database_rows(ws_id, db_id) else {
+                return Vec::new();
+            };
+            rows.into_iter()
+                .filter(|r| !r.archived && is_page_uncached(storage, ws_id, &r.id))
+                .take(limit)
+                .map(|r| r.id)
+                .collect()
+        }
+    }
+}
+
+/// Quietly warms SQLite with up to `SIBLING_PAGE_PREFETCH_LIMIT` uncached sibling pages
+/// (or top database rows) after an interactive load, fetching sequentially so each page's
+/// 3-way detail fetch stays conservatively within Notion's ~3 req/s rate limit.
+fn spawn_sibling_prefetch(
+    client: NotionClient,
+    storage: Storage,
+    target: ActiveTarget,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if !client.rate_limit_remaining().is_zero() {
+            return;
+        }
+        let ws_id = client.auth().active_workspace_id().await;
+        let st = storage.clone();
+        let ws_pick = ws_id.clone();
+        let candidates = tokio::task::spawn_blocking(move || {
+            pick_prefetch_candidates(&st, &ws_pick, &target, SIBLING_PAGE_PREFETCH_LIMIT)
+        })
+        .await
+        .unwrap_or_default();
+
+        for pid in candidates {
+            if !client.rate_limit_remaining().is_zero() {
+                break;
+            }
+            if client.auth().active_workspace_id().await != ws_id {
+                break;
+            }
+            let _ = sync_page_detail(&client, &storage, &pid).await;
+        }
+    })
+}
+
 async fn run_tree_refresh(
     client: &NotionClient,
     storage: &Storage,
@@ -1734,29 +1893,30 @@ async fn run_tree_refresh(
     fetch_profile: bool,
     previous_digest: Option<TreeDigest>,
 ) -> TreeDone {
-    let previous_digest = if !loud && previous_digest.is_none() {
-        let workspace_id = client.auth().active_workspace_id().await;
-        let st = storage.clone();
-        tokio::task::spawn_blocking(move || {
-            let pages = st.list_page_summaries(&workspace_id).ok()?;
-            let databases = st.list_databases(&workspace_id).ok()?;
-            tree_digest(&workspace_id, &pages, &databases).ok()
-        })
-        .await
-        .ok()
-        .flatten()
-    } else {
-        previous_digest
-    };
-
-    let mut profile_loaded = false;
-    if fetch_profile {
-        if let Ok(me) = client.get_me().await {
-            profile_loaded = true;
-            let _ = event_tx.send(CoreEvent::ProfileLoaded(me));
+    let me_fut = async {
+        if fetch_profile {
+            if let Ok(me) = client.get_me().await {
+                let _ = event_tx.send(CoreEvent::ProfileLoaded(me));
+                return true;
+            }
         }
-    }
-    let result: Result<_> = async {
+        false
+    };
+    let tree_fut = async {
+        let previous_digest = if !loud && previous_digest.is_none() {
+            let workspace_id = client.auth().active_workspace_id().await;
+            let st = storage.clone();
+            tokio::task::spawn_blocking(move || {
+                let pages = st.list_page_summaries(&workspace_id).ok()?;
+                let databases = st.list_databases(&workspace_id).ok()?;
+                tree_digest(&workspace_id, &pages, &databases).ok()
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            previous_digest
+        };
         let snapshot = sync_workspace_tree_summaries(client, storage).await?;
         tokio::task::spawn_blocking(move || {
             let digest = tree_digest(&snapshot.0, &snapshot.1, &snapshot.2)?;
@@ -1764,8 +1924,8 @@ async fn run_tree_refresh(
             Ok((digest, update))
         })
         .await?
-    }
-    .await;
+    };
+    let (profile_loaded, result): (bool, Result<_>) = tokio::join!(me_fut, tree_fut);
     match result {
         Ok(result) => TreeDone {
             loud,
@@ -1907,6 +2067,7 @@ async fn run_db_refresh(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use super::*;
 
     #[test]
@@ -1977,5 +2138,400 @@ mod tests {
             compute_next_active_delay(5_000, 4, Duration::from_secs(240)),
             Duration::from_secs(240)
         );
+    }
+
+    #[tokio::test]
+    async fn run_tree_refresh_overlaps_get_me_and_workspace_search() {
+        use axum::{routing::{get, post}, Json, Router};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+        use tokio::sync::Barrier;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b_me = Arc::clone(&barrier);
+        let b_search = Arc::clone(&barrier);
+
+        let app = Router::new()
+            .route(
+                "/v1/users/me",
+                get(move || {
+                    let b = Arc::clone(&b_me);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "id": "bot-1",
+                            "type": "bot",
+                            "name": "Overlap Bot",
+                            "bot": { "workspace_name": "Overlap WS" }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/search",
+                post(move || {
+                    let b = Arc::clone(&b_search);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "results": [{
+                                "object": "page",
+                                "id": "page-1",
+                                "url": "https://www.notion.so/page-1",
+                                "parent": { "type": "workspace", "workspace": true },
+                                "archived": false,
+                                "last_edited_time": "2026-11-20T02:00:00.000Z",
+                                "properties": {
+                                    "title": { "type": "title", "title": [{ "plain_text": "Home" }] }
+                                }
+                            }],
+                            "has_more": false,
+                            "next_cursor": null
+                        }))
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("sync_overlap.db")).unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.api_base_url = format!("http://{addr}/v1");
+        let auth = crate::auth::AuthManager::from_token(cfg.clone(), "ntn_overlap");
+        let client = NotionClient::new(&cfg, auth).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_tree_refresh(&client, &storage, &tx, true, true, None),
+        )
+        .await
+        .expect("get_me and workspace search must overlap via tokio::join!");
+
+        assert!(result.profile_loaded, "profile_loaded should be true");
+        let (_, tree) = result.result.expect("run_tree_refresh should return tree snapshot");
+        let (_, pages, _) = tree.expect("loud tree refresh should return workspace tree");
+        assert_eq!(pages.len(), 1);
+        let mut saw_profile = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, CoreEvent::ProfileLoaded(ref u) if u.name == "Overlap Bot") {
+                saw_profile = true;
+            }
+        }
+        assert!(saw_profile, "expected ProfileLoaded event");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_workspace_tree_resolves_block_owners_concurrently() {
+        use axum::{extract::Path as AxumPath, routing::{get, post}, Json, Router};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+        use tokio::sync::Barrier;
+
+        let barrier = Arc::new(Barrier::new(3));
+        let b_blk = Arc::clone(&barrier);
+
+        let app = Router::new()
+            .route(
+                "/v1/search",
+                post(|| async {
+                    Json(json!({
+                        "results": [
+                            {
+                                "object": "page",
+                                "id": "root-page",
+                                "url": "https://www.notion.so/root-page",
+                                "parent": { "type": "workspace", "workspace": true },
+                                "archived": false,
+                                "last_edited_time": "2026-11-20T02:00:00.000Z",
+                                "properties": { "title": { "type": "title", "title": [{ "plain_text": "Root" }] } }
+                            },
+                            {
+                                "object": "page",
+                                "id": "child-1",
+                                "url": "https://www.notion.so/child-1",
+                                "parent": { "type": "block_id", "block_id": "blk-1" },
+                                "archived": false,
+                                "last_edited_time": "2026-11-20T02:01:00.000Z",
+                                "properties": { "title": { "type": "title", "title": [{ "plain_text": "Child 1" }] } }
+                            },
+                            {
+                                "object": "page",
+                                "id": "child-2",
+                                "url": "https://www.notion.so/child-2",
+                                "parent": { "type": "block_id", "block_id": "blk-2" },
+                                "archived": false,
+                                "last_edited_time": "2026-11-20T02:02:00.000Z",
+                                "properties": { "title": { "type": "title", "title": [{ "plain_text": "Child 2" }] } }
+                            },
+                            {
+                                "object": "page",
+                                "id": "child-3",
+                                "url": "https://www.notion.so/child-3",
+                                "parent": { "type": "block_id", "block_id": "blk-3" },
+                                "archived": false,
+                                "last_edited_time": "2026-11-20T02:03:00.000Z",
+                                "properties": { "title": { "type": "title", "title": [{ "plain_text": "Child 3" }] } }
+                            }
+                        ],
+                        "has_more": false,
+                        "next_cursor": null
+                    }))
+                }),
+            )
+            .route(
+                "/v1/blocks/{id}",
+                get(move |AxumPath(id): AxumPath<String>| {
+                    let b = Arc::clone(&b_blk);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "object": "block",
+                            "id": id,
+                            "type": "column",
+                            "parent": { "type": "page_id", "page_id": "root-page" },
+                            "has_children": true
+                        }))
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("block_owners.db")).unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.api_base_url = format!("http://{addr}/v1");
+        let auth = crate::auth::AuthManager::from_token(cfg.clone(), "ntn_owners");
+        let client = NotionClient::new(&cfg, auth).unwrap();
+
+        let (ws_id, pages, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            sync_workspace_tree_summaries(&client, &storage),
+        )
+        .await
+        .expect("block-owner lookups must run concurrently in chunks of 3")
+        .unwrap();
+        assert_eq!(pages.len(), 4);
+
+        let (owners, _) = storage.load_page_parent_hints(&ws_id).unwrap();
+        for bid in ["blk-1", "blk-2", "blk-3"] {
+            assert_eq!(
+                owners.get(bid).map(String::as_str),
+                Some("root-page"),
+                "expected resolved owner for {bid}"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn interactive_focus_prefetches_uncached_siblings_and_periodic_poll_does_not() {
+        use axum::{extract::Path as AxumPath, routing::{get, post}, Json, Router};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let app = Router::new()
+            .route(
+                "/v1/pages/{id}",
+                get(|AxumPath(id): AxumPath<String>| async move {
+                    let parent = if id.starts_with("row-") {
+                        json!({ "type": "database_id", "database_id": "db-1" })
+                    } else {
+                        json!({ "type": "page_id", "page_id": "root-1" })
+                    };
+                    Json(json!({
+                        "object": "page",
+                        "id": id,
+                        "url": format!("https://www.notion.so/{id}"),
+                        "parent": parent,
+                        "archived": false,
+                        "last_edited_time": "2026-11-20T02:00:00.000Z",
+                        "properties": { "title": { "type": "title", "title": [{ "plain_text": id }] } }
+                    }))
+                }),
+            )
+            .route(
+                "/v1/blocks/{id}/children",
+                get(|AxumPath(id): AxumPath<String>| async move {
+                    Json(json!({
+                        "results": [{
+                            "object": "block",
+                            "id": format!("blk-{id}"),
+                            "type": "paragraph",
+                            "has_children": false,
+                            "paragraph": { "rich_text": [{ "plain_text": format!("body-{id}") }] }
+                        }],
+                        "has_more": false,
+                        "next_cursor": null
+                    }))
+                }),
+            )
+            .route(
+                "/v1/comments",
+                get(|| async {
+                    Json(json!({ "results": [], "has_more": false, "next_cursor": null }))
+                }),
+            )
+            .route(
+                "/v1/databases/{id}",
+                get(|AxumPath(id): AxumPath<String>| async move {
+                    Json(json!({
+                        "object": "database",
+                        "id": id,
+                        "url": format!("https://www.notion.so/{id}"),
+                        "parent": { "type": "workspace", "workspace": true },
+                        "title": [{ "plain_text": "Tasks" }],
+                        "description": [],
+                        "last_edited_time": "2026-11-20T02:00:00.000Z",
+                        "properties": { "Name": { "id": "title", "type": "title", "title": {} } }
+                    }))
+                }),
+            )
+            .route(
+                "/v1/databases/{id}/query",
+                post(|AxumPath(id): AxumPath<String>| async move {
+                    let rows: Vec<serde_json::Value> = ["row-1", "row-2", "row-3"]
+                        .into_iter()
+                        .map(|rid| {
+                            json!({
+                                "object": "page",
+                                "id": rid,
+                                "url": format!("https://www.notion.so/{rid}"),
+                                "parent": { "type": "database_id", "database_id": id },
+                                "archived": false,
+                                "last_edited_time": "2026-11-20T02:00:00.000Z",
+                                "properties": { "Name": { "type": "title", "title": [{ "plain_text": rid }] } }
+                            })
+                        })
+                        .collect();
+                    Json(json!({
+                        "results": rows,
+                        "has_more": false,
+                        "next_cursor": null
+                    }))
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("prefetch.db")).unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.api_base_url = format!("http://{addr}/v1");
+        cfg.active_poll_ms = 120;
+        cfg.sync_poll_ms = 60_000;
+        let auth = crate::auth::AuthManager::from_token(cfg.clone(), "ntn_prefetch");
+        let ws_id = auth.active_workspace_id().await;
+
+        let make_page = |id: &str, title: &str, edited: &str| NotionPage {
+            id: id.into(),
+            workspace_id: ws_id.clone(),
+            parent_type: "page_id".into(),
+            parent_id: Some("root-1".into()),
+            title: title.into(),
+            last_edited_time: Some(edited.into()),
+            ..Default::default()
+        };
+        for p in [
+            make_page("p-a", "A", "2026-11-20T05:00:00Z"),
+            make_page("p-b", "B", "2026-11-20T04:00:00Z"),
+            make_page("p-c", "C", "2026-11-20T03:00:00Z"),
+            make_page("p-d", "D", "2026-11-20T02:00:00Z"),
+        ] {
+            storage.upsert_page(&p).unwrap();
+        }
+
+        let client = NotionClient::new(&cfg, auth).unwrap();
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        let ctrl = spawn_sync_engine(cfg, client, storage.clone(), ev_tx);
+
+        // 1. Interactive focus on p-a warms up to SIBLING_PAGE_PREFETCH_LIMIT (2) uncached siblings.
+        ctrl.set_focus(FocusTarget {
+            page_id: Some("p-a".into()),
+            database_id: None,
+        });
+
+        let mut page_events = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let b_warm = storage.load_cached_children(&ws_id, "p-b").unwrap().is_some();
+            let c_warm = storage.load_cached_children(&ws_id, "p-c").unwrap().is_some();
+            if b_warm && c_warm {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting for interactive sibling prefetch (b={b_warm}, c={c_warm})");
+            }
+            while let Ok(ev) = ev_rx.try_recv() {
+                if let CoreEvent::PageDetailUpdated(d) = ev {
+                    page_events.push(d.page.id);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        while let Ok(ev) = ev_rx.try_recv() {
+            if let CoreEvent::PageDetailUpdated(d) = ev {
+                page_events.push(d.page.id);
+            }
+        }
+        assert!(
+            storage.load_cached_children(&ws_id, "p-d").unwrap().is_none(),
+            "3rd sibling p-d must stay uncached due to SIBLING_PAGE_PREFETCH_LIMIT=2"
+        );
+        assert!(
+            !page_events.iter().any(|id| id == "p-b" || id == "p-c"),
+            "silent prefetch must not emit PageDetailUpdated for background siblings: {page_events:?}"
+        );
+
+        // 2. Add a brand-new uncached sibling and let periodic active polling tick (>= 250ms).
+        // Periodic background polls MUST NOT prefetch siblings.
+        storage
+            .upsert_page(&make_page("p-e", "E", "2026-11-20T06:00:00Z"))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(280)).await;
+        assert!(
+            storage.load_cached_children(&ws_id, "p-e").unwrap().is_none(),
+            "periodic background poll must never trigger sibling prefetch"
+        );
+
+        // 3. Interactive database focus warms up to 2 uncached rows (row-1, row-2) and skips row-3.
+        ctrl.set_focus(FocusTarget {
+            page_id: None,
+            database_id: Some("db-1".into()),
+        });
+        let db_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let r1 = storage.load_cached_children(&ws_id, "row-1").unwrap().is_some();
+            let r2 = storage.load_cached_children(&ws_id, "row-2").unwrap().is_some();
+            if r1 && r2 {
+                break;
+            }
+            if tokio::time::Instant::now() >= db_deadline {
+                panic!("timed out waiting for interactive DB row prefetch (r1={r1}, r2={r2})");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            storage.load_cached_children(&ws_id, "row-3").unwrap().is_none(),
+            "3rd database row must stay uncached due to SIBLING_PAGE_PREFETCH_LIMIT=2"
+        );
+
+        ctrl.request(SyncCommand::Shutdown);
+        server.abort();
     }
 }

@@ -2445,6 +2445,39 @@ pub async fn op_get_page_for_output(
     Ok((detail, comments_has_more))
 }
 
+fn is_notion_validation_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<NotionApiError>())
+        .is_some_and(|e| e.status == 400 && e.code == "validation_error")
+}
+
+fn title_key_from_database(db: &NotionDatabase) -> Option<String> {
+    db.schema
+        .iter()
+        .find_map(|(name, prop)| (prop.prop_type == "title").then(|| name.clone()))
+}
+
+fn title_key_from_page(page: &NotionPage) -> Option<String> {
+    page.properties
+        .iter()
+        .find_map(|(name, prop)| matches!(prop, NotionPropertyValue::Title(_)).then(|| name.clone()))
+}
+
+fn page_property_columns(page: &NotionPage) -> Vec<(&str, &'static str)> {
+    page.properties
+        .iter()
+        .filter_map(|(name, value)| {
+            let kind = match value {
+                NotionPropertyValue::Title(_) => "title",
+                NotionPropertyValue::Status(_) => "status",
+                NotionPropertyValue::Select(_) => "select",
+                _ => return None,
+            };
+            Some((name.as_str(), kind))
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn op_create_page(
     client: &NotionClient,
@@ -2473,13 +2506,20 @@ pub async fn op_create_page(
         Some(Value::Object(map)) => map,
         _ => serde_json::Map::new(),
     };
+    let mut cached_title_key: Option<String> = None;
     if !props.values().any(|value| value.get("title").is_some()) {
         let title_key = if parent_is_database {
-            let db = op_get_database(client, storage, &parent_id, false).await?;
-            db.schema
-                .iter()
-                .find_map(|(name, prop)| (prop.prop_type == "title").then(|| name.clone()))
-                .context("Database does not have a title property")?
+            if let Some(key) = storage
+                .get_database(&ws_id, &parent_id)?
+                .and_then(|db| title_key_from_database(&db))
+            {
+                cached_title_key = Some(key.clone());
+                key
+            } else {
+                let db = op_get_database(client, storage, &parent_id, false).await?;
+                title_key_from_database(&db)
+                    .context("Database does not have a title property")?
+            }
         } else {
             "title".to_string()
         };
@@ -2511,7 +2551,26 @@ pub async fn op_create_page(
         }
     }
 
-    let created = client.create_page(payload).await?;
+    let created = match client.create_page(payload.clone()).await {
+        Ok(page) => page,
+        Err(err) if cached_title_key.is_some() && is_notion_validation_error(&err) => {
+            let old_key = cached_title_key.unwrap();
+            let db = op_get_database(client, storage, &parent_id, false).await?;
+            let fresh_key = title_key_from_database(&db)
+                .context("Database does not have a title property")?;
+            if fresh_key != old_key {
+                if let Some(map) = payload.get_mut("properties").and_then(Value::as_object_mut) {
+                    if let Some(val) = map.remove(&old_key) {
+                        map.insert(fresh_key, val);
+                    }
+                }
+                client.create_page(payload).await?
+            } else {
+                return Err(err);
+            }
+        }
+        Err(err) => return Err(err),
+    };
     let _ = storage.upsert_page(&created);
     if !overflow_blocks.is_empty() {
         if let Err(err) = client
@@ -2542,16 +2601,39 @@ pub(crate) async fn op_update_page_metadata(
     }
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id_for_write(storage, client, &ws_id, page, false).await?;
+    let mut used_cached_key = false;
     let title_key = if title.is_some() {
-        let current = client.get_page(&id).await?;
-        current.properties.into_iter().find_map(|(name, property)| {
-            matches!(property, NotionPropertyValue::Title(_)).then_some(name)
-        }).context("Page has no accessible title property")?
+        if let Some(key) = storage
+            .get_page(&ws_id, &id)?
+            .and_then(|p| title_key_from_page(&p))
+        {
+            used_cached_key = true;
+            key
+        } else {
+            let current = client.get_page(&id).await?;
+            let _ = storage.upsert_page(&current);
+            title_key_from_page(&current).context("Page has no accessible title property")?
+        }
     } else {
         String::new()
     };
-    let title = title.map(|text| (title_key.as_str(), text));
-    patch_page_metadata(client, storage, &id, title, icon).await
+    let title_arg = title.map(|text| (title_key.as_str(), text));
+    match patch_page_metadata(client, storage, &id, title_arg, icon).await {
+        Ok(updated) => Ok(updated),
+        Err(err) if used_cached_key && is_notion_validation_error(&err) => {
+            let current = client.get_page(&id).await?;
+            let _ = storage.upsert_page(&current);
+            let fresh_key =
+                title_key_from_page(&current).context("Page has no accessible title property")?;
+            if fresh_key != title_key {
+                let retry_title = title.map(|text| (fresh_key.as_str(), text));
+                patch_page_metadata(client, storage, &id, retry_title, icon).await
+            } else {
+                Err(err)
+            }
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn patch_page_metadata(
@@ -2610,52 +2692,70 @@ pub async fn op_patch_page(
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id_for_write(storage, client, &ws_id, page, archived == Some(false))
         .await?;
-    let mut payload = serde_json::Map::new();
-    if properties.is_some() {
-        // Same property building as `op_update_database_item`.
-        let props = if title.is_some() {
-            let current = client.get_page(&id).await?;
-            let columns = current.properties.iter().filter_map(|(name, value)| {
-                let kind = match value {
-                    NotionPropertyValue::Title(_) => "title",
-                    NotionPropertyValue::Status(_) => "status",
-                    NotionPropertyValue::Select(_) => "select",
-                    _ => return None,
-                };
-                Some((name.as_str(), kind))
-            });
-            database_item_properties(columns, title, None, properties)?
-        } else {
-            property_map(properties)?
-        };
-        if !props.is_empty() {
-            payload.insert("properties".into(), Value::Object(props));
+    let build_patch_payload = |current: Option<&NotionPage>| -> Result<serde_json::Map<String, Value>> {
+        let mut payload = serde_json::Map::new();
+        if properties.is_some() {
+            // Same property building as `op_update_database_item`.
+            let props = if title.is_some() {
+                let page_ref = current.context("Page metadata required to resolve title property")?;
+                let cols = page_property_columns(page_ref);
+                database_item_properties(cols.into_iter(), title, None, properties.clone())?
+            } else {
+                property_map(properties.clone())?
+            };
+            if !props.is_empty() {
+                payload.insert("properties".into(), Value::Object(props));
+            }
+        } else if let Some(text) = title {
+            // Same title payload as `op_update_page_metadata`.
+            let page_ref = current.context("Page metadata required to resolve title property")?;
+            let key = title_key_from_page(page_ref)
+                .context("Page has no accessible title property")?;
+            let spans = if text.is_empty() {
+                json!([])
+            } else {
+                json!([{ "type": "text", "text": { "content": text } }])
+            };
+            payload.insert("properties".into(), json!({ (key): { "title": spans } }));
         }
-    } else if let Some(text) = title {
-        // Same title payload as `op_update_page_metadata`.
-        let current = client.get_page(&id).await?;
-        let key = current
-            .properties
-            .into_iter()
-            .find_map(|(name, property)| matches!(property, NotionPropertyValue::Title(_)).then_some(name))
-            .context("Page has no accessible title property")?;
-        let spans = if text.is_empty() {
-            json!([])
+        if let Some(emoji) = icon {
+            payload.insert("icon".into(), json!({ "type": "emoji", "emoji": emoji }));
+        }
+        if let Some(archived) = archived {
+            payload.insert("archived".into(), json!(archived));
+        }
+        if payload.is_empty() {
+            bail!("At least one of title, icon, archived, properties is required");
+        }
+        Ok(payload)
+    };
+
+    let mut used_cached_meta = false;
+    let payload = if title.is_some() {
+        let cached_attempt = storage
+            .get_page(&ws_id, &id)?
+            .and_then(|cached| build_patch_payload(Some(&cached)).ok());
+        if let Some(p) = cached_attempt {
+            used_cached_meta = true;
+            p
         } else {
-            json!([{ "type": "text", "text": { "content": text } }])
-        };
-        payload.insert("properties".into(), json!({ (key): { "title": spans } }));
-    }
-    if let Some(emoji) = icon {
-        payload.insert("icon".into(), json!({ "type": "emoji", "emoji": emoji }));
-    }
-    if let Some(archived) = archived {
-        payload.insert("archived".into(), json!(archived));
-    }
-    if payload.is_empty() {
-        bail!("At least one of title, icon, archived, properties is required");
-    }
-    let updated = client.update_page(&id, Value::Object(payload)).await?;
+            let current = client.get_page(&id).await?;
+            let _ = storage.upsert_page(&current);
+            build_patch_payload(Some(&current))?
+        }
+    } else {
+        build_patch_payload(None)?
+    };
+    let updated = match client.update_page(&id, Value::Object(payload)).await {
+        Ok(u) => u,
+        Err(err) if used_cached_meta && is_notion_validation_error(&err) => {
+            let current = client.get_page(&id).await?;
+            let _ = storage.upsert_page(&current);
+            let fresh_payload = build_patch_payload(Some(&current))?;
+            client.update_page(&id, Value::Object(fresh_payload)).await?
+        }
+        Err(err) => return Err(err),
+    };
     let _ = storage.upsert_page(&updated);
     Ok(updated)
 }
@@ -2730,13 +2830,22 @@ pub async fn op_append_blocks(
         bail!("No blocks produced from input text");
     }
     let appended = client.append_block_children(&id, children).await;
-    if appended.is_err() {
-        let _ = storage.invalidate_page_detail(&ws_id, &id);
+    match appended {
+        Ok(mut blocks) => {
+            if blocks.iter().any(|b| b.has_children) {
+                let _ = client.hydrate_block_subtrees(&mut blocks, &id).await;
+            }
+            let _ = storage.append_cached_blocks(&ws_id, &id, &blocks);
+            Ok(blocks)
+        }
+        Err(err) => {
+            let _ = storage.invalidate_page_detail(&ws_id, &id);
+            if let Ok(full_tree) = client.fetch_block_tree(&id, None).await {
+                let _ = storage.replace_page_blocks(&ws_id, &id, &full_tree);
+            }
+            Err(err)
+        }
     }
-    if let Ok(full_tree) = client.fetch_block_tree(&id, None).await {
-        let _ = storage.replace_page_blocks(&ws_id, &id, &full_tree);
-    }
-    appended
 }
 
 /// Apply a Markdown edit using the hierarchy and rendered ranges of the original blocks.
@@ -3119,11 +3228,39 @@ pub async fn op_create_database_item(
 ) -> Result<NotionPage> {
     let ws_id = client.auth().active_workspace_id().await;
     let db_id = resolver::resolve_database_id_for_write(storage, client, &ws_id, database).await?;
-    let db = op_get_database(client, storage, &db_id, false).await?;
-    let columns = db.schema.iter().map(|(name, prop)| (name.as_str(), prop.prop_type.as_str()));
-    let props = database_item_properties(columns, Some(title), status, extra_properties)?;
+    let mut used_cached_schema = false;
+    let props = if let Some(cached_db) = storage
+        .get_database(&ws_id, &db_id)?
+        .filter(|db| !db.schema.is_empty())
+    {
+        let cols = cached_db
+            .schema
+            .iter()
+            .map(|(name, prop)| (name.as_str(), prop.prop_type.as_str()));
+        match database_item_properties(cols, Some(title), status, extra_properties.clone()) {
+            Ok(p) => {
+                used_cached_schema = true;
+                p
+            }
+            Err(_) => {
+                let db = op_get_database(client, storage, &db_id, false).await?;
+                let cols = db
+                    .schema
+                    .iter()
+                    .map(|(name, prop)| (name.as_str(), prop.prop_type.as_str()));
+                database_item_properties(cols, Some(title), status, extra_properties.clone())?
+            }
+        }
+    } else {
+        let db = op_get_database(client, storage, &db_id, false).await?;
+        let cols = db
+            .schema
+            .iter()
+            .map(|(name, prop)| (name.as_str(), prop.prop_type.as_str()));
+        database_item_properties(cols, Some(title), status, extra_properties.clone())?
+    };
 
-    op_create_page(
+    match op_create_page(
         client,
         storage,
         &db_id,
@@ -3134,6 +3271,30 @@ pub async fn op_create_database_item(
         Some(Value::Object(props)),
     )
     .await
+    {
+        Ok(created) => Ok(created),
+        Err(err) if used_cached_schema && is_notion_validation_error(&err) => {
+            let db = op_get_database(client, storage, &db_id, false).await?;
+            let cols = db
+                .schema
+                .iter()
+                .map(|(name, prop)| (name.as_str(), prop.prop_type.as_str()));
+            let fresh_props =
+                database_item_properties(cols, Some(title), status, extra_properties)?;
+            op_create_page(
+                client,
+                storage,
+                &db_id,
+                title,
+                None,
+                body,
+                true,
+                Some(Value::Object(fresh_props)),
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub async fn op_update_database_item(
@@ -3147,27 +3308,48 @@ pub async fn op_update_database_item(
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id_for_write(storage, client, &ws_id, page_id, false).await?;
     let status = status.map(str::trim).filter(|s| !s.is_empty());
+    let mut used_cached_meta = false;
     let props = if title.is_some() || status.is_some() {
-        let page = client.get_page(&id).await?;
-        let columns = page.properties.iter().filter_map(|(name, value)| {
-            let kind = match value {
-                NotionPropertyValue::Title(_) => "title",
-                NotionPropertyValue::Status(_) => "status",
-                NotionPropertyValue::Select(_) => "select",
-                _ => return None,
-            };
-            Some((name.as_str(), kind))
-        });
-        database_item_properties(columns, title, status, extra_properties)?
+        let cached_props = storage
+            .get_page(&ws_id, &id)?
+            .filter(|p| !p.properties.is_empty())
+            .and_then(|page| {
+                let cols = page_property_columns(&page);
+                database_item_properties(cols.into_iter(), title, status, extra_properties.clone())
+                    .ok()
+            });
+        if let Some(p) = cached_props {
+            used_cached_meta = true;
+            p
+        } else {
+            let page = client.get_page(&id).await?;
+            let _ = storage.upsert_page(&page);
+            let cols = page_property_columns(&page);
+            database_item_properties(cols.into_iter(), title, status, extra_properties.clone())?
+        }
     } else {
-        property_map(extra_properties)?
+        property_map(extra_properties.clone())?
     };
     if props.is_empty() {
         bail!("Provide a title, status, or properties to update");
     }
-    let updated = client
+    let updated = match client
         .update_page(&id, json!({ "properties": Value::Object(props) }))
-        .await?;
+        .await
+    {
+        Ok(u) => u,
+        Err(err) if used_cached_meta && is_notion_validation_error(&err) => {
+            let page = client.get_page(&id).await?;
+            let _ = storage.upsert_page(&page);
+            let cols = page_property_columns(&page);
+            let fresh_props =
+                database_item_properties(cols.into_iter(), title, status, extra_properties)?;
+            client
+                .update_page(&id, json!({ "properties": Value::Object(fresh_props) }))
+                .await?
+        }
+        Err(err) => return Err(err),
+    };
     let _ = storage.upsert_page(&updated);
     Ok(updated)
 }
@@ -3229,10 +3411,7 @@ pub async fn op_add_comment(
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id_for_write(storage, client, &ws_id, page, false).await?;
     let comment = client.add_comment(Some(&id), discussion_id, text).await?;
-    if let Ok(all) = client.list_comments(&id).await {
-        let _ =
-            storage.replace_page_comments(&ws_id, &id, &all, all.len() <= DETAIL_COMMENTS_LIMIT);
-    }
+    let _ = storage.append_cached_comment(&ws_id, &id, &comment);
     Ok(comment)
 }
 
@@ -3581,5 +3760,376 @@ mod tests {
                 "expected parser rejection for {rejected:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn write_ops_use_cached_schema_and_retry_once_on_validation_error() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        use axum::{
+            extract::Path as AxumPath,
+            http::StatusCode,
+            response::IntoResponse,
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let db_gets = Arc::new(AtomicUsize::new(0));
+        let page_gets = Arc::new(AtomicUsize::new(0));
+        let renamed_title_col = Arc::new(AtomicBool::new(false));
+
+        let db_gets_h = Arc::clone(&db_gets);
+        let page_gets_h = Arc::clone(&page_gets);
+        let renamed_db_h = Arc::clone(&renamed_title_col);
+        let renamed_post_h = Arc::clone(&renamed_title_col);
+
+        let app = Router::new()
+            .route(
+                "/v1/databases/{id}",
+                get(move |AxumPath(id): AxumPath<String>| {
+                    let c = Arc::clone(&db_gets_h);
+                    let renamed = Arc::clone(&renamed_db_h);
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        let col_name = if renamed.load(Ordering::SeqCst) {
+                            "Task Title"
+                        } else {
+                            "Name"
+                        };
+                        Json(json!({
+                            "object": "database",
+                            "id": id,
+                            "url": "https://www.notion.so/db-1",
+                            "parent": { "type": "workspace", "workspace": true },
+                            "title": [{ "plain_text": "Tasks" }],
+                            "description": [],
+                            "last_edited_time": "2026-11-20T02:00:00.000Z",
+                            "properties": {
+                                col_name: { "id": "title", "type": "title", "title": {} }
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/pages/{id}",
+                get(move |AxumPath(id): AxumPath<String>| {
+                    let c = Arc::clone(&page_gets_h);
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "object": "page",
+                            "id": id,
+                            "url": format!("https://www.notion.so/{id}"),
+                            "parent": { "type": "database_id", "database_id": "db-1" },
+                            "archived": false,
+                            "last_edited_time": "2026-11-20T02:00:00.000Z",
+                            "properties": {
+                                "Name": { "type": "title", "title": [{ "plain_text": "Row 1" }] }
+                            }
+                        }))
+                    }
+                })
+                .patch(|AxumPath(id): AxumPath<String>, Json(body): Json<Value>| async move {
+                    let props = body
+                        .get("properties")
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "Name": { "type": "title", "title": [{ "plain_text": "Updated" }] } }));
+                    Json(json!({
+                        "object": "page",
+                        "id": id,
+                        "url": format!("https://www.notion.so/{id}"),
+                        "parent": { "type": "database_id", "database_id": "db-1" },
+                        "archived": false,
+                        "last_edited_time": "2026-11-20T03:00:00.000Z",
+                        "properties": props
+                    }))
+                }),
+            )
+            .route(
+                "/v1/pages",
+                post(move |Json(body): Json<Value>| {
+                    let renamed = Arc::clone(&renamed_post_h);
+                    async move {
+                        let expected = if renamed.load(Ordering::SeqCst) {
+                            "Task Title"
+                        } else {
+                            "Name"
+                        };
+                        let has_expected = body
+                            .get("properties")
+                            .and_then(|p| p.get(expected))
+                            .is_some();
+                        if !has_expected {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "object": "error",
+                                    "status": 400,
+                                    "code": "validation_error",
+                                    "message": format!("Name is not a property that exists (expected {expected}).")
+                                })),
+                            )
+                                .into_response();
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "object": "page",
+                                "id": "row-created",
+                                "url": "https://www.notion.so/row-created",
+                                "parent": { "type": "database_id", "database_id": "db-1" },
+                                "archived": false,
+                                "last_edited_time": "2026-11-20T03:00:00.000Z",
+                                "properties": {
+                                    expected: { "type": "title", "title": [{ "plain_text": "Created" }] }
+                                }
+                            })),
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("cli_cache_write.db")).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.api_base_url = format!("http://{addr}/v1");
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_cli_write");
+        let ws_id = auth.active_workspace_id().await;
+        let client = NotionClient::new(&cfg, auth).unwrap();
+
+        // Seed cached database schema + cached page properties in SQLite.
+        let mut db_schema = std::collections::BTreeMap::new();
+        db_schema.insert(
+            "Name".to_string(),
+            crate::models::NotionPropertySchema {
+                id: "title".into(),
+                name: "Name".into(),
+                prop_type: "title".into(),
+                options: Vec::new(),
+                relation_database_id: None,
+            },
+        );
+        storage
+            .upsert_database(&NotionDatabase {
+                id: "db-1".into(),
+                workspace_id: ws_id.clone(),
+                title: "Tasks".into(),
+                schema: db_schema,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut page_props = std::collections::BTreeMap::new();
+        page_props.insert(
+            "Name".to_string(),
+            crate::models::NotionPropertyValue::Title("Row 1".into()),
+        );
+        storage
+            .upsert_page(&NotionPage {
+                id: "row-1".into(),
+                workspace_id: ws_id.clone(),
+                parent_type: "database_id".into(),
+                parent_id: Some("db-1".into()),
+                title: "Row 1".into(),
+                properties: page_props,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Warm cache: all 4 write ops should skip GET /v1/databases and GET /v1/pages.
+        op_create_database_item(&client, &storage, "db-1", "Item 1", None, None, None)
+            .await
+            .unwrap();
+        op_update_database_item(&client, &storage, "row-1", Some("Row 1b"), None, None)
+            .await
+            .unwrap();
+        op_update_page_metadata(&client, &storage, "row-1", Some(Some("Row 1c")), None)
+            .await
+            .unwrap();
+        op_patch_page(
+            &client,
+            &storage,
+            "row-1",
+            PagePatch {
+                title: Some("Row 1d"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(db_gets.load(Ordering::SeqCst), 0, "cached DB schema must skip GET /v1/databases");
+        assert_eq!(page_gets.load(Ordering::SeqCst), 0, "cached page properties must skip GET /v1/pages");
+
+        // Stale cache recovery: server renamed title column -> HTTP 400 validation_error ->
+        // refreshes DB schema once and retries POST /v1/pages successfully.
+        renamed_title_col.store(true, Ordering::SeqCst);
+        let created =
+            op_create_database_item(&client, &storage, "db-1", "Item After Rename", None, None, None)
+                .await
+                .unwrap();
+        assert_eq!(created.id, "row-created");
+        assert_eq!(
+            db_gets.load(Ordering::SeqCst),
+            1,
+            "stale schema validation_error must refresh DB schema exactly once and retry"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn append_blocks_and_add_comment_update_warm_cache_without_refetch() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use axum::{
+            extract::Path as AxumPath,
+            routing::get,
+            Json, Router,
+        };
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let block_gets = Arc::new(AtomicUsize::new(0));
+        let comment_gets = Arc::new(AtomicUsize::new(0));
+        let bg_h = Arc::clone(&block_gets);
+        let cg_h = Arc::clone(&comment_gets);
+
+        let app = Router::new()
+            .route(
+                "/v1/blocks/{id}/children",
+                get(move |AxumPath(_id): AxumPath<String>| {
+                    let c = Arc::clone(&bg_h);
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "results": [], "has_more": false, "next_cursor": null }))
+                    }
+                })
+                .patch(|AxumPath(_id): AxumPath<String>| async {
+                    Json(json!({
+                        "results": [{
+                            "object": "block",
+                            "id": "blk-appended",
+                            "type": "paragraph",
+                            "has_children": false,
+                            "paragraph": { "rich_text": [{ "plain_text": "Appended line" }] }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1/comments",
+                get(move || {
+                    let c = Arc::clone(&cg_h);
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "results": [], "has_more": false, "next_cursor": null }))
+                    }
+                })
+                .post(|| async {
+                    Json(json!({
+                        "object": "comment",
+                        "id": "cmt-new",
+                        "discussion_id": "disc-2",
+                        "created_time": "2026-11-20T04:00:00.000Z",
+                        "created_by": { "id": "u-1", "name": "Alice" },
+                        "rich_text": [{ "plain_text": "Looks good!" }]
+                    }))
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("cli_incremental.db")).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.api_base_url = format!("http://{addr}/v1");
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_cli_inc");
+        let ws_id = auth.active_workspace_id().await;
+        let client = NotionClient::new(&cfg, auth).unwrap();
+
+        // Seed warm page detail (existing block + complete comments).
+        let page = NotionPage {
+            id: "page-1".into(),
+            workspace_id: ws_id.clone(),
+            title: "Doc".into(),
+            last_edited_time: Some("2026-11-20T02:00:00Z".into()),
+            ..Default::default()
+        };
+        let existing_block = NotionBlock {
+            id: "blk-0".into(),
+            page_id: "page-1".into(),
+            parent_block_id: None,
+            block_type: "paragraph".into(),
+            has_children: false,
+            archived: false,
+            kind: crate::models::NotionBlockKind::Paragraph {
+                rich_text: vec![crate::models::RichTextSpan::plain("Existing line")],
+                color: crate::models::NotionColor::Default,
+            },
+            children: Vec::new(),
+        };
+        let existing_comment = NotionComment {
+            id: "cmt-0".into(),
+            page_id: "page-1".into(),
+            discussion_id: "disc-1".into(),
+            author: "Bob".into(),
+            body: "First".into(),
+            rich_text: vec![crate::models::RichTextSpan::plain("First")],
+            created_time: "2026-11-20T01:00:00Z".into(),
+        };
+        storage
+            .save_page_detail(&NotionPageDetail {
+                page,
+                blocks: vec![existing_block],
+                comments: vec![existing_comment],
+                comments_error: None,
+                markdown: "Existing line".into(),
+                media: Vec::new(),
+            })
+            .unwrap();
+
+        let appended = op_append_blocks(&client, &storage, "page-1", "Appended line")
+            .await
+            .unwrap();
+        assert_eq!(appended.len(), 1);
+        assert_eq!(
+            block_gets.load(Ordering::SeqCst),
+            0,
+            "warm-cache op_append_blocks must not refetch the full block tree"
+        );
+        let detail = storage.load_page_detail(&ws_id, "page-1").unwrap().unwrap();
+        let ids: Vec<&str> = detail.blocks.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, vec!["blk-0", "blk-appended"]);
+
+        let comment = op_add_comment(&client, &storage, "page-1", None, "Looks good!")
+            .await
+            .unwrap();
+        assert_eq!(comment.id, "cmt-new");
+        assert_eq!(
+            comment_gets.load(Ordering::SeqCst),
+            0,
+            "warm-cache op_add_comment must not refetch GET /v1/comments"
+        );
+        let comments = storage.load_page_comments(&ws_id, "page-1").unwrap();
+        let cids: Vec<&str> = comments.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(cids, vec!["cmt-0", "cmt-new"]);
+
+        server.abort();
     }
 }

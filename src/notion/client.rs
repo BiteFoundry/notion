@@ -13,12 +13,13 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use futures::StreamExt;
 use reqwest::{
     header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
     Method, StatusCode,
 };
 use serde_json::{json, Value};
-use tokio::time::Instant;
+use tokio::{sync::Semaphore, time::Instant};
 
 use crate::{
     auth::{parse_notion_user, AuthManager},
@@ -36,6 +37,7 @@ use crate::{
 
 const MAX_RETRIES: usize = 4;
 const DEFAULT_BLOCK_TREE_DEPTH: usize = 12;
+const BLOCK_TREE_CONCURRENCY: usize = 3;
 /// Comments carried inside a page detail. One extra comment is fetched to learn whether more exist.
 pub const DETAIL_COMMENTS_LIMIT: usize = 2000;
 const MAX_APPEND_BATCH_SIZE: usize = 100;
@@ -631,7 +633,8 @@ impl NotionClient {
         bail!("Notion block children pagination did not complete")
     }
 
-    /// Recursively fetches a block tree with depth cap & cursor pagination.
+    /// Recursively fetches a block tree with depth cap, cursor pagination, and a tree-wide
+    /// concurrency cap (`BLOCK_TREE_CONCURRENCY`) to avoid Notion 429 bursts on deep trees.
     pub async fn fetch_block_tree(
         &self,
         root_block_id: &str,
@@ -639,7 +642,21 @@ impl NotionClient {
     ) -> Result<Vec<NotionBlock>> {
         let page_id = normalize_notion_id(root_block_id);
         let limit = max_depth.unwrap_or(DEFAULT_BLOCK_TREE_DEPTH);
-        self.fetch_block_tree_rec(&page_id, &page_id, None, limit)
+        let sem = Arc::new(Semaphore::new(BLOCK_TREE_CONCURRENCY));
+        self.fetch_block_tree_rec(&page_id, &page_id, None, limit, &sem)
+            .await
+    }
+
+    /// Hydrates recursive children for an existing slice of blocks (e.g. newly appended
+    /// container blocks) using the same tree-wide concurrency bound.
+    pub(crate) async fn hydrate_block_subtrees(
+        &self,
+        blocks: &mut Vec<NotionBlock>,
+        page_id: &str,
+    ) -> Result<()> {
+        let norm_page = normalize_notion_id(page_id);
+        let sem = Arc::new(Semaphore::new(BLOCK_TREE_CONCURRENCY));
+        self.hydrate_children(blocks, &norm_page, DEFAULT_BLOCK_TREE_DEPTH, &sem)
             .await
     }
 
@@ -705,7 +722,8 @@ impl NotionClient {
                 break;
             }
         }
-        self.hydrate_children(&mut out, &page_id, DEFAULT_BLOCK_TREE_DEPTH)
+        let sem = Arc::new(Semaphore::new(BLOCK_TREE_CONCURRENCY));
+        self.hydrate_children(&mut out, &page_id, DEFAULT_BLOCK_TREE_DEPTH, &sem)
             .await?;
         Ok((out, last_has_more, last_next_cursor))
     }
@@ -715,14 +733,16 @@ impl NotionClient {
         blocks: &'a mut Vec<NotionBlock>,
         page_id: &'a str,
         remaining_depth: usize,
+        sem: &'a Arc<Semaphore>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             if remaining_depth == 0 {
                 return Ok(());
             }
-            // Collect indices of child blocks to recurse into and fetch in bounded parallel chunks of 3
-            // (respects Notion's 3 req/s rate limit while cutting nested page latency ~3x).
-            let recurse_indices: Vec<usize> = blocks
+            // Stream sibling child fetches with `buffer_unordered(BLOCK_TREE_CONCURRENCY)` gated
+            // by a single tree-wide semaphore: eliminates chunk head-of-line blocking while
+            // capping total concurrent HTTP requests across all recursion depths at <= 3.
+            let targets: Vec<(usize, String)> = blocks
                 .iter()
                 .enumerate()
                 .filter_map(|(i, blk)| {
@@ -732,26 +752,26 @@ impl NotionClient {
                             blk.block_type.as_str(),
                             "child_page" | "child_database" | "unsupported"
                         );
-                    should_recurse.then_some(i)
+                    should_recurse.then(|| (i, blk.id.clone()))
                 })
                 .collect();
 
-            for chunk in recurse_indices.chunks(3) {
-                let futs: Vec<_> = chunk
-                    .iter()
-                    .map(|&idx| {
-                        let bid = blocks[idx].id.clone();
-                        async move {
-                            let res = self
-                                .fetch_block_tree_rec(&bid, page_id, Some(&bid), remaining_depth - 1)
-                                .await;
-                            (idx, res)
-                        }
-                    })
-                    .collect();
-                for (idx, res) in futures::future::join_all(futs).await {
-                    blocks[idx].children = res?;
+            if targets.is_empty() {
+                return Ok(());
+            }
+
+            let mut stream = futures::stream::iter(targets.into_iter().map(|(idx, bid)| {
+                async move {
+                    let res = self
+                        .fetch_block_tree_rec(&bid, page_id, Some(&bid), remaining_depth - 1, sem)
+                        .await;
+                    (idx, res)
                 }
+            }))
+            .buffer_unordered(BLOCK_TREE_CONCURRENCY);
+
+            while let Some((idx, res)) = stream.next().await {
+                blocks[idx].children = res?;
             }
             Ok(())
         })
@@ -763,13 +783,21 @@ impl NotionClient {
         page_id: &'a str,
         parent_block_id: Option<&'a str>,
         remaining_depth: usize,
+        sem: &'a Arc<Semaphore>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<NotionBlock>>> + Send + 'a>> {
         Box::pin(async move {
-            let mut blocks = self
-                .list_block_children(block_id, page_id, parent_block_id)
-                .await?;
+            // Acquire permit strictly around the HTTP fetch and drop it before recursing into
+            // children so nested recursion can never deadlock on the shared semaphore.
+            let mut blocks = {
+                let _permit = sem
+                    .acquire()
+                    .await
+                    .context("Block tree concurrency semaphore closed")?;
+                self.list_block_children(block_id, page_id, parent_block_id)
+                    .await?
+            };
             if remaining_depth > 0 {
-                self.hydrate_children(&mut blocks, page_id, remaining_depth)
+                self.hydrate_children(&mut blocks, page_id, remaining_depth, sem)
                     .await?;
             }
             Ok(blocks)
@@ -1331,5 +1359,150 @@ mod tests {
             "concurrent waiter must honor cooldown extended while sleeping (elapsed={:?})",
             finished.duration_since(start)
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_block_tree_streams_past_slow_sibling_and_caps_total_concurrency_at_3() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use axum::{extract::Path as AxumPath, routing::get, Json, Router};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        let wake_slow_sibling = Arc::new(Notify::new());
+        let wake_for_handler = Arc::clone(&wake_slow_sibling);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let in_flight_h = Arc::clone(&in_flight);
+        let peak_h = Arc::clone(&peak_in_flight);
+
+        let app = Router::new().route(
+            "/v1/blocks/{id}/children",
+            get(move |AxumPath(id): AxumPath<String>| {
+                let wake = Arc::clone(&wake_for_handler);
+                let cur = Arc::clone(&in_flight_h);
+                let peak = Arc::clone(&peak_h);
+                async move {
+                    // Part A: 4 sibling containers; c0 waits until c3 has started.
+                    if id == "page-stream" {
+                        return Json(json!({
+                            "results": [
+                                { "id": "c0", "type": "toggle", "has_children": true, "toggle": { "rich_text": [{ "plain_text": "C0" }] } },
+                                { "id": "c1", "type": "toggle", "has_children": true, "toggle": { "rich_text": [{ "plain_text": "C1" }] } },
+                                { "id": "c2", "type": "toggle", "has_children": true, "toggle": { "rich_text": [{ "plain_text": "C2" }] } },
+                                { "id": "c3", "type": "toggle", "has_children": true, "toggle": { "rich_text": [{ "plain_text": "C3" }] } }
+                            ],
+                            "has_more": false,
+                            "next_cursor": null
+                        }));
+                    }
+                    if id == "c0" {
+                        wake.notified().await;
+                        return Json(json!({
+                            "results": [{ "id": "c0-leaf", "type": "paragraph", "has_children": false, "paragraph": { "rich_text": [{ "plain_text": "leaf0" }] } }],
+                            "has_more": false,
+                            "next_cursor": null
+                        }));
+                    }
+                    if id == "c3" {
+                        wake.notify_waiters();
+                        return Json(json!({
+                            "results": [{ "id": "c3-leaf", "type": "paragraph", "has_children": false, "paragraph": { "rich_text": [{ "plain_text": "leaf3" }] } }],
+                            "has_more": false,
+                            "next_cursor": null
+                        }));
+                    }
+                    if id == "c1" || id == "c2" {
+                        return Json(json!({
+                            "results": [{ "id": format!("{id}-leaf"), "type": "paragraph", "has_children": false, "paragraph": { "rich_text": [{ "plain_text": id }] } }],
+                            "has_more": false,
+                            "next_cursor": null
+                        }));
+                    }
+
+                    // Part B: 2-level nested tree (3 parents x 3 children = 9 nested containers).
+                    let active = cur.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(active, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let body = if id == "page-nested" {
+                        json!({
+                            "results": [
+                                { "id": "p0", "type": "toggle", "has_children": true, "toggle": { "rich_text": [{ "plain_text": "P0" }] } },
+                                { "id": "p1", "type": "toggle", "has_children": true, "toggle": { "rich_text": [{ "plain_text": "P1" }] } },
+                                { "id": "p2", "type": "toggle", "has_children": true, "toggle": { "rich_text": [{ "plain_text": "P2" }] } }
+                            ],
+                            "has_more": false,
+                            "next_cursor": null
+                        })
+                    } else if id.starts_with('p') && id.len() == 2 {
+                        json!({
+                            "results": [
+                                { "id": format!("{id}-k0"), "type": "toggle", "has_children": true, "toggle": { "rich_text": [{ "plain_text": "K0" }] } },
+                                { "id": format!("{id}-k1"), "type": "toggle", "has_children": true, "toggle": { "rich_text": [{ "plain_text": "K1" }] } },
+                                { "id": format!("{id}-k2"), "type": "toggle", "has_children": true, "toggle": { "rich_text": [{ "plain_text": "K2" }] } }
+                            ],
+                            "has_more": false,
+                            "next_cursor": null
+                        })
+                    } else {
+                        json!({
+                            "results": [{ "id": format!("{id}-leaf"), "type": "paragraph", "has_children": false, "paragraph": { "rich_text": [{ "plain_text": id }] } }],
+                            "has_more": false,
+                            "next_cursor": null
+                        })
+                    };
+                    cur.fetch_sub(1, Ordering::SeqCst);
+                    Json(body)
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.api_base_url = format!("http://{addr}/v1");
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_test_tree");
+        let client = NotionClient::new(&cfg, auth).unwrap();
+
+        // Part A: must NOT deadlock on chunks(3) boundary — c3 must start while c0 is still blocked.
+        let streamed = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.fetch_block_tree("page-stream", None),
+        )
+        .await
+        .expect("buffer_unordered must stream past slow sibling c0 into c3 without chunk barrier")
+        .unwrap();
+        let ids: Vec<&str> = streamed.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, vec!["c0", "c1", "c2", "c3"]);
+        assert_eq!(streamed[0].children[0].id, "c0-leaf");
+        assert_eq!(streamed[3].children[0].id, "c3-leaf");
+
+        // Part B: total concurrent requests across all recursion depths must stay <= 3.
+        peak_in_flight.store(0, Ordering::SeqCst);
+        let nested = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.fetch_block_tree("page-nested", None),
+        )
+        .await
+        .expect("nested block tree fetch should complete promptly")
+        .unwrap();
+        let peak = peak_in_flight.load(Ordering::SeqCst);
+        assert!(
+            (2..=BLOCK_TREE_CONCURRENCY).contains(&peak),
+            "expected bounded concurrent peak in 2..={BLOCK_TREE_CONCURRENCY}, got {peak}"
+        );
+        assert_eq!(nested.len(), 3);
+        let leaf_count: usize = nested
+            .iter()
+            .flat_map(|p| &p.children)
+            .map(|k| k.children.len())
+            .sum();
+        assert_eq!(leaf_count, 9);
+
+        server.abort();
     }
 }

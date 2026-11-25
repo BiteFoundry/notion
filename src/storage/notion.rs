@@ -151,6 +151,155 @@ impl Storage {
         Ok(())
     }
 
+    /// Incrementally records a newly created comment into SQLite when the page's complete
+    /// comment list is already cached, avoiding a full paginated `GET /v1/comments` refetch.
+    /// Returns `Ok(true)` if cached in-place, or `Ok(false)` after invalidating the detail
+    /// sync marker so the next full read fetches comments cleanly.
+    pub fn append_cached_comment(
+        &self,
+        workspace_id: &str,
+        page_id: &str,
+        comment: &NotionComment,
+    ) -> Result<bool> {
+        let mut conn = self.writer();
+        let tx = conn.transaction()?;
+        let row: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT comments_fetched, comments_error FROM pages WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, page_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if matches!(row, Some((1, None))) {
+            let rt_json = serde_json::to_string(&comment.rich_text).unwrap_or_else(|_| "[]".into());
+            tx.execute(
+                "INSERT OR REPLACE INTO comments
+                 (id, workspace_id, page_id, discussion_id, author, body, rich_text_json, created_time)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    comment.id,
+                    workspace_id,
+                    page_id,
+                    comment.discussion_id,
+                    comment.author,
+                    comment.body,
+                    rt_json,
+                    comment.created_time
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(true);
+        }
+        tx.execute(
+            "UPDATE pages SET detail_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
+            params![workspace_id, page_id],
+        )?;
+        tx.commit()?;
+        Ok(false)
+    }
+
+    /// Incrementally appends server-confirmed blocks into SQLite when the target parent's
+    /// children are already cached, recomputing `pages.plain_text` and `pages_fts` without
+    /// refetching the entire page block tree. Returns `Ok(true)` if merged into a warm cache,
+    /// or `Ok(false)` after invalidating the page's sync markers on a cold cache.
+    pub fn append_cached_blocks(
+        &self,
+        workspace_id: &str,
+        parent_id: &str,
+        appended: &[NotionBlock],
+    ) -> Result<bool> {
+        let mut conn = self.writer();
+        let tx = conn.transaction()?;
+        if let Some((owner_id, has_children)) = cached_child_parent(&tx, workspace_id, parent_id)? {
+            let fetched: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM block_children_fetched WHERE workspace_id = ?1 AND parent_id = ?2)",
+                params![workspace_id, parent_id],
+                |r| r.get(0),
+            )?;
+            let has_rows: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM blocks WHERE workspace_id = ?1 AND parent_block_id = ?2)",
+                params![workspace_id, parent_id],
+                |r| r.get(0),
+            )?;
+            if !has_children || fetched || has_rows {
+                let max_pos: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(position), -1) FROM blocks WHERE workspace_id = ?1 AND page_id = ?2",
+                    params![workspace_id, owner_id],
+                    |r| r.get(0),
+                )?;
+                let mut pos = max_pos + 1;
+                insert_blocks_recursive(
+                    &tx,
+                    workspace_id,
+                    &owner_id,
+                    Some(parent_id),
+                    appended,
+                    &mut pos,
+                )?;
+                if !appended.is_empty() {
+                    tx.execute(
+                        "UPDATE blocks SET has_children = 1, content_json = json_set(content_json, '$.has_children', json('true'))
+                         WHERE workspace_id = ?1 AND id = ?2",
+                        params![workspace_id, parent_id],
+                    )?;
+                }
+                mark_children_fetched(&tx, workspace_id, parent_id)?;
+                tx.execute(
+                    "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL
+                     WHERE workspace_id = ?1 AND id = ?2",
+                    params![workspace_id, owner_id],
+                )?;
+                recompute_page_plain_text_in_tx(&tx, workspace_id, &owner_id)?;
+                tx.commit()?;
+                return Ok(true);
+            }
+            tx.execute(
+                "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL
+                 WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, owner_id],
+            )?;
+            tx.commit()?;
+            return Ok(false);
+        }
+
+        let fetched: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM block_children_fetched WHERE workspace_id = ?1 AND parent_id = ?2)",
+            params![workspace_id, parent_id],
+            |r| r.get(0),
+        )?;
+        let has_rows: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM blocks WHERE workspace_id = ?1 AND page_id = ?2)",
+            params![workspace_id, parent_id],
+            |r| r.get(0),
+        )?;
+        if fetched || has_rows {
+            let max_pos: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(position), -1) FROM blocks WHERE workspace_id = ?1 AND page_id = ?2",
+                params![workspace_id, parent_id],
+                |r| r.get(0),
+            )?;
+            let mut pos = max_pos + 1;
+            insert_blocks_recursive(&tx, workspace_id, parent_id, None, appended, &mut pos)?;
+            mark_children_fetched(&tx, workspace_id, parent_id)?;
+            tx.execute(
+                "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL
+                 WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, parent_id],
+            )?;
+            recompute_page_plain_text_in_tx(&tx, workspace_id, parent_id)?;
+            tx.commit()?;
+            return Ok(true);
+        }
+
+        tx.execute(
+            "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL
+             WHERE workspace_id = ?1 AND id = ?2",
+            params![workspace_id, parent_id],
+        )?;
+        tx.commit()?;
+        Ok(false)
+    }
+
     /// Saves a full `NotionPageDetail` atomically (page metadata + blocks + comments + FTS5)
     /// and records `detail_synced_edited_time` only after blocks and comments are stored.
     pub fn save_page_detail(&self, detail: &NotionPageDetail) -> Result<()> {

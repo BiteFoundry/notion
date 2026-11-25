@@ -263,7 +263,21 @@ pub enum UiMsg {
         error: String,
         edited_markdown: String,
     },
-    PageCreated(NotionPage),
+    AppendFailed {
+        page_id: String,
+        error: String,
+    },
+    PageCreated {
+        page: NotionPage,
+        preview_detail: Option<Box<NotionPageDetail>>,
+    },
+    WorkspaceTreeRefreshed {
+        workspace_id: String,
+        pages: Vec<NotionPageSummary>,
+        databases: Vec<NotionDatabase>,
+        task_label: &'static str,
+        toast: String,
+    },
     PageArchived(String),
     MediaUrlRefreshed {
         page_id: String,
@@ -841,6 +855,31 @@ impl AppState {
                 apply_optimistic_markdown_to_detail(detail, edited_markdown);
             }
         }
+    }
+
+    /// Immediately appends optimistic blocks to the active in-memory page detail so quick-append
+    /// renders in 0ms while the API request runs. Never writes `__optimistic_*` IDs to SQLite.
+    pub fn apply_optimistic_append_local(
+        &mut self,
+        page_id: &str,
+        markdown_or_slash: &str,
+        ui: &mut UiState,
+    ) -> bool {
+        let optimistic = build_optimistic_append_blocks(page_id, markdown_or_slash);
+        if optimistic.is_empty() {
+            return false;
+        }
+        if let Some(ref mut detail) = self.active_page_detail {
+            if detail.page.id == page_id {
+                detail.blocks.extend(optimistic);
+                detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
+                detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
+                detail.media = crate::parser::collect_media_refs(&detail.blocks);
+                self.clamp_canvas_selection(ui);
+                return true;
+            }
+        }
+        false
     }
 
     /// Materializes the draft on demand for actions that read the page's blocks.
@@ -1735,7 +1774,22 @@ impl AppState {
                     }
                 }
             }
-            UiMsg::PageCreated(page) => {
+            UiMsg::AppendFailed { page_id, error } => {
+                ui.tasks.finish("append", Some(error.clone()));
+                if self.active_page_id.as_deref() == Some(page_id.as_str()) {
+                    if let Ok(Some(cached)) =
+                        self.storage.load_page_detail(&self.workspace_id, &page_id)
+                    {
+                        self.active_page_detail = Some(cached);
+                        self.clamp_canvas_selection(ui);
+                    }
+                }
+                ui.error(format!("append: {error}"));
+            }
+            UiMsg::PageCreated {
+                page,
+                preview_detail,
+            } => {
                 ui.tasks.finish("create", None);
                 if let Some(expected) = self.expected_workspace_id.as_deref() {
                     if !page.workspace_id.is_empty() && page.workspace_id != expected {
@@ -1771,9 +1825,37 @@ impl AppState {
                     }
                 } else {
                     let _ = self.try_open_page(&id, ui, true);
+                    if let Some(preview) = preview_detail {
+                        if self.active_page_id.as_deref() == Some(id.as_str()) {
+                            self.active_page_detail = Some(*preview);
+                            self.clamp_canvas_selection(ui);
+                        }
+                    }
                 }
                 self.snap_sidebar_selection(ui);
                 ui.success(format!("Created '{title}'"));
+            }
+            UiMsg::WorkspaceTreeRefreshed {
+                workspace_id,
+                pages,
+                databases,
+                task_label,
+                toast,
+            } => {
+                ui.tasks.finish(task_label, None);
+                if self
+                    .expected_workspace_id
+                    .as_ref()
+                    .is_some_and(|expected| *expected != workspace_id)
+                {
+                    return;
+                }
+                self.workspace_id = workspace_id;
+                self.pages = pages;
+                self.databases = databases;
+                self.reload_page_parent_hints();
+                self.snap_sidebar_selection(ui);
+                ui.success(toast);
             }
             UiMsg::PageArchived(id) => {
                 ui.tasks.finish("archive", None);
@@ -2480,4 +2562,206 @@ fn update_block_media_url_in_tree(blocks: &mut [NotionBlock], target_id: &str, u
         }
     }
     false
+}
+
+fn parse_optimistic_block_payload(
+    val: &serde_json::Value,
+    page_id: &str,
+    parent_block_id: Option<&str>,
+    prefix: &str,
+    counter: &mut usize,
+) -> NotionBlock {
+    let mut blk = crate::parser::parse_notion_block(val, page_id, parent_block_id);
+    if blk.id.trim().is_empty() {
+        blk.id = format!("__optimistic_{prefix}_{page_id}_{}", *counter);
+        *counter += 1;
+    }
+    if blk.children.is_empty() {
+        if let Some(nested) = val
+            .get(&blk.block_type)
+            .and_then(|inner| inner.get("children"))
+            .and_then(serde_json::Value::as_array)
+        {
+            let parent_id = blk.id.clone();
+            blk.children = nested
+                .iter()
+                .map(|child| {
+                    parse_optimistic_block_payload(child, page_id, Some(&parent_id), prefix, counter)
+                })
+                .collect();
+        }
+    } else {
+        for child in &mut blk.children {
+            if child.id.trim().is_empty() {
+                child.id = format!("__optimistic_{prefix}_{page_id}_{}", *counter);
+                *counter += 1;
+            }
+        }
+    }
+    if !blk.children.is_empty() {
+        blk.has_children = true;
+    }
+    blk
+}
+
+/// Parses quick-append slash or Markdown input into local optimistic `NotionBlock`s with
+/// `__optimistic_append_*` IDs (for in-memory display only; never written to SQLite).
+pub fn build_optimistic_append_blocks(page_id: &str, markdown_or_slash: &str) -> Vec<NotionBlock> {
+    let payloads = crate::parser::parse_slash_command_blocks(markdown_or_slash);
+    let mut counter = 0usize;
+    payloads
+        .iter()
+        .map(|val| parse_optimistic_block_payload(val, page_id, None, "append", &mut counter))
+        .collect()
+}
+
+/// Builds an immediate local `NotionPageDetail` preview for a newly created page from the
+/// user's Markdown body so the canvas renders right away while background sync hydrates real IDs.
+pub fn build_created_page_preview(mut page: NotionPage, markdown_body: &str) -> NotionPageDetail {
+    let page_id = page.id.clone();
+    let blocks = if markdown_body.trim().is_empty() {
+        Vec::new()
+    } else {
+        let payloads = crate::parser::markdown_to_notion_blocks(markdown_body);
+        let mut counter = 0usize;
+        payloads
+            .iter()
+            .map(|val| parse_optimistic_block_payload(val, &page_id, None, "create", &mut counter))
+            .collect()
+    };
+    page.plain_text = crate::parser::blocks_to_plain_text(&blocks);
+    let markdown = crate::parser::blocks_to_markdown(&blocks);
+    let media = crate::parser::collect_media_refs(&blocks);
+    NotionPageDetail {
+        page,
+        blocks,
+        comments: Vec::new(),
+        comments_error: None,
+        markdown,
+        media,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app_and_ui() -> (AppState, UiState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("ui_app.db")).unwrap();
+        let cfg = AppConfig::default();
+        let auth = AuthManager::from_token(cfg.clone(), "ntn_ui_test");
+        let client = NotionClient::new(&cfg, auth.clone()).unwrap();
+        let (focus_tx, _focus_rx) = tokio::sync::watch::channel(FocusTarget::default());
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        let app = AppState::new(cfg, auth, client, storage, sync_ctrl, ui_tx);
+        let ui = UiState::new();
+        (app, ui, dir)
+    }
+
+    #[test]
+    fn page_created_renders_preview_immediately_without_persisting_optimistic_ids() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+        let page = NotionPage {
+            id: "page-created-1".into(),
+            workspace_id: app.workspace_id.clone(),
+            parent_type: "workspace".into(),
+            title: "Launch Plan".into(),
+            ..Default::default()
+        };
+        app.storage.upsert_page(&page).unwrap();
+
+        let preview = build_created_page_preview(page.clone(), "# Kickoff\n\nShip v1");
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::PageCreated {
+                page: page.clone(),
+                preview_detail: Some(Box::new(preview)),
+            },
+        );
+
+        let active = app
+            .active_page_detail
+            .as_ref()
+            .expect("active_page_detail should be populated immediately");
+        assert_eq!(active.page.id, "page-created-1");
+        assert_eq!(active.blocks.len(), 2);
+        assert!(active.blocks.iter().all(|b| b.id.starts_with("__optimistic_create_")));
+        assert!(active.markdown.contains("Kickoff"));
+        assert!(active.markdown.contains("Ship v1"));
+
+        // SQLite must NEVER contain synthetic __optimistic_* blocks.
+        assert!(
+            app.storage
+                .load_cached_children(&app.workspace_id, "page-created-1")
+                .unwrap()
+                .is_none(),
+            "optimistic preview must stay in memory only"
+        );
+    }
+
+    #[test]
+    fn optimistic_append_renders_immediately_and_reverts_on_failure() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+        let page = NotionPage {
+            id: "page-append-1".into(),
+            workspace_id: app.workspace_id.clone(),
+            parent_type: "workspace".into(),
+            title: "Notes".into(),
+            ..Default::default()
+        };
+        let existing = NotionBlock {
+            id: "blk-real-1".into(),
+            page_id: "page-append-1".into(),
+            parent_block_id: None,
+            block_type: "paragraph".into(),
+            has_children: false,
+            archived: false,
+            kind: NotionBlockKind::Paragraph {
+                rich_text: vec![crate::models::RichTextSpan::plain("Original")],
+                color: NotionColor::Default,
+            },
+            children: Vec::new(),
+        };
+        app.storage
+            .save_page_detail(&NotionPageDetail {
+                page: page.clone(),
+                blocks: vec![existing],
+                comments: Vec::new(),
+                comments_error: None,
+                markdown: "Original".into(),
+                media: Vec::new(),
+            })
+            .unwrap();
+        app.pages.push(NotionPageSummary::from(&page));
+        app.open_page("page-append-1", &mut ui, false);
+
+        assert!(app.apply_optimistic_append_local("page-append-1", "/todo Ship now", &mut ui));
+        let after_opt = app.active_page_detail.as_ref().unwrap();
+        assert_eq!(after_opt.blocks.len(), 2);
+        assert!(after_opt.blocks[1].id.starts_with("__optimistic_append_"));
+        assert!(after_opt.markdown.contains("Ship now"));
+
+        // SQLite still holds only the single server-confirmed block.
+        let cached = app
+            .storage
+            .load_page_detail(&app.workspace_id, "page-append-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.blocks.len(), 1);
+
+        // Failure reverts in-memory canvas back to SQLite's authoritative block list.
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::AppendFailed {
+                page_id: "page-append-1".into(),
+                error: "network timeout".into(),
+            },
+        );
+        let reverted = app.active_page_detail.as_ref().unwrap();
+        assert_eq!(reverted.blocks.len(), 1);
+        assert_eq!(reverted.blocks[0].id, "blk-real-1");
+    }
 }
