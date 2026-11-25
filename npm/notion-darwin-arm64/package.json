@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/notion-darwin-arm64",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Prebuilt notion binary for macOS arm64",
   "repository": {
     "type": "git",

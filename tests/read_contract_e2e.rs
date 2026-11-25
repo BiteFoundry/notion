@@ -2480,7 +2480,7 @@ async fn mcp_get_page_defaults_compact_and_text_is_minified() {
     assert_eq!(parsed_compact["comments_state"], "not_fetched");
     assert_eq!(
         parsed_compact["hint"],
-        "Call get_page with {\"page\":\"page-roadmap\",\"compact\":false} for properties, blocks, comments and media."
+        "Call get_page with {\"page\":\"page-roadmap\",\"fields\":[\"<property name>\",...]} to fetch specific properties or fields without pulling full blocks or comments, or {\"page\":\"page-roadmap\",\"compact\":false} for full detail."
     );
 
     // Full (compact: false)
