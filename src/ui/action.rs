@@ -579,8 +579,13 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     | NotionBlockKind::Heading2 { is_toggleable: true, .. }
                     | NotionBlockKind::Heading3 { is_toggleable: true, .. } => {
                         let id = vblk.block.id.clone();
+                        let children_unloaded =
+                            vblk.block.has_children && vblk.block.children.is_empty();
                         if !ui.expanded_toggles.remove(&id) {
-                            ui.expanded_toggles.insert(id);
+                            ui.expanded_toggles.insert(id.clone());
+                            if children_unloaded {
+                                app.hydrate_block_children(&id, ui);
+                            }
                         }
                         app.clamp_canvas_selection(ui);
                     }

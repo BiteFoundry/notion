@@ -309,6 +309,8 @@ fn make_db_row(
         plain_text: format!("{title} {} {}", status.0, priority.0),
         created_time: Some("2025-11-01T09:00:00Z".into()),
         last_edited_time: Some(edited.into()),
+        created_by: None,
+        last_edited_by: None,
         synced_at: Some("2025-11-19T14:30:00Z".into()),
     }
 }

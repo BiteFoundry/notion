@@ -2806,11 +2806,13 @@ pub fn partition_blocks_around_anchors(
 
     for (j, anchor) in anchors.iter().enumerate() {
         let anchor_md = blocks_to_markdown(std::slice::from_ref(anchor));
-        let anchor_keys: Vec<(String, String)> = markdown_to_notion_blocks(&anchor_md)
-            .iter()
-            .map(|val| parse_notion_block(val, &anchor.page_id, None))
-            .map(|blk| block_comparison_key(&blk))
-            .collect();
+        // Parse the anchor the same way `new_parsed` was parsed (indented lines nest under the
+        // block above them) so an anchor whose children render indented still matches.
+        let anchor_keys: Vec<(String, String)> =
+            parse_markdown_block_tree(&anchor_md, &anchor.page_id)
+                .iter()
+                .map(block_comparison_key)
+                .collect();
 
         let matched = if !anchor_keys.is_empty() {
             find_key_subslice(&new_keys, &anchor_keys, cursor)
@@ -2892,17 +2894,239 @@ pub fn apply_optimistic_markdown_to_detail(detail: &mut NotionPageDetail, edited
     let normalized = edited_markdown.replace("\r\n", "\n").replace('\r', "\n");
     let page_id = detail.page.id.clone();
 
-    let payloads = markdown_to_notion_blocks(&normalized);
-    let new_parsed: Vec<NotionBlock> = payloads
-        .iter()
-        .map(|val| parse_notion_block(val, &page_id, None))
-        .collect();
+    // Children render as indented lines under their parent (`blocks_to_markdown`), so the edited
+    // Markdown is parsed back into a tree: re-parsing it flat would turn every child of a toggle,
+    // toggleable heading or list item into a duplicate top-level block.
+    let new_parsed = parse_markdown_block_tree(&normalized, &page_id);
+    let mut opt_counter = 0usize;
+    let final_blocks =
+        merge_optimistic_blocks(&detail.blocks, new_parsed, &page_id, &mut opt_counter);
 
-    let (old_segments, anchors, new_ranges) =
-        partition_blocks_around_anchors(&detail.blocks, &new_parsed);
+    detail.page.plain_text = blocks_to_plain_text(&final_blocks);
+    detail.media = collect_media_refs(&final_blocks);
+    detail.blocks = final_blocks;
+    detail.markdown = normalized;
+}
+
+/// Last line index of the Markdown block starting at `lines[start]`: a fenced code block or a
+/// multi-line `$$` equation spans to its closing line (whose indentation can differ from the
+/// opening line), everything else is a single line.
+fn markdown_block_span_end(lines: &[&str], start: usize) -> usize {
+    let t = lines[start].trim();
+    if t.starts_with("```") {
+        return (start + 1..lines.len())
+            .find(|&j| lines[j].trim().starts_with("```"))
+            .unwrap_or(lines.len().saturating_sub(1));
+    }
+    if let Some(after_open) = t.strip_prefix("$$") {
+        let single_line = after_open
+            .strip_suffix("$$")
+            .is_some_and(|expr| !expr.trim().is_empty());
+        if !single_line {
+            if let Some(end) = (start + 1..lines.len()).find(|&j| lines[j].trim().ends_with("$$")) {
+                return end;
+            }
+        }
+    }
+    start
+}
+
+/// Removes one nesting level (two spaces or a tab) of leading indentation.
+fn dedent_markdown_line(line: &str) -> &str {
+    if let Some(rest) = line.strip_prefix('\t') {
+        rest
+    } else if let Some(rest) = line.strip_prefix("  ") {
+        rest
+    } else {
+        line.strip_prefix(' ').unwrap_or(line)
+    }
+}
+
+/// Whether Notion allows (and `blocks_to_markdown` renders) nested children under this block.
+fn markdown_block_can_nest(blk: &NotionBlock) -> bool {
+    matches!(
+        blk.kind,
+        NotionBlockKind::Paragraph { .. }
+            | NotionBlockKind::Heading1 { .. }
+            | NotionBlockKind::Heading2 { .. }
+            | NotionBlockKind::Heading3 { .. }
+            | NotionBlockKind::BulletedListItem { .. }
+            | NotionBlockKind::NumberedListItem { .. }
+            | NotionBlockKind::ToDo { .. }
+            | NotionBlockKind::Toggle { .. }
+            | NotionBlockKind::Callout { .. }
+            | NotionBlockKind::Quote { .. }
+    )
+}
+
+fn set_heading_toggleable(blk: &mut NotionBlock) {
+    if let NotionBlockKind::Heading1 { is_toggleable, .. }
+    | NotionBlockKind::Heading2 { is_toggleable, .. }
+    | NotionBlockKind::Heading3 { is_toggleable, .. } = &mut blk.kind
+    {
+        *is_toggleable = true;
+    }
+}
+
+fn is_toggleable_heading(blk: &NotionBlock) -> bool {
+    matches!(
+        blk.kind,
+        NotionBlockKind::Heading1 { is_toggleable: true, .. }
+            | NotionBlockKind::Heading2 { is_toggleable: true, .. }
+            | NotionBlockKind::Heading3 { is_toggleable: true, .. }
+    )
+}
+
+/// Parses editor Markdown into a typed block tree. Lines indented one level deeper than the
+/// block above them (as `blocks_to_markdown` renders children) become that block's children;
+/// only blocks that cannot hold children get them as following siblings instead.
+fn parse_markdown_block_tree(markdown: &str, page_id: &str) -> Vec<NotionBlock> {
+    fn flush(top_run: &mut Vec<&str>, page_id: &str, out: &mut Vec<NotionBlock>) {
+        if top_run.iter().any(|l| !l.trim().is_empty()) {
+            out.extend(
+                markdown_to_notion_blocks(&top_run.join("\n"))
+                    .iter()
+                    .map(|val| parse_notion_block(val, page_id, None)),
+            );
+        }
+        top_run.clear();
+    }
+
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut out: Vec<NotionBlock> = Vec::new();
+    let mut top_run: Vec<&str> = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim().is_empty() || leading_indent_level(line) == 0 {
+            let end = if line.trim().is_empty() {
+                i
+            } else {
+                markdown_block_span_end(&lines, i)
+            };
+            top_run.extend_from_slice(&lines[i..=end]);
+            i = end + 1;
+            continue;
+        }
+
+        // An indented run (blank lines inside it included) holds the children of the block above.
+        let mut child_lines: Vec<&str> = Vec::new();
+        while i < lines.len() {
+            let l = lines[i];
+            if l.trim().is_empty() {
+                let continues = lines[i + 1..]
+                    .iter()
+                    .find(|n| !n.trim().is_empty())
+                    .is_some_and(|n| leading_indent_level(n) > 0);
+                if !continues {
+                    break;
+                }
+                child_lines.push("");
+                i += 1;
+                continue;
+            }
+            if leading_indent_level(l) == 0 {
+                break;
+            }
+            let end = markdown_block_span_end(&lines, i);
+            child_lines.extend(lines[i..=end].iter().map(|l| dedent_markdown_line(l)));
+            i = end + 1;
+        }
+
+        flush(&mut top_run, page_id, &mut out);
+        let children = parse_markdown_block_tree(&child_lines.join("\n"), page_id);
+        match out.last_mut() {
+            Some(parent) if markdown_block_can_nest(parent) && !children.is_empty() => {
+                // Only toggleable headings carry children in Notion.
+                set_heading_toggleable(parent);
+                parent.has_children = true;
+                parent.children.extend(children);
+            }
+            _ => out.extend(children),
+        }
+    }
+    flush(&mut top_run, page_id, &mut out);
+    out
+}
+
+/// Carries a matched existing block's identity onto its freshly parsed counterpart: the real
+/// Notion ID, its children (merged recursively so unchanged children keep their IDs and are never
+/// duplicated), unloaded-children state, and the toggle affordance of a toggleable heading
+/// (Markdown cannot express it).
+fn adopt_existing_block(
+    old: &NotionBlock,
+    new: &mut NotionBlock,
+    page_id: &str,
+    opt_counter: &mut usize,
+) {
+    if !old.id.is_empty() {
+        new.id = old.id.clone();
+    }
+    if new.parent_block_id.is_none() {
+        new.parent_block_id = old.parent_block_id.clone();
+    }
+    if is_toggleable_heading(old) && old.block_type == new.block_type {
+        set_heading_toggleable(new);
+    }
+    let unloaded_children = old.has_children && old.children.is_empty();
+    let new_children = std::mem::take(&mut new.children);
+    new.children = if old.children.is_empty() {
+        new_children
+    } else if same_rendered_markdown(&old.children, &new_children) {
+        // Unchanged subtree: keep it exactly, including block types Markdown cannot express.
+        old.children.clone()
+    } else {
+        merge_optimistic_blocks(&old.children, new_children, page_id, opt_counter)
+    };
+    new.has_children = unloaded_children || !new.children.is_empty();
+}
+
+/// Whether two block lists render to the same Markdown (ignoring blank lines and trailing spaces).
+fn same_rendered_markdown(a: &[NotionBlock], b: &[NotionBlock]) -> bool {
+    let rendered = |blocks: &[NotionBlock]| -> Vec<String> {
+        blocks_to_markdown(blocks)
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    rendered(a) == rendered(b)
+}
+
+/// Gives every block still lacking a Notion ID an `__optimistic_*` placeholder ID and links
+/// parsed children to their (possibly placeholder) parent.
+fn assign_optimistic_ids(
+    blocks: &mut [NotionBlock],
+    parent_id: Option<&str>,
+    page_id: &str,
+    opt_counter: &mut usize,
+) {
+    for blk in blocks {
+        if blk.id.trim().is_empty() {
+            blk.id = format!("__optimistic_{}_{}", page_id, opt_counter);
+            *opt_counter += 1;
+        }
+        if blk.parent_block_id.is_none() {
+            blk.parent_block_id = parent_id.map(str::to_string);
+        }
+        let id = blk.id.clone();
+        assign_optimistic_ids(&mut blk.children, Some(&id), page_id, opt_counter);
+    }
+}
+
+/// Aligns freshly parsed blocks with one sibling list of existing blocks: preserved anchors stay
+/// in place, matched prefix/suffix blocks (and same-type blocks edited in place) keep their IDs
+/// and children, and everything else gets an optimistic placeholder ID.
+fn merge_optimistic_blocks(
+    old: &[NotionBlock],
+    new_parsed: Vec<NotionBlock>,
+    page_id: &str,
+    opt_counter: &mut usize,
+) -> Vec<NotionBlock> {
+    let (old_segments, anchors, new_ranges) = partition_blocks_around_anchors(old, &new_parsed);
 
     let mut final_blocks: Vec<NotionBlock> = Vec::with_capacity(new_parsed.len() + anchors.len());
-    let mut opt_counter = 0usize;
 
     for (seg_idx, (old_editable, range)) in
         old_segments.into_iter().zip(new_ranges.into_iter()).enumerate()
@@ -2916,9 +3140,12 @@ pub fn apply_optimistic_markdown_to_detail(detail: &mut NotionPageDetail, edited
             && prefix_len < new_keys.len()
             && old_keys[prefix_len] == new_keys[prefix_len]
         {
-            seg_new[prefix_len].id = old_editable[prefix_len].id.clone();
-            seg_new[prefix_len].has_children = old_editable[prefix_len].has_children;
-            seg_new[prefix_len].children = old_editable[prefix_len].children.clone();
+            adopt_existing_block(
+                &old_editable[prefix_len],
+                &mut seg_new[prefix_len],
+                page_id,
+                opt_counter,
+            );
             prefix_len += 1;
         }
 
@@ -2930,9 +3157,7 @@ pub fn apply_optimistic_markdown_to_detail(detail: &mut NotionPageDetail, edited
         {
             let old_idx = old_editable.len() - 1 - suffix_len;
             let new_idx = seg_new.len() - 1 - suffix_len;
-            seg_new[new_idx].id = old_editable[old_idx].id.clone();
-            seg_new[new_idx].has_children = old_editable[old_idx].has_children;
-            seg_new[new_idx].children = old_editable[old_idx].children.clone();
+            adopt_existing_block(&old_editable[old_idx], &mut seg_new[new_idx], page_id, opt_counter);
             suffix_len += 1;
         }
 
@@ -2943,17 +3168,12 @@ pub fn apply_optimistic_markdown_to_detail(detail: &mut NotionPageDetail, edited
                 let old_blk = &old_editable[prefix_len + offset];
                 let new_blk = &mut seg_new[prefix_len + offset];
                 if old_blk.block_type == new_blk.block_type && !old_blk.id.is_empty() {
-                    new_blk.id = old_blk.id.clone();
+                    adopt_existing_block(old_blk, new_blk, page_id, opt_counter);
                 }
             }
         }
 
-        for blk in &mut seg_new {
-            if blk.id.trim().is_empty() {
-                blk.id = format!("__optimistic_{}_{}", page_id, opt_counter);
-                opt_counter += 1;
-            }
-        }
+        assign_optimistic_ids(&mut seg_new, None, page_id, opt_counter);
 
         final_blocks.extend(seg_new);
         if let Some(anchor) = anchors.get(seg_idx) {
@@ -2961,10 +3181,7 @@ pub fn apply_optimistic_markdown_to_detail(detail: &mut NotionPageDetail, edited
         }
     }
 
-    detail.page.plain_text = blocks_to_plain_text(&final_blocks);
-    detail.media = collect_media_refs(&final_blocks);
-    detail.blocks = final_blocks;
-    detail.markdown = normalized;
+    final_blocks
 }
 
 #[cfg(test)]
@@ -3559,5 +3776,167 @@ mod tests {
                 expression: "a+b".into()
             }
         );
+    }
+
+    fn opt_block(id: &str, block_type: &str, kind: NotionBlockKind, children: Vec<NotionBlock>) -> NotionBlock {
+        NotionBlock {
+            id: id.into(),
+            page_id: "page-opt".into(),
+            block_type: block_type.into(),
+            has_children: !children.is_empty(),
+            kind,
+            children,
+            ..Default::default()
+        }
+    }
+
+    fn opt_para(id: &str, text: &str) -> NotionBlock {
+        opt_block(
+            id,
+            "paragraph",
+            NotionBlockKind::Paragraph {
+                rich_text: vec![RichTextSpan::plain(text)],
+                color: NotionColor::Default,
+            },
+            Vec::new(),
+        )
+    }
+
+    fn opt_detail(blocks: Vec<NotionBlock>) -> NotionPageDetail {
+        NotionPageDetail {
+            page: NotionPage {
+                id: "page-opt".into(),
+                ..Default::default()
+            },
+            markdown: blocks_to_markdown(&blocks),
+            blocks,
+            comments: Vec::new(),
+            comments_error: None,
+            media: Vec::new(),
+        }
+    }
+
+    fn ids(blocks: &[NotionBlock]) -> Vec<&str> {
+        blocks.iter().map(|b| b.id.as_str()).collect()
+    }
+
+    #[test]
+    fn optimistic_save_keeps_toggle_children_nested_without_duplicates() {
+        let code = opt_block(
+            "blk-code",
+            "code",
+            NotionBlockKind::Code {
+                rich_text: vec![RichTextSpan::plain("fn a() {\n\n    x\n}")],
+                language: "rust".into(),
+                caption: Vec::new(),
+            },
+            Vec::new(),
+        );
+        let bullet = opt_block(
+            "blk-bullet",
+            "bulleted_list_item",
+            NotionBlockKind::BulletedListItem {
+                rich_text: vec![RichTextSpan::plain("Child B")],
+                color: NotionColor::Default,
+            },
+            vec![opt_para("blk-grand", "Grandchild")],
+        );
+        let toggle = opt_block(
+            "blk-toggle",
+            "toggle",
+            NotionBlockKind::Toggle {
+                rich_text: vec![RichTextSpan::plain("Details")],
+                color: NotionColor::Default,
+            },
+            vec![opt_para("blk-child-a", "Child A"), bullet, code],
+        );
+        let mut detail = opt_detail(vec![
+            opt_para("blk-intro", "Intro"),
+            toggle,
+            opt_para("blk-outro", "Outro"),
+        ]);
+
+        // Editing a sibling leaves the unchanged toggle's subtree exactly as it was.
+        let edited = detail.markdown.replace("Outro", "Outro edited");
+        apply_optimistic_markdown_to_detail(&mut detail, &edited);
+        assert_eq!(ids(&detail.blocks), vec!["blk-intro", "blk-toggle", "blk-outro"]);
+        assert_eq!(detail.blocks[2].plain_text(), "Outro edited");
+        let toggle = &detail.blocks[1];
+        assert!(toggle.has_children);
+        assert_eq!(ids(&toggle.children), vec!["blk-child-a", "blk-bullet", "blk-code"]);
+        assert_eq!(ids(&toggle.children[1].children), vec!["blk-grand"]);
+        assert_eq!(toggle.children[2].plain_text(), "fn a() {\n\n    x\n}");
+
+        // Editing a child line updates it in place under its toggle (same ID, no copies).
+        let edited = detail.markdown.replace("Child A", "Child A2");
+        apply_optimistic_markdown_to_detail(&mut detail, &edited);
+        assert_eq!(ids(&detail.blocks), vec!["blk-intro", "blk-toggle", "blk-outro"]);
+        let toggle = &detail.blocks[1];
+        assert_eq!(ids(&toggle.children), vec!["blk-child-a", "blk-bullet", "blk-code"]);
+        assert_eq!(toggle.children[0].plain_text(), "Child A2");
+        assert_eq!(ids(&toggle.children[1].children), vec!["blk-grand"]);
+
+        // A child added under the toggle stays nested with a placeholder ID.
+        let edited = detail.markdown.replace("  Child A2", "  Child A2\n\n  Child New");
+        apply_optimistic_markdown_to_detail(&mut detail, &edited);
+        assert_eq!(detail.blocks.len(), 3);
+        let toggle = &detail.blocks[1];
+        assert_eq!(toggle.children.len(), 4);
+        assert_eq!(toggle.children[1].plain_text(), "Child New");
+        assert!(toggle.children[1].id.starts_with("__optimistic_"));
+        assert_eq!(toggle.children[1].parent_block_id.as_deref(), Some("blk-toggle"));
+    }
+
+    #[test]
+    fn optimistic_save_preserves_toggleable_heading_state_and_children() {
+        let heading = opt_block(
+            "blk-h2",
+            "heading_2",
+            NotionBlockKind::Heading2 {
+                rich_text: vec![RichTextSpan::plain("Section")],
+                is_toggleable: true,
+                color: NotionColor::Default,
+            },
+            vec![opt_para("blk-h2-child", "Inside")],
+        );
+        let mut unloaded = opt_block(
+            "blk-h3",
+            "heading_3",
+            NotionBlockKind::Heading3 {
+                rich_text: vec![RichTextSpan::plain("Later")],
+                is_toggleable: true,
+                color: NotionColor::Default,
+            },
+            Vec::new(),
+        );
+        unloaded.has_children = true; // children beyond the fetched tree, not loaded yet
+        let mut detail = opt_detail(vec![heading, unloaded, opt_para("blk-end", "End")]);
+
+        let edited = detail
+            .markdown
+            .replace("## Section", "## Section renamed")
+            .replace("### Later", "### Later renamed");
+        apply_optimistic_markdown_to_detail(&mut detail, &edited);
+
+        assert_eq!(ids(&detail.blocks), vec!["blk-h2", "blk-h3", "blk-end"]);
+        match &detail.blocks[0].kind {
+            NotionBlockKind::Heading2 {
+                rich_text,
+                is_toggleable,
+                ..
+            } => {
+                assert!(*is_toggleable, "edited toggleable heading must stay toggleable");
+                assert_eq!(spans_plain_text(rich_text), "Section renamed");
+            }
+            other => panic!("expected heading_2, got {other:?}"),
+        }
+        assert_eq!(ids(&detail.blocks[0].children), vec!["blk-h2-child"]);
+        assert!(matches!(
+            detail.blocks[1].kind,
+            NotionBlockKind::Heading3 { is_toggleable: true, .. }
+        ));
+        assert!(detail.blocks[1].has_children, "unloaded children stay fetchable");
+        assert!(detail.blocks[1].children.is_empty());
+        assert!(!detail.blocks.iter().any(|b| b.plain_text() == "Inside"));
     }
 }

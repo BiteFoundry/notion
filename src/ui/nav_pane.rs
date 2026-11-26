@@ -17,6 +17,15 @@ use crate::ui::{
     hitmap::{HitMap, HitTarget},
 };
 
+/// Deepest indentation level drawn in the sidebar. Deeper pages keep rendering at this indent
+/// (the tree itself is listed much deeper) so their labels never get pushed out of a narrow pane.
+pub const SIDEBAR_MAX_INDENT_LEVEL: usize = 6;
+
+/// Visual indent level for a sidebar tree depth; also positions the `SidebarToggle` arrow hit.
+pub fn sidebar_indent_level(depth: usize) -> usize {
+    depth.min(SIDEBAR_MAX_INDENT_LEVEL)
+}
+
 pub fn selection_offset(selected: usize, visible_rows: usize, total: usize) -> usize {
     if visible_rows == 0 || total <= visible_rows {
         return 0;
@@ -99,7 +108,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         };
         let is_sel = focused && idx == selected;
 
-        let indent = "  ".repeat(item.depth);
+        let indent_level = sidebar_indent_level(item.depth);
+        let indent = "  ".repeat(indent_level);
         let arrow = if item.collapsible {
             if item.collapsed {
                 "▸ "
@@ -147,7 +157,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         );
         hitmap.add_line(area.x, y, content_w, HitTarget::SidebarRow(idx));
         if item.collapsible {
-            let arrow_offset = (item.depth as u16).saturating_mul(2);
+            let arrow_offset = (indent_level as u16).saturating_mul(2);
             let arrow_x = area.x.saturating_add(arrow_offset);
             let arrow_w = 3u16.min(content_w.saturating_sub(arrow_offset));
             if arrow_w > 0 {

@@ -1869,6 +1869,36 @@ fn push_properties_strip(
     }
 }
 
+/// Muted suffix for a toggle or toggleable heading: its child count while collapsed, or, when its
+/// children are not loaded yet, a loading / expandable cue instead of blank space.
+fn toggle_children_hint(vblk: &VisibleBlock, ui: &UiState) -> Option<String> {
+    let blk = &vblk.block;
+    if !blk.children.is_empty() {
+        return (!vblk.is_toggle_open).then(|| format!("  ({} items)", blk.children.len()));
+    }
+    if !blk.has_children {
+        return None;
+    }
+    Some(if ui.hydrating_blocks.contains(&blk.id) {
+        "  (loading...)".to_string()
+    } else if vblk.is_toggle_open {
+        "  (not loaded · toggle to retry)".to_string()
+    } else {
+        "  (expand to load)".to_string()
+    })
+}
+
+/// Database title suffix shown when the database has more rows than were read: the rows the
+/// latest read actually fetched and the row limit it ran with (background poll vs explicit refresh).
+fn database_truncation_banner(fetched_rows: usize) -> String {
+    let limit = if fetched_rows > crate::sync::TUI_DATABASE_ROW_LIMIT {
+        crate::sync::EXPLICIT_DATABASE_ROW_LIMIT
+    } else {
+        crate::sync::TUI_DATABASE_ROW_LIMIT
+    };
+    format!("   {fetched_rows}+ rows · showing first {fetched_rows} · {limit}-row limit")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_block_lines(
     vblk: &VisibleBlock,
@@ -1911,7 +1941,7 @@ fn render_block_lines(
                 cursor_gutter,
                 Span::raw(format!("{indent}{}", " ".repeat(prefix.width()))),
             ];
-            let body = style_rich_text(
+            let mut body = style_rich_text(
                 rich_text,
                 Style::default()
                     .fg(theme.fg_primary)
@@ -1920,6 +1950,9 @@ fn render_block_lines(
                 ui.show_inline_hrefs,
             );
             let hit = if *is_toggleable {
+                if let Some(hint) = toggle_children_hint(vblk, ui) {
+                    body.push(Span::styled(hint, theme.muted_style()));
+                }
                 HitTarget::ToggleBlock(idx)
             } else {
                 HitTarget::CanvasBlock(idx)
@@ -1945,7 +1978,7 @@ fn render_block_lines(
                 cursor_gutter,
                 Span::raw(format!("{indent}{}", " ".repeat(prefix.width()))),
             ];
-            let body = style_rich_text(
+            let mut body = style_rich_text(
                 rich_text,
                 Style::default()
                     .fg(theme.accent_soft)
@@ -1954,6 +1987,9 @@ fn render_block_lines(
                 ui.show_inline_hrefs,
             );
             let hit = if *is_toggleable {
+                if let Some(hint) = toggle_children_hint(vblk, ui) {
+                    body.push(Span::styled(hint, theme.muted_style()));
+                }
                 HitTarget::ToggleBlock(idx)
             } else {
                 HitTarget::CanvasBlock(idx)
@@ -1978,7 +2014,7 @@ fn render_block_lines(
                 cursor_gutter,
                 Span::raw(format!("{indent}{}", " ".repeat(prefix.width()))),
             ];
-            let body = style_rich_text(
+            let mut body = style_rich_text(
                 rich_text,
                 Style::default()
                     .fg(theme.fg_secondary)
@@ -1987,6 +2023,9 @@ fn render_block_lines(
                 ui.show_inline_hrefs,
             );
             let hit = if *is_toggleable {
+                if let Some(hint) = toggle_children_hint(vblk, ui) {
+                    body.push(Span::styled(hint, theme.muted_style()));
+                }
                 HitTarget::ToggleBlock(idx)
             } else {
                 HitTarget::CanvasBlock(idx)
@@ -2123,11 +2162,8 @@ fn render_block_lines(
                 theme,
                 ui.show_inline_hrefs,
             );
-            if !vblk.is_toggle_open && !vblk.block.children.is_empty() {
-                body.push(Span::styled(
-                    format!("  ({} items)", vblk.block.children.len()),
-                    theme.muted_style(),
-                ));
+            if let Some(hint) = toggle_children_hint(vblk, ui) {
+                body.push(Span::styled(hint, theme.muted_style()));
             }
             push_wrapped_block(
                 &body,
@@ -3072,9 +3108,12 @@ fn draw_database_view(
             .add_modifier(Modifier::BOLD),
     )];
     if app.active_database_rows_truncated {
-        let limit = crate::sync::TUI_DATABASE_ROW_LIMIT;
         title_line.push(Span::styled(
-            format!("   {limit}+ rows · showing first {limit}"),
+            database_truncation_banner(if app.active_database_rows_fetched > 0 {
+                app.active_database_rows_fetched
+            } else {
+                app.active_database_rows.len()
+            }),
             theme.muted_style(),
         ));
     }
@@ -4343,5 +4382,60 @@ mod tests {
                 "every wrapped row of selected ToDo block must carry TodoToggle(1)"
             );
         }
+    }
+
+    #[test]
+    fn toggle_hints_show_child_count_and_unloaded_children_cue() {
+        use crate::models::{NotionColor, RichTextSpan};
+        let mut ui = UiState::new();
+        let heading = |children: Vec<NotionBlock>, has_children: bool| NotionBlock {
+            id: "blk-h".into(),
+            block_type: "heading_2".into(),
+            has_children,
+            kind: NotionBlockKind::Heading2 {
+                rich_text: vec![RichTextSpan::plain("Section")],
+                is_toggleable: true,
+                color: NotionColor::Default,
+            },
+            children,
+            ..Default::default()
+        };
+        let vb = |block: NotionBlock, open: bool| VisibleBlock {
+            block,
+            depth: 0,
+            is_toggle_open: open,
+            numbered_index: 0,
+        };
+        let two = vec![NotionBlock::default(), NotionBlock::default()];
+
+        // Collapsed toggleable headings show their child count like toggles do.
+        assert_eq!(
+            toggle_children_hint(&vb(heading(two.clone(), true), false), &ui).as_deref(),
+            Some("  (2 items)")
+        );
+        assert_eq!(toggle_children_hint(&vb(heading(two, true), true), &ui), None);
+        // Children past the fetched tree: an expandable cue, then a loading cue while fetching.
+        assert_eq!(
+            toggle_children_hint(&vb(heading(Vec::new(), true), false), &ui).as_deref(),
+            Some("  (expand to load)")
+        );
+        ui.hydrating_blocks.insert("blk-h".into());
+        assert_eq!(
+            toggle_children_hint(&vb(heading(Vec::new(), true), true), &ui).as_deref(),
+            Some("  (loading...)")
+        );
+        assert_eq!(toggle_children_hint(&vb(heading(Vec::new(), false), false), &ui), None);
+    }
+
+    #[test]
+    fn database_truncation_banner_reports_fetched_rows_and_active_limit() {
+        assert_eq!(
+            database_truncation_banner(crate::sync::TUI_DATABASE_ROW_LIMIT),
+            "   250+ rows · showing first 250 · 250-row limit"
+        );
+        assert_eq!(
+            database_truncation_banner(crate::sync::EXPLICIT_DATABASE_ROW_LIMIT),
+            "   5000+ rows · showing first 5000 · 5000-row limit"
+        );
     }
 }

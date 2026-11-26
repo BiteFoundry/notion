@@ -495,6 +495,10 @@ pub struct PendingPixelGraphic {
     pub payload: Option<String>,
 }
 
+/// Deepest WORKSPACE tree level the sidebar lists. The visited set already breaks parent cycles;
+/// this only bounds pathological nesting, so real page trees are never silently cut off.
+pub const SIDEBAR_MAX_TREE_DEPTH: usize = 20;
+
 #[derive(Debug, Clone)]
 pub struct SidebarItem {
     pub id: String,
@@ -622,6 +626,15 @@ pub enum UiMsg {
         label: String,
         error: String,
     },
+    BlockChildrenHydrated {
+        page_id: String,
+        block_id: String,
+        children: Vec<NotionBlock>,
+    },
+    BlockChildrenHydrationFailed {
+        block_id: String,
+        error: String,
+    },
 }
 
 pub struct UiState {
@@ -654,6 +667,9 @@ pub struct UiState {
     pub sidebar_selected: usize,
     pub collapsed_nodes: HashSet<String>,
     pub expanded_toggles: HashSet<String>,
+    /// Blocks whose unloaded children are being fetched on demand (toggle expanded past the
+    /// recursive tree-fetch depth cap).
+    pub hydrating_blocks: HashSet<String>,
     pub selected_block: usize,
     pub canvas_scroll: u16,
     pub canvas_follow_selected: bool,
@@ -720,6 +736,7 @@ impl UiState {
             sidebar_selected: 0,
             collapsed_nodes: HashSet::new(),
             expanded_toggles: HashSet::new(),
+            hydrating_blocks: HashSet::new(),
             selected_block: 0,
             canvas_scroll: 0,
             canvas_follow_selected: false,
@@ -820,6 +837,8 @@ pub struct AppState {
     pub active_database_rows: Vec<NotionPage>,
     /// The last sync read only the first rows of the active database.
     pub active_database_rows_truncated: bool,
+    /// Rows the latest read of the active database returned (its row limit when truncated).
+    pub active_database_rows_fetched: usize,
     pub nav_stack: Vec<NavTarget>,
     pub syncing: bool,
     pub sync_summary: String,
@@ -867,6 +886,7 @@ impl AppState {
             active_database_id: None,
             active_database_rows: Vec::new(),
             active_database_rows_truncated: false,
+            active_database_rows_fetched: 0,
             nav_stack: Vec::new(),
             syncing: false,
             sync_summary: "Ready".to_string(),
@@ -1052,6 +1072,7 @@ impl AppState {
             .list_database_rows(&self.workspace_id, database_id)
             .unwrap_or_default();
         self.active_database_rows_truncated = false;
+        self.active_database_rows_fetched = 0;
         self.clamp_db_selection(ui);
         self.sync_ctrl.set_focus(FocusTarget {
             page_id: None,
@@ -2395,6 +2416,7 @@ impl AppState {
                     }
                 }
                 if self.active_database_id.as_deref() == Some(database_id.as_str()) {
+                    let fetched_rows = rows.len();
                     if rows_truncated && self.active_database_rows.len() > rows.len() {
                         // Preserve already-loaded rows beyond a truncated background poll slice
                         // while refreshing any rows present in the poll window.
@@ -2434,6 +2456,10 @@ impl AppState {
                     if self.active_database_rows_truncated != rows_truncated {
                         self.active_database_rows_truncated = rows_truncated;
                         changed = true;
+                    }
+                    if self.active_database_rows_fetched != fetched_rows {
+                        self.active_database_rows_fetched = fetched_rows;
+                        changed |= rows_truncated;
                     }
                     self.clamp_db_selection(ui);
                 }
@@ -2922,6 +2948,7 @@ impl AppState {
                 self.active_database_id = None;
                 self.active_database_rows.clear();
                 self.active_database_rows_truncated = false;
+                self.active_database_rows_fetched = 0;
                 self.block_owner_pages.clear();
                 self.child_page_positions.clear();
                 self.nav_stack.clear();
@@ -3003,7 +3030,101 @@ impl AppState {
                 ui.tasks.finish(&label, Some(error.clone()));
                 ui.error(format!("{label}: {error}"));
             }
+            UiMsg::BlockChildrenHydrated {
+                page_id,
+                block_id,
+                children,
+            } => {
+                ui.hydrating_blocks.remove(&block_id);
+                if ui.hydrating_blocks.is_empty() {
+                    ui.tasks.finish("hydrate", None);
+                }
+                self.apply_hydrated_children(ui, &page_id, &block_id, children);
+            }
+            UiMsg::BlockChildrenHydrationFailed { block_id, error } => {
+                ui.hydrating_blocks.remove(&block_id);
+                ui.tasks.finish("hydrate", Some(error.clone()));
+                ui.error(format!("Could not load toggle contents: {error}"));
+            }
         }
+    }
+
+    /// Fetches, on demand, the children of a block that the recursive page fetch stopped short of
+    /// (`has_children` with nothing loaded, e.g. a toggle nested past the tree depth cap), so
+    /// expanding it shows its content instead of blank space.
+    pub fn hydrate_block_children(&mut self, block_id: &str, ui: &mut UiState) {
+        let Some(page_id) = self.active_page_detail.as_ref().map(|d| d.page.id.clone()) else {
+            return;
+        };
+        if block_id.trim().is_empty() || block_id.starts_with("__optimistic_") {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if !ui.hydrating_blocks.insert(block_id.to_string()) {
+            return;
+        }
+        let client = self.client.clone();
+        let ui_tx = self.ui_tx.clone();
+        let bid = block_id.to_string();
+        ui.tasks.begin("hydrate");
+        handle.spawn(async move {
+            let fetched = async {
+                let mut children = client.list_block_children(&bid, &page_id, Some(&bid)).await?;
+                client.hydrate_block_subtrees(&mut children, &page_id).await?;
+                Ok::<_, anyhow::Error>(children)
+            }
+            .await;
+            let _ = ui_tx.send(match fetched {
+                Ok(children) => UiMsg::BlockChildrenHydrated {
+                    page_id,
+                    block_id: bid,
+                    children,
+                },
+                Err(err) => UiMsg::BlockChildrenHydrationFailed {
+                    block_id: bid,
+                    error: err.to_string(),
+                },
+            });
+        });
+    }
+
+    /// Attaches lazily fetched children to the open page. The confirmed sync baseline gets the
+    /// same children so a later diff-sync sees them as existing content rather than new blocks.
+    /// Skipped while the full-page Markdown editor is open: its draft was rendered without them.
+    pub fn apply_hydrated_children(
+        &mut self,
+        ui: &mut UiState,
+        page_id: &str,
+        block_id: &str,
+        children: Vec<NotionBlock>,
+    ) -> bool {
+        if ui
+            .inline_editor
+            .as_ref()
+            .is_some_and(|ed| ed.page_id == page_id)
+        {
+            return false;
+        }
+        let Some(detail) = self
+            .active_page_detail
+            .as_mut()
+            .filter(|d| d.page.id == page_id)
+        else {
+            return false;
+        };
+        if !attach_children_in_tree(&mut detail.blocks, block_id, &children) {
+            return false;
+        }
+        if let Some(confirmed) = ui.page_confirmed_blocks.get_mut(page_id) {
+            attach_children_in_tree(confirmed, block_id, &children);
+        }
+        detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
+        detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
+        detail.media = crate::parser::collect_media_refs(&detail.blocks);
+        self.clamp_canvas_selection(ui);
+        true
     }
 
     /// Builds the Notion left sidebar entries: Favorites, Workspace hierarchical tree, Databases, Recent / Trash.
@@ -3072,7 +3193,14 @@ impl AppState {
             archived: false,
         });
 
-        let page_ids: HashSet<&str> = active_pages.iter().map(|p| p.id.as_str()).collect();
+        // Database rows are never rendered in WORKSPACE, so they cannot be tree parents either: a
+        // subpage nested inside a database row is promoted to a root instead of being orphaned
+        // under a parent that never appears.
+        let page_ids: HashSet<&str> = active_pages
+            .iter()
+            .filter(|p| p.parent_type != "database_id")
+            .map(|p| p.id.as_str())
+            .collect();
         let mut effective_parent: HashMap<&str, &str> = HashMap::new();
         for p in &active_pages {
             if p.parent_type == "database_id" {
@@ -3180,7 +3308,8 @@ impl AppState {
             let has_kids = children_map
                 .get(&node.id)
                 .is_some_and(|kids| !kids.is_empty());
-            let is_collapsed = collapsed.contains(&node.id);
+            // Past the recursion cap the children cannot be listed, so show the node collapsed.
+            let is_collapsed = collapsed.contains(&node.id) || depth >= SIDEBAR_MAX_TREE_DEPTH;
             out.push(SidebarItem {
                 id: node.id.clone(),
                 label: node.display_title().to_string(),
@@ -3193,7 +3322,7 @@ impl AppState {
                 is_favorite: node.is_favorite,
                 archived: false,
             });
-            if has_kids && !is_collapsed && depth < 5 {
+            if has_kids && !is_collapsed {
                 if let Some(kids) = children_map.get(&node.id) {
                     for kid in kids {
                         push_tree(kid, depth + 1, children_map, collapsed, visited, out);
@@ -3491,6 +3620,16 @@ fn flatten_visible_blocks(
         // Tables render their `table_row` children directly inside the table block
         let is_table = matches!(blk.kind, NotionBlockKind::Table { .. });
 
+        // Layout wrappers render no lines of their own: listing them would add invisible cursor
+        // stops, so only their children become visible blocks (keeping their indentation).
+        if matches!(
+            blk.kind,
+            NotionBlockKind::ColumnList | NotionBlockKind::Column | NotionBlockKind::SyncedBlock { .. }
+        ) {
+            flatten_visible_blocks(&blk.children, depth + 1, expanded_toggles, out);
+            continue;
+        }
+
         out.push(VisibleBlock {
             block: blk.clone(),
             depth,
@@ -3502,6 +3641,27 @@ fn flatten_visible_blocks(
             flatten_visible_blocks(&blk.children, depth + 1, expanded_toggles, out);
         }
     }
+}
+
+/// Sets the children of `target_id` when it still has none loaded. Returns whether it was found.
+fn attach_children_in_tree(
+    blocks: &mut [NotionBlock],
+    target_id: &str,
+    children: &[NotionBlock],
+) -> bool {
+    for blk in blocks {
+        if blk.id == target_id {
+            if blk.children.is_empty() {
+                blk.children = children.to_vec();
+                blk.has_children = !blk.children.is_empty();
+            }
+            return true;
+        }
+        if attach_children_in_tree(&mut blk.children, target_id, children) {
+            return true;
+        }
+    }
+    false
 }
 
 fn set_todo_in_tree(blocks: &mut [NotionBlock], target_id: &str, checked: bool) -> bool {
@@ -3842,5 +4002,257 @@ mod tests {
         let reverted = app.active_page_detail.as_ref().unwrap();
         assert_eq!(reverted.blocks.len(), 1);
         assert_eq!(reverted.blocks[0].id, "blk-real-1");
+    }
+
+    fn sidebar_page(id: &str, parent_type: &str, parent_id: Option<&str>) -> NotionPageSummary {
+        NotionPageSummary {
+            id: id.into(),
+            title: id.into(),
+            parent_type: parent_type.into(),
+            parent_id: parent_id.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn sidebar_index(items: &[SidebarItem], id: &str) -> Option<usize> {
+        items.iter().position(|it| it.id == id && !it.is_section_header)
+    }
+
+    #[test]
+    fn sidebar_lists_depth_seven_page_with_capped_indent_and_clickable_toggle() {
+        use crate::ui::action::{dispatch, Action};
+        use crate::ui::hitmap::HitTarget;
+
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+        // page-depth-0 (workspace) -> page-depth-1 -> ... -> page-depth-8
+        app.pages = (0..=8)
+            .map(|d| {
+                let parent = (d > 0).then(|| format!("page-depth-{}", d - 1));
+                let parent_type = if d == 0 { "workspace" } else { "page_id" };
+                sidebar_page(&format!("page-depth-{d}"), parent_type, parent.as_deref())
+            })
+            .collect();
+
+        let items = app.build_sidebar_items(&ui);
+        for d in 0..=8 {
+            let idx = sidebar_index(&items, &format!("page-depth-{d}"))
+                .unwrap_or_else(|| panic!("depth-{d} page must be listed"));
+            assert_eq!(items[idx].depth, d);
+        }
+        let d7 = sidebar_index(&items, "page-depth-7").unwrap();
+        assert!(items[d7].collapsible && !items[d7].collapsed);
+
+        // Indentation stops growing at the cap, and the arrow hit rect sits on the drawn arrow.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(48, 20)).unwrap();
+        let mut hitmap = HitMap::new();
+        terminal
+            .draw(|f| crate::ui::nav_pane::draw(f, f.area(), &app, &ui, &mut hitmap))
+            .unwrap();
+        let arrow = hitmap
+            .region_of(HitTarget::SidebarToggle(d7))
+            .expect("depth-7 arrow must be clickable");
+        let capped = (crate::ui::nav_pane::SIDEBAR_MAX_INDENT_LEVEL * 2) as u16;
+        assert_eq!(arrow.x, capped);
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(arrow.x + 1, arrow.y)].symbol(), "▾");
+        let d8_row = hitmap
+            .region_of(HitTarget::SidebarRow(sidebar_index(&items, "page-depth-8").unwrap()))
+            .unwrap();
+        assert_eq!(buf[(capped + 1, d8_row.y)].symbol(), "└");
+
+        // Clicking the depth-7 arrow collapses its subtree; clicking again expands it.
+        let click = |app: &mut AppState, ui: &mut UiState| {
+            dispatch(
+                Action::MouseClick {
+                    target: HitTarget::SidebarToggle(d7),
+                    col: arrow.x + 1,
+                    row: arrow.y,
+                },
+                app,
+                ui,
+            );
+        };
+        click(&mut app, &mut ui);
+        assert!(ui.collapsed_nodes.contains("page-depth-7"));
+        let collapsed = app.build_sidebar_items(&ui);
+        assert!(collapsed[sidebar_index(&collapsed, "page-depth-7").unwrap()].collapsed);
+        assert!(sidebar_index(&collapsed, "page-depth-8").is_none());
+
+        click(&mut app, &mut ui);
+        assert!(!ui.collapsed_nodes.contains("page-depth-7"));
+        let expanded = app.build_sidebar_items(&ui);
+        assert_eq!(expanded[sidebar_index(&expanded, "page-depth-8").unwrap()].depth, 8);
+    }
+
+    #[test]
+    fn sidebar_tree_depth_cap_still_breaks_parent_cycles() {
+        let (mut app, ui, _dir) = test_app_and_ui();
+        // A 30-level chain is listed up to the cap; a parent cycle must not recurse forever.
+        app.pages = (0..30)
+            .map(|d| {
+                let parent = (d > 0).then(|| format!("deep-{}", d - 1));
+                let parent_type = if d == 0 { "workspace" } else { "page_id" };
+                sidebar_page(&format!("deep-{d}"), parent_type, parent.as_deref())
+            })
+            .chain([
+                sidebar_page("cycle-a", "page_id", Some("cycle-b")),
+                sidebar_page("cycle-b", "page_id", Some("cycle-a")),
+            ])
+            .collect();
+
+        let items = app.build_sidebar_items(&ui);
+        let last = sidebar_index(&items, &format!("deep-{SIDEBAR_MAX_TREE_DEPTH}")).unwrap();
+        assert_eq!(items[last].depth, SIDEBAR_MAX_TREE_DEPTH);
+        assert!(items[last].collapsible && items[last].collapsed);
+        assert!(sidebar_index(&items, &format!("deep-{}", SIDEBAR_MAX_TREE_DEPTH + 1)).is_none());
+        assert!(sidebar_index(&items, "cycle-a").is_some());
+        assert!(sidebar_index(&items, "cycle-b").is_some());
+    }
+
+    #[test]
+    fn sidebar_lists_subpages_nested_inside_database_rows() {
+        let (mut app, ui, _dir) = test_app_and_ui();
+        app.pages = vec![
+            sidebar_page("page-root", "workspace", None),
+            sidebar_page("db-row-1", "database_id", Some("db-1")),
+            sidebar_page("page-in-row", "page_id", Some("db-row-1")),
+            sidebar_page("page-in-row-child", "page_id", Some("page-in-row")),
+            sidebar_page("page-in-row-block", "block_id", Some("blk-in-row")),
+        ];
+        app.block_owner_pages
+            .insert("blk-in-row".into(), "db-row-1".into());
+
+        let items = app.build_sidebar_items(&ui);
+        let workspace = items
+            .iter()
+            .position(|it| it.id == "__sec_workspace")
+            .expect("WORKSPACE section");
+        let pos = |id: &str| {
+            sidebar_index(&items, id).unwrap_or_else(|| panic!("{id} must not be orphaned"))
+        };
+        assert!(sidebar_index(&items, "db-row-1").is_none(), "database rows stay out of WORKSPACE");
+        for id in ["page-in-row", "page-in-row-block"] {
+            assert!(pos(id) > workspace);
+            assert_eq!(items[pos(id)].depth, 0);
+        }
+        assert!(items[pos("page-in-row")].collapsible);
+        assert_eq!(items[pos("page-in-row-child")].depth, 1);
+        assert_eq!(pos("page-in-row-child"), pos("page-in-row") + 1);
+    }
+
+    fn para(id: &str, text: &str) -> NotionBlock {
+        NotionBlock {
+            id: id.into(),
+            block_type: "paragraph".into(),
+            kind: NotionBlockKind::Paragraph {
+                rich_text: vec![RichTextSpan::plain(text)],
+                color: NotionColor::Default,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn wrapper(id: &str, block_type: &str, kind: NotionBlockKind, children: Vec<NotionBlock>) -> NotionBlock {
+        NotionBlock {
+            id: id.into(),
+            block_type: block_type.into(),
+            has_children: true,
+            kind,
+            children,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn flatten_visible_blocks_skips_zero_line_container_wrappers() {
+        let blocks = vec![
+            wrapper(
+                "cl",
+                "column_list",
+                NotionBlockKind::ColumnList,
+                vec![
+                    wrapper("col-1", "column", NotionBlockKind::Column, vec![para("a", "A")]),
+                    wrapper("col-2", "column", NotionBlockKind::Column, vec![para("b", "B")]),
+                ],
+            ),
+            wrapper(
+                "sync",
+                "synced_block",
+                NotionBlockKind::SyncedBlock {
+                    synced_from_block_id: None,
+                },
+                vec![para("c", "C")],
+            ),
+            para("d", "D"),
+        ];
+        let mut out = Vec::new();
+        flatten_visible_blocks(&blocks, 0, &HashSet::new(), &mut out);
+        let stops: Vec<(&str, usize)> =
+            out.iter().map(|v| (v.block.id.as_str(), v.depth)).collect();
+        assert_eq!(stops, vec![("a", 2), ("b", 2), ("c", 1), ("d", 0)]);
+    }
+
+    #[test]
+    fn hydrated_toggle_children_attach_to_detail_and_confirmed_baseline() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+        let deep_toggle = NotionBlock {
+            id: "blk-deep-toggle".into(),
+            block_type: "toggle".into(),
+            has_children: true,
+            kind: NotionBlockKind::Toggle {
+                rich_text: vec![RichTextSpan::plain("Deep")],
+                color: NotionColor::Default,
+            },
+            ..Default::default()
+        };
+        let outer = wrapper(
+            "blk-outer",
+            "toggle",
+            NotionBlockKind::Toggle {
+                rich_text: vec![RichTextSpan::plain("Outer")],
+                color: NotionColor::Default,
+            },
+            vec![deep_toggle],
+        );
+        let blocks = vec![outer];
+        app.active_page_detail = Some(NotionPageDetail {
+            page: NotionPage {
+                id: "page-hydrate".into(),
+                ..Default::default()
+            },
+            markdown: crate::parser::blocks_to_markdown(&blocks),
+            blocks: blocks.clone(),
+            comments: Vec::new(),
+            comments_error: None,
+            media: Vec::new(),
+        });
+        ui.page_confirmed_blocks
+            .insert("page-hydrate".into(), blocks);
+        ui.hydrating_blocks.insert("blk-deep-toggle".into());
+        ui.expanded_toggles.insert("blk-outer".into());
+        ui.expanded_toggles.insert("blk-deep-toggle".into());
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::BlockChildrenHydrated {
+                page_id: "page-hydrate".into(),
+                block_id: "blk-deep-toggle".into(),
+                children: vec![para("blk-lazy", "Lazy child")],
+            },
+        );
+
+        assert!(ui.hydrating_blocks.is_empty());
+        let detail = app.active_page_detail.as_ref().unwrap();
+        assert_eq!(detail.blocks[0].children[0].children[0].id, "blk-lazy");
+        assert!(detail.markdown.contains("Lazy child"));
+        let confirmed = &ui.page_confirmed_blocks["page-hydrate"];
+        assert_eq!(confirmed[0].children[0].children[0].id, "blk-lazy");
+        let visible: Vec<String> = app
+            .visible_blocks(&ui)
+            .into_iter()
+            .map(|v| v.block.id)
+            .collect();
+        assert_eq!(visible, vec!["blk-outer", "blk-deep-toggle", "blk-lazy"]);
     }
 }
