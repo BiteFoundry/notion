@@ -21,9 +21,9 @@ base64 = "0.22"
 bitefoundry-html = { git = "https://github.com/BiteFoundry/bitefoundry-html", rev = "4d9f94b14c8a8b9a8775b630af4510483e0efe45" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = "0.28"
 dirs = "5"
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 notify-rust = "4"
@@ -31,13 +31,12 @@ open = "5"
 qrcode = { version = "0.14", default-features = false }
 rand = "0.8"
 ratatui = "0.28"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream", "http2", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "http2", "gzip"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
@@ -55,7 +54,12 @@ keyring = { version = "3", features = ["apple-native"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
+opt-level = "s"
+panic = "abort"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"

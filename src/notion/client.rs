@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use reqwest::{
     header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
     Method, StatusCode,
@@ -760,7 +760,7 @@ impl NotionClient {
                 return Ok(());
             }
 
-            let mut stream = futures::stream::iter(targets.into_iter().map(|(idx, bid)| {
+            let mut stream = futures_util::stream::iter(targets.into_iter().map(|(idx, bid)| {
                 async move {
                     let res = self
                         .fetch_block_tree_rec(&bid, page_id, Some(&bid), remaining_depth - 1, sem)

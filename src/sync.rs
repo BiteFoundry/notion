@@ -414,7 +414,7 @@ where
                 let res = client.get_page(pid).await;
                 (pid.clone(), res)
             });
-            for (pid, probe_res) in futures::future::join_all(futs).await {
+            for (pid, probe_res) in futures_util::future::join_all(futs).await {
                 match probe_res {
                     Ok(page) => confirmed_pages.push(page),
                     Err(err) if NotionClient::is_authoritative_not_found(&err) => {
@@ -434,7 +434,7 @@ where
                 let res = client.get_database(did).await;
                 (did.clone(), res)
             });
-            for (did, probe_res) in futures::future::join_all(futs).await {
+            for (did, probe_res) in futures_util::future::join_all(futs).await {
                 match probe_res {
                     Ok(db) => confirmed_dbs.push(db),
                     Err(err) if NotionClient::is_authoritative_not_found(&err) => {
@@ -552,7 +552,7 @@ where
                 (visited_hops, found_owner)
             });
 
-            for (visited_hops, found_owner) in futures::future::join_all(futs).await {
+            for (visited_hops, found_owner) in futures_util::future::join_all(futs).await {
                 if let Some(owner_page_id) = found_owner {
                     for hop_id in visited_hops {
                         if !resolved_map.contains_key(&hop_id) {
