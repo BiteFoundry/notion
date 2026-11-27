@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/notion",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "Notion terminal client & AI agent toolkit — Pages, Blocks, Databases (Table/Board/List), Comments & Multi-Workspace (CLI, TUI, HTTP API, MCP)",
   "repository": {
     "type": "git",
@@ -40,11 +40,11 @@
     "build:npm": "node scripts/build-npm.mjs"
   },
   "optionalDependencies": {
-    "@bitefoundry/notion-win32-x64": "0.4.9",
-    "@bitefoundry/notion-win32-arm64": "0.4.9",
-    "@bitefoundry/notion-darwin-x64": "0.4.9",
-    "@bitefoundry/notion-darwin-arm64": "0.4.9",
-    "@bitefoundry/notion-linux-x64": "0.4.9",
-    "@bitefoundry/notion-linux-arm64": "0.4.9"
+    "@bitefoundry/notion-win32-x64": "0.4.10",
+    "@bitefoundry/notion-win32-arm64": "0.4.10",
+    "@bitefoundry/notion-darwin-x64": "0.4.10",
+    "@bitefoundry/notion-darwin-arm64": "0.4.10",
+    "@bitefoundry/notion-linux-x64": "0.4.10",
+    "@bitefoundry/notion-linux-arm64": "0.4.10"
   }
 }
