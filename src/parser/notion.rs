@@ -2797,7 +2797,11 @@ pub fn partition_blocks_around_anchors(
     }
 
     if anchors.is_empty() {
-        return (old_segments, anchors, vec![0..new_parsed.len()]);
+        return (
+            old_segments,
+            anchors,
+            std::iter::once(0..new_parsed.len()).collect(),
+        );
     }
 
     let new_keys: Vec<(String, String)> = new_parsed.iter().map(block_comparison_key).collect();
@@ -3129,7 +3133,7 @@ fn merge_optimistic_blocks(
     let mut final_blocks: Vec<NotionBlock> = Vec::with_capacity(new_parsed.len() + anchors.len());
 
     for (seg_idx, (old_editable, range)) in
-        old_segments.into_iter().zip(new_ranges.into_iter()).enumerate()
+        old_segments.into_iter().zip(new_ranges).enumerate()
     {
         let mut seg_new: Vec<NotionBlock> = new_parsed[range].to_vec();
         let old_keys: Vec<(String, String)> = old_editable.iter().map(block_comparison_key).collect();

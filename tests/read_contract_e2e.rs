@@ -722,8 +722,10 @@ async fn start_mock_server(state: ReadContractMock) -> (String, tokio::task::Joi
 }
 
 fn mcp_runtime(base_url: &str) -> (AppConfig, AuthManager, NotionClient, Storage) {
-    let mut cfg = AppConfig::default();
-    cfg.api_base_url = format!("{base_url}/v1");
+    let mut cfg = AppConfig {
+        api_base_url: format!("{base_url}/v1"),
+        ..Default::default()
+    };
     cfg.upsert_workspace(
         WorkspaceProfile {
             name: "default".into(),
@@ -2533,7 +2535,7 @@ async fn mcp_get_page_defaults_compact_and_text_is_minified() {
     assert_eq!(bsc["returned"], 1);
     assert_eq!(bsc["count"], 1);
     assert_eq!(bsc["has_more"], true);
-    assert_eq!(bsc["next_cursor"].is_string(), true);
+    assert!(bsc["next_cursor"].is_string());
     assert_eq!(bsc["incomplete_blocks"], json!([]));
 
     // W6: MCP append_blocks defaults to compact {ok, appended, block_ids}; compact:false returns blocks

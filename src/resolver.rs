@@ -127,13 +127,15 @@ fn database_not_found_err(query: &str, similar: &[NotionDatabase]) -> anyhow::Er
     coded_with_details("database_not_found", msg, json!({ "candidates": candidates }))
 }
 
+struct WriteSearchState<T> {
+    exact: Vec<T>,
+    seen_ids: HashSet<String>,
+    similar_active: Vec<T>,
+}
+
 enum WriteSearchOutcome<T> {
     DirectId(String),
-    Scanned {
-        exact: Vec<T>,
-        seen_ids: HashSet<String>,
-        similar_active: Vec<T>,
-    },
+    Scanned(WriteSearchState<T>),
 }
 
 async fn search_pages_for_write(
@@ -186,11 +188,11 @@ async fn search_pages_for_write(
         cursor = Some(next.to_owned());
     }
 
-    Ok(WriteSearchOutcome::Scanned {
+    Ok(WriteSearchOutcome::Scanned(WriteSearchState {
         exact,
         seen_ids,
         similar_active,
-    })
+    }))
 }
 
 async fn verify_cached_pages_for_write(
@@ -200,13 +202,11 @@ async fn verify_cached_pages_for_write(
     query: &str,
     want_archived: bool,
     cached_pages: &[NotionPage],
-    seen_ids: &HashSet<String>,
-    exact: &mut Vec<NotionPage>,
-    similar_active: &mut Vec<NotionPage>,
+    state: &mut WriteSearchState<NotionPage>,
 ) -> Result<()> {
     let lower = query.to_ascii_lowercase();
     for p in cached_pages {
-        if seen_ids.contains(&p.id) {
+        if state.seen_ids.contains(&p.id) {
             continue;
         }
         if p.title.eq_ignore_ascii_case(query) && p.archived == want_archived {
@@ -214,11 +214,11 @@ async fn verify_cached_pages_for_write(
                 Ok(fresh) => {
                     let _ = storage.upsert_page(&fresh);
                     if fresh.title.eq_ignore_ascii_case(query) && fresh.archived == want_archived {
-                        if !exact.iter().any(|e| e.id == fresh.id) {
-                            exact.push(fresh);
+                        if !state.exact.iter().any(|e| e.id == fresh.id) {
+                            state.exact.push(fresh);
                         }
-                        if exact.len() >= 2 {
-                            return Err(ambiguous_page_err(query, exact));
+                        if state.exact.len() >= 2 {
+                            return Err(ambiguous_page_err(query, &state.exact));
                         }
                     }
                 }
@@ -230,9 +230,9 @@ async fn verify_cached_pages_for_write(
         } else if !want_archived
             && !p.archived
             && p.title.to_ascii_lowercase().contains(&lower)
-            && !similar_active.iter().any(|s| s.id == p.id)
+            && !state.similar_active.iter().any(|s| s.id == p.id)
         {
-            similar_active.push(p.clone());
+            state.similar_active.push(p.clone());
         }
     }
     Ok(())
@@ -267,15 +267,10 @@ pub async fn resolve_page_id_for_write(
         return Ok(found.id.clone());
     }
 
-    let (mut exact, seen_ids, mut similar_active) =
-        match search_pages_for_write(storage, client, trimmed, want_archived).await? {
-            WriteSearchOutcome::DirectId(id) => return Ok(id),
-            WriteSearchOutcome::Scanned {
-                exact,
-                seen_ids,
-                similar_active,
-            } => (exact, seen_ids, similar_active),
-        };
+    let mut state = match search_pages_for_write(storage, client, trimmed, want_archived).await? {
+        WriteSearchOutcome::DirectId(id) => return Ok(id),
+        WriteSearchOutcome::Scanned(state) => state,
+    };
 
     verify_cached_pages_for_write(
         storage,
@@ -284,16 +279,18 @@ pub async fn resolve_page_id_for_write(
         trimmed,
         want_archived,
         &cached_pages,
-        &seen_ids,
-        &mut exact,
-        &mut similar_active,
+        &mut state,
     )
     .await?;
 
-    match exact.as_slice() {
+    match state.exact.as_slice() {
         [only] => Ok(only.id.clone()),
-        [] => Err(page_not_found_err(trimmed, want_archived, &similar_active)),
-        _ => Err(ambiguous_page_err(trimmed, &exact)),
+        [] => Err(page_not_found_err(
+            trimmed,
+            want_archived,
+            &state.similar_active,
+        )),
+        _ => Err(ambiguous_page_err(trimmed, &state.exact)),
     }
 }
 
@@ -351,11 +348,11 @@ async fn search_databases_for_write(
         cursor = Some(next.to_owned());
     }
 
-    Ok(WriteSearchOutcome::Scanned {
+    Ok(WriteSearchOutcome::Scanned(WriteSearchState {
         exact,
         seen_ids,
         similar_active,
-    })
+    }))
 }
 
 async fn verify_cached_databases_for_write(
@@ -364,13 +361,11 @@ async fn verify_cached_databases_for_write(
     workspace_id: &str,
     query: &str,
     cached_dbs: &[NotionDatabase],
-    seen_ids: &HashSet<String>,
-    exact: &mut Vec<NotionDatabase>,
-    similar_active: &mut Vec<NotionDatabase>,
+    state: &mut WriteSearchState<NotionDatabase>,
 ) -> Result<()> {
     let lower = query.to_ascii_lowercase();
     for d in cached_dbs {
-        if seen_ids.contains(&d.id) {
+        if state.seen_ids.contains(&d.id) {
             continue;
         }
         if d.title.eq_ignore_ascii_case(query) && !d.archived {
@@ -378,11 +373,11 @@ async fn verify_cached_databases_for_write(
                 Ok(fresh) => {
                     let _ = storage.upsert_database(&fresh);
                     if fresh.title.eq_ignore_ascii_case(query) && !fresh.archived {
-                        if !exact.iter().any(|e| e.id == fresh.id) {
-                            exact.push(fresh);
+                        if !state.exact.iter().any(|e| e.id == fresh.id) {
+                            state.exact.push(fresh);
                         }
-                        if exact.len() >= 2 {
-                            return Err(ambiguous_database_err(query, exact));
+                        if state.exact.len() >= 2 {
+                            return Err(ambiguous_database_err(query, &state.exact));
                         }
                     }
                 }
@@ -393,9 +388,9 @@ async fn verify_cached_databases_for_write(
             }
         } else if !d.archived
             && d.title.to_ascii_lowercase().contains(&lower)
-            && !similar_active.iter().any(|s| s.id == d.id)
+            && !state.similar_active.iter().any(|s| s.id == d.id)
         {
-            similar_active.push(d.clone());
+            state.similar_active.push(d.clone());
         }
     }
     Ok(())
@@ -429,15 +424,10 @@ pub async fn resolve_database_id_for_write(
         return Ok(found.id.clone());
     }
 
-    let (mut exact, seen_ids, mut similar_active) =
-        match search_databases_for_write(storage, client, trimmed).await? {
-            WriteSearchOutcome::DirectId(id) => return Ok(id),
-            WriteSearchOutcome::Scanned {
-                exact,
-                seen_ids,
-                similar_active,
-            } => (exact, seen_ids, similar_active),
-        };
+    let mut state = match search_databases_for_write(storage, client, trimmed).await? {
+        WriteSearchOutcome::DirectId(id) => return Ok(id),
+        WriteSearchOutcome::Scanned(state) => state,
+    };
 
     verify_cached_databases_for_write(
         storage,
@@ -445,16 +435,14 @@ pub async fn resolve_database_id_for_write(
         workspace_id,
         trimmed,
         &cached_dbs,
-        &seen_ids,
-        &mut exact,
-        &mut similar_active,
+        &mut state,
     )
     .await?;
 
-    match exact.as_slice() {
+    match state.exact.as_slice() {
         [only] => Ok(only.id.clone()),
-        [] => Err(database_not_found_err(trimmed, &similar_active)),
-        _ => Err(ambiguous_database_err(trimmed, &exact)),
+        [] => Err(database_not_found_err(trimmed, &state.similar_active)),
+        _ => Err(ambiguous_database_err(trimmed, &state.exact)),
     }
 }
 

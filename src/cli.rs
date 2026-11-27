@@ -554,7 +554,7 @@ fn find_long_option<'a>(cmd: &'a clap::Command, name: &str) -> Option<&'a clap::
     cmd.get_arguments().find(|arg| arg.get_long() == Some(name))
 }
 
-fn find_short_option<'a>(cmd: &'a clap::Command, ch: char) -> Option<&'a clap::Arg> {
+fn find_short_option(cmd: &clap::Command, ch: char) -> Option<&clap::Arg> {
     cmd.get_arguments().find(|arg| arg.get_short() == Some(ch))
 }
 
@@ -666,19 +666,19 @@ fn normalize_cli_args(raw: Vec<OsString>) -> Vec<OsString> {
                     }
                     continue;
                 }
-            } else if s.len() == 2 {
-                let ch = s.chars().nth(1).unwrap();
-                if find_short_option(cmd, ch)
-                    .is_some_and(|arg| arg.get_action().takes_values())
+            } else if (s.len() == 2)
+                .then(|| s.chars().nth(1))
+                .flatten()
+                .and_then(|ch| find_short_option(cmd, ch))
+                .is_some_and(|arg| arg.get_action().takes_values())
+            {
+                idx += 1;
+                if idx < raw.len()
+                    && !raw[idx].to_str().is_some_and(|next| next.starts_with('-'))
                 {
                     idx += 1;
-                    if idx < raw.len()
-                        && !raw[idx].to_str().is_some_and(|next| next.starts_with('-'))
-                    {
-                        idx += 1;
-                    }
-                    continue;
                 }
+                continue;
             }
             idx += 1;
             continue;
@@ -793,21 +793,22 @@ fn normalize_cli_args(raw: Vec<OsString>) -> Vec<OsString> {
                 is_separate_hyphen_literal(s, cmd)
             };
             if s.starts_with('-') && !is_literal_here {
-                if s.len() == 2 {
-                    let ch = s.chars().nth(1).unwrap();
-                    if find_short_option(cmd, ch)
-                        .is_some_and(|arg| arg.get_action().takes_values())
+                let takes_value = (s.len() == 2)
+                    .then(|| s.chars().nth(1))
+                    .flatten()
+                    .and_then(|ch| find_short_option(cmd, ch))
+                    .is_some_and(|arg| arg.get_action().takes_values());
+                if takes_value {
+                    if let Some(next) = tail
+                        .get(i + 1)
+                        .filter(|next| !is_flag_like_token(next, cmd) && next.to_str() != Some("--"))
                     {
-                        if let Some(next) = tail.get(i + 1) {
-                            if !is_flag_like_token(next, cmd) && next.to_str() != Some("--") {
-                                in_place.push(tok.clone());
-                                in_place.push(next.clone());
-                                option_tokens.push(tok.clone());
-                                option_tokens.push(next.clone());
-                                i += 2;
-                                continue;
-                            }
-                        }
+                        in_place.push(tok.clone());
+                        in_place.push(next.clone());
+                        option_tokens.push(tok.clone());
+                        option_tokens.push(next.clone());
+                        i += 2;
+                        continue;
                     }
                 }
                 in_place.push(tok.clone());
@@ -2553,8 +2554,10 @@ pub async fn op_create_page(
 
     let created = match client.create_page(payload.clone()).await {
         Ok(page) => page,
-        Err(err) if cached_title_key.is_some() && is_notion_validation_error(&err) => {
-            let old_key = cached_title_key.unwrap();
+        Err(err) if is_notion_validation_error(&err) => {
+            let Some(old_key) = cached_title_key else {
+                return Err(err);
+            };
             let db = op_get_database(client, storage, &parent_id, false).await?;
             let fresh_key = title_key_from_database(&db)
                 .context("Database does not have a title property")?;
@@ -3903,8 +3906,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("cli_cache_write.db")).unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.api_base_url = format!("http://{addr}/v1");
+        let cfg = AppConfig {
+            api_base_url: format!("http://{addr}/v1"),
+            ..Default::default()
+        };
         let auth = AuthManager::from_token(cfg.clone(), "ntn_cli_write");
         let ws_id = auth.active_workspace_id().await;
         let client = NotionClient::new(&cfg, auth).unwrap();
@@ -4057,8 +4062,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("cli_incremental.db")).unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.api_base_url = format!("http://{addr}/v1");
+        let cfg = AppConfig {
+            api_base_url: format!("http://{addr}/v1"),
+            ..Default::default()
+        };
         let auth = AuthManager::from_token(cfg.clone(), "ntn_cli_inc");
         let ws_id = auth.active_workspace_id().await;
         let client = NotionClient::new(&cfg, auth).unwrap();

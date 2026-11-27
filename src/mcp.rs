@@ -931,8 +931,10 @@ mod tests {
         });
 
         let base_url = format!("http://{addr}/v1");
-        let mut cfg = AppConfig::default();
-        cfg.api_base_url = base_url.clone();
+        let mut cfg = AppConfig {
+            api_base_url: base_url.clone(),
+            ..Default::default()
+        };
         cfg.upsert_workspace(
             crate::config::WorkspaceProfile {
                 name: "default".into(),

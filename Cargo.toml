@@ -38,14 +38,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2"
 url = "2"
 urlencoding = "2"
-uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }

@@ -694,8 +694,10 @@ async fn reject_oversized_writes(
 }
 
 fn test_config(base_url: &str) -> AppConfig {
-    let mut cfg = AppConfig::default();
-    cfg.api_base_url = format!("{base_url}/v1");
+    let mut cfg = AppConfig {
+        api_base_url: format!("{base_url}/v1"),
+        ..Default::default()
+    };
     cfg.upsert_workspace(
         WorkspaceProfile {
             name: "acme".into(),
@@ -1840,13 +1842,11 @@ async fn e2e_bidirectional_sync_versions_forced_refresh_block_writes_and_section
     let mut refreshed_detail = None;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Some(ev)) =
+        if let Ok(Some(CoreEvent::PageDetailUpdated(d))) =
             tokio::time::timeout(std::time::Duration::from_millis(500), ev_rx.recv()).await
         {
-            if let CoreEvent::PageDetailUpdated(d) = ev {
-                refreshed_detail = Some(*d);
-                break;
-            }
+            refreshed_detail = Some(*d);
+            break;
         }
     }
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;

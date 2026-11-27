@@ -38,13 +38,15 @@ struct CachedHtmlGraphic {
     rendered: RenderedTerminalImage,
 }
 
+type GraphicEnv = ((u16, u16), (u8, u8, u8));
+
 pub struct HtmlPreviewOverlay {
     pub title: String,
     pub session: HtmlViewSession,
     pub body_rect: Rect,
     pub last_max_scroll: u16,
     graphic_cache: HashMap<(usize, u16, TerminalImageProtocol), CachedHtmlGraphic>,
-    last_graphic_env: Option<((u16, u16), (u8, u8, u8))>,
+    last_graphic_env: Option<GraphicEnv>,
 }
 
 impl Drop for HtmlPreviewOverlay {

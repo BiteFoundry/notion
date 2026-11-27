@@ -1321,15 +1321,15 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     ui.warning("Open a page to edit");
                 }
             } else if ui.inline_editor.is_some() {
-                if app.close_inline_editor_and_flush(ui) {
-                    if !app.open_block_editor(ui, ui.selected_block, BlockCursorInit::End) {
-                        let visible = app.visible_blocks(ui);
-                        if let Some(first_editable) = visible
-                            .iter()
-                            .position(|vb| is_block_inline_editable(&vb.block.kind))
-                        {
-                            app.open_block_editor(ui, first_editable, BlockCursorInit::End);
-                        }
+                if app.close_inline_editor_and_flush(ui)
+                    && !app.open_block_editor(ui, ui.selected_block, BlockCursorInit::End)
+                {
+                    let visible = app.visible_blocks(ui);
+                    if let Some(first_editable) = visible
+                        .iter()
+                        .position(|vb| is_block_inline_editable(&vb.block.kind))
+                    {
+                        app.open_block_editor(ui, first_editable, BlockCursorInit::End);
                     }
                 }
             } else if app.active_view == CanvasView::Page && app.active_page_detail.is_some() {
@@ -4123,9 +4123,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{addr}");
-        let fresh_s3_url = format!(
-            "https://prod-files-secure.s3.us-west-2.amazonaws.com/ws/blk-s3/fresh.png?X-Amz-Expires=3600&X-Amz-Signature=fresh_sig_999"
-        );
+        let fresh_s3_url = "https://prod-files-secure.s3.us-west-2.amazonaws.com/ws/blk-s3/fresh.png?X-Amz-Expires=3600&X-Amz-Signature=fresh_sig_999".to_string();
         let fresh_for_route = fresh_s3_url.clone();
         let svg_body = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\"><rect width=\"24\" height=\"24\" fill=\"teal\"/></svg>";
 
@@ -4353,11 +4351,11 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         use tokio::net::TcpListener;
 
+        type AppendPayloadLog = Arc<Mutex<Vec<(Option<String>, Vec<serde_json::Value>)>>>;
         let deleted_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let patched_blocks: Arc<Mutex<Vec<(String, serde_json::Value)>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let appended_payloads: Arc<Mutex<Vec<(Option<String>, Vec<serde_json::Value>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let appended_payloads: AppendPayloadLog = Arc::new(Mutex::new(Vec::new()));
         let current_blocks: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(vec![
             serde_json::json!({
                 "id": "blk-old-1",
@@ -5037,11 +5035,11 @@ mod tests {
         };
         use tokio::net::TcpListener;
 
+        type AppendCallLog = Arc<Mutex<Vec<(Option<String>, usize)>>>;
         let deleted_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let patched_ids: Arc<Mutex<Vec<(String, serde_json::Value)>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let appended_calls: Arc<Mutex<Vec<(Option<String>, usize)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let appended_calls: AppendCallLog = Arc::new(Mutex::new(Vec::new()));
 
         let initial_blocks = vec![
             serde_json::json!({
@@ -5268,10 +5266,10 @@ mod tests {
         };
         use tokio::net::TcpListener;
 
+        type AppendPayloadLog = Arc<Mutex<Vec<(Option<String>, Vec<serde_json::Value>)>>>;
         let deleted_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let patched_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let appended_payloads: Arc<Mutex<Vec<(Option<String>, Vec<serde_json::Value>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let appended_payloads: AppendPayloadLog = Arc::new(Mutex::new(Vec::new()));
 
         let hosted_url = "https://prod-files-secure.s3.us-west-2.amazonaws.com/ws/blk/demo.png?X-Amz=sig";
         let state_blocks = Arc::new(Mutex::new(vec![
@@ -6249,7 +6247,7 @@ mod tests {
         html_ov.session.focus_next_control();
         let _ = html_ov.session.activate_focused();
         assert!(html_ov.session.editing_input.is_some());
-        ui.overlays.push(Overlay::HtmlPreview(html_ov));
+        ui.overlays.push(Overlay::HtmlPreview(Box::new(html_ov)));
         dispatch(
             Action::MouseClick {
                 target: HitTarget::Button(ButtonId::HtmlToggleMode),

@@ -1,10 +1,10 @@
 //! Signature Notion-Native Terminal Canvas (`src/ui/notion_view.rs`):
 //! - Minimal 1-line Top Breadcrumb Bar (`Workspace ▾ / Parent / 📄 Page` + `[Width]` `[Sync]` `[? Help]`)
 //! - Adaptive Main Canvas:
-//!   A. Editorial Page Canvas (Centered ~88 col measure vs Full Width, Page Header + Properties Strip,
-//!      Interactive Blocks: Callouts, Toggles, To-do Checkboxes, Code Blocks, Unicode Tables,
-//!      Inline Images, Child Page/Database Cards, + Comments Peek Drawer `C`)
-//!   B. Database View (`1 Table`, `2 Board` Kanban, `3 List`, Filter `f`, Sort `s`, New Item `n`).
+//!   - Editorial Page Canvas (Centered ~88 col measure vs Full Width, Page Header + Properties Strip,
+//!     Interactive Blocks: Callouts, Toggles, To-do Checkboxes, Code Blocks, Unicode Tables,
+//!     Inline Images, Child Page/Database Cards, + Comments Peek Drawer `C`)
+//!   - Database View (`1 Table`, `2 Board` Kanban, `3 List`, Filter `f`, Sort `s`, New Item `n`).
 
 use bitefoundry_html::layout::{
     pad_display_width, render_wrapped_table, wrap_styled_spans, TableAlign, TableBorder, TableSpec,
@@ -520,7 +520,7 @@ fn draw_inline_page_editor(
 
     let left_budget = content_area.width.saturating_sub(right_w) as usize;
     let edit_badge = "✎ EDITING";
-    let left_line = if left_budget >= edit_badge.width() + 3 + status_text.width() + 1 {
+    let left_line = if left_budget > edit_badge.width() + 3 + status_text.width() {
         Line::from(vec![
             Span::styled(
                 format!(" {edit_badge}"),
@@ -781,7 +781,7 @@ fn highlight_markdown_visual_slice(
                 .get(logical_start..=pos)
                 .map(|s| s.chars().filter(|&c| c == '`').count())
                 .unwrap_or(0);
-            if before_count % 2 == 0 {
+            if before_count.is_multiple_of(2) {
                 in_inline_code = false;
             }
         }
@@ -940,23 +940,6 @@ struct PageCanvasScene {
     block_meta: Vec<BlockRenderMeta>,
     inline_links: Vec<(usize, u16, u16, String)>,
     active_block_edit: Option<ActiveBlockRenderInfo>,
-}
-
-#[allow(dead_code)]
-#[allow(clippy::type_complexity)]
-fn build_page_canvas_lines(
-    app: &AppState,
-    detail: &NotionPageDetail,
-    ui: &UiState,
-    theme: &Theme,
-    content_width: u16,
-) -> (
-    Vec<(Line<'static>, Option<HitTarget>)>,
-    Vec<(usize, u16, u16, HitTarget)>,
-    Option<(usize, usize)>,
-) {
-    let scene = build_page_canvas_scene(app, detail, ui, theme, content_width);
-    (scene.lines, scene.inline_hits, scene.selected_line_range)
 }
 
 fn build_page_canvas_scene(
@@ -3735,8 +3718,8 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let view_h = height.saturating_sub(2) as usize; // top breadcrumb + bottom status
         let detail = app.active_page_detail.as_ref().unwrap();
-        let (all_lines, _, _) =
-            build_page_canvas_lines(app, detail, ui, &ui.theme.clone(), expected_content_w);
+        let all_lines =
+            build_page_canvas_scene(app, detail, ui, &ui.theme.clone(), expected_content_w).lines;
         let total = all_lines.len();
 
         let mut collected: Vec<String> = Vec::with_capacity(total);
@@ -4000,9 +3983,9 @@ mod tests {
         let theme = ui.theme.clone();
 
         // 1. Direct line-level width invariants at Centered (88) and Full (156)
-        let (centered_lines, _, _) =
-            build_page_canvas_lines(&app, detail, &ui, &theme, EDITORIAL_MAX_COLS);
-        let (full_lines, _, _) = build_page_canvas_lines(&app, detail, &ui, &theme, 156);
+        let centered_lines =
+            build_page_canvas_scene(&app, detail, &ui, &theme, EDITORIAL_MAX_COLS).lines;
+        let full_lines = build_page_canvas_scene(&app, detail, &ui, &theme, 156).lines;
 
         for (i, (line, _)) in centered_lines.iter().enumerate() {
             assert!(
@@ -4327,8 +4310,9 @@ mod tests {
         let detail = app.active_page_detail.as_ref().unwrap();
         let theme = ui.theme.clone();
         let narrow_w = 36u16;
+        let scene = build_page_canvas_scene(&app, detail, &ui, &theme, narrow_w);
         let (lines, inline_hits, selected_range) =
-            build_page_canvas_lines(&app, detail, &ui, &theme, narrow_w);
+            (scene.lines, scene.inline_hits, scene.selected_line_range);
 
         // Width invariant across every single line
         for (i, (line, _)) in lines.iter().enumerate() {
@@ -4375,9 +4359,9 @@ mod tests {
             sel_end > sel_start,
             "wrapped ToDo block should span multiple lines (start={sel_start}, end={sel_end})"
         );
-        for line_idx in sel_start..=sel_end {
+        for line in &lines[sel_start..=sel_end] {
             assert_eq!(
-                lines[line_idx].1,
+                line.1,
                 Some(HitTarget::TodoToggle(1)),
                 "every wrapped row of selected ToDo block must carry TodoToggle(1)"
             );

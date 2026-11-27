@@ -76,7 +76,7 @@ pub enum Overlay {
     Links(LinkExtractorOverlay),
     NotionForm(NotionFormOverlay),
     ImagePreview(ImagePreviewOverlay),
-    HtmlPreview(HtmlPreviewOverlay),
+    HtmlPreview(Box<HtmlPreviewOverlay>),
     Help(HelpOverlay),
     Confirm(ConfirmDialog),
 }
@@ -154,11 +154,11 @@ impl Overlay {
     }
 
     pub fn html_preview(title: impl Into<String>, html: String) -> Self {
-        Overlay::HtmlPreview(HtmlPreviewOverlay::new(title, html))
+        Overlay::HtmlPreview(Box::new(HtmlPreviewOverlay::new(title, html)))
     }
 
     pub fn markdown_preview(title: impl Into<String>, markdown: String) -> Self {
-        Overlay::HtmlPreview(HtmlPreviewOverlay::new_markdown(title, markdown))
+        Overlay::HtmlPreview(Box::new(HtmlPreviewOverlay::new_markdown(title, markdown)))
     }
 
     pub fn help() -> Self {

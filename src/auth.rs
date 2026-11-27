@@ -911,8 +911,10 @@ mod tests {
             ("NOTION_DISABLE_KEYRING", Some("1")),
             ("NOTION_TOKEN", Some("ntn_env_token_x")),
         ]);
-        let mut cfg = AppConfig::default();
-        cfg.active_workspace = "work".into();
+        let cfg = AppConfig {
+            active_workspace: "work".into(),
+            ..Default::default()
+        };
         let auth = AuthManager::new(cfg, None).unwrap();
 
         // No saved login: the profile name, as before.
@@ -962,8 +964,10 @@ mod tests {
             ("NOTION_TOKEN", None),
             ("NOTION_WORKSPACE", None),
         ]);
-        let mut cfg = AppConfig::default();
-        cfg.active_workspace = "home".into();
+        let cfg = AppConfig {
+            active_workspace: "home".into(),
+            ..Default::default()
+        };
         let auth = AuthManager::new(cfg, Some("a".into())).unwrap();
         let clone = auth.clone();
         assert_eq!(auth.active_workspace_name().await, "a");
@@ -1047,8 +1051,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.api_base_url = format!("http://{addr}/v1");
+        let cfg = AppConfig {
+            api_base_url: format!("http://{addr}/v1"),
+            ..Default::default()
+        };
         let auth = AuthManager::new(cfg.clone(), None).unwrap();
 
         let (cred, user) = auth

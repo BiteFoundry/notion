@@ -460,7 +460,7 @@ impl ComposerState {
             end <= self.text.len()
                 && self.text.is_char_boundary(delta.start)
                 && self.text.is_char_boundary(end)
-                && &self.text[delta.start..end] == delta.inserted
+                && self.text[delta.start..end] == delta.inserted
         );
         delta.cursor_after = self.cursor;
         self.text.replace_range(delta.start..end, &delta.removed);
@@ -478,7 +478,7 @@ impl ComposerState {
             end <= self.text.len()
                 && self.text.is_char_boundary(delta.start)
                 && self.text.is_char_boundary(end)
-                && &self.text[delta.start..end] == delta.removed
+                && self.text[delta.start..end] == delta.removed
         );
         delta.cursor_before = self.cursor;
         self.text.replace_range(delta.start..end, &delta.inserted);

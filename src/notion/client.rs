@@ -497,14 +497,14 @@ impl NotionClient {
                 let mut oldest_in_batch: Option<&str> = None;
                 for p in &batch.pages {
                     if let Some(ts) = p.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
-                        if oldest_in_batch.map_or(true, |cur| ts < cur) {
+                        if oldest_in_batch.is_none_or(|cur| ts < cur) {
                             oldest_in_batch = Some(ts);
                         }
                     }
                 }
                 for d in &batch.databases {
                     if let Some(ts) = d.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
-                        if oldest_in_batch.map_or(true, |cur| ts < cur) {
+                        if oldest_in_batch.is_none_or(|cur| ts < cur) {
                             oldest_in_batch = Some(ts);
                         }
                     }
@@ -651,7 +651,7 @@ impl NotionClient {
     /// container blocks) using the same tree-wide concurrency bound.
     pub(crate) async fn hydrate_block_subtrees(
         &self,
-        blocks: &mut Vec<NotionBlock>,
+        blocks: &mut [NotionBlock],
         page_id: &str,
     ) -> Result<()> {
         let norm_page = normalize_notion_id(page_id);
@@ -730,7 +730,7 @@ impl NotionClient {
 
     fn hydrate_children<'a>(
         &'a self,
-        blocks: &'a mut Vec<NotionBlock>,
+        blocks: &'a mut [NotionBlock],
         page_id: &'a str,
         remaining_depth: usize,
         sem: &'a Arc<Semaphore>,
@@ -1463,8 +1463,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.api_base_url = format!("http://{addr}/v1");
+        let cfg = AppConfig {
+            api_base_url: format!("http://{addr}/v1"),
+            ..Default::default()
+        };
         let auth = AuthManager::from_token(cfg.clone(), "ntn_test_tree");
         let client = NotionClient::new(&cfg, auth).unwrap();
 

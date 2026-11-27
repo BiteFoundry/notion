@@ -39,6 +39,7 @@ struct Insertion {
 }
 
 struct Draft {
+    kind: String,
     source: String,
     payload: Value,
     children_markdown: String,
@@ -46,7 +47,7 @@ struct Draft {
 
 impl Draft {
     fn kind(&self) -> &str {
-        self.payload["type"].as_str().expect("Markdown block type")
+        &self.kind
     }
 
     fn into_payload(mut self) -> Result<Value> {
@@ -652,7 +653,9 @@ impl PageEdit {
             if let Some(draft) = drafts.peek() {
                 if can_patch_in_place(block, draft) {
                     self.queue_insertion(parent, after, &mut new_blocks);
-                    self.patch(block, drafts.next().unwrap())?;
+                    if let Some(draft) = drafts.next() {
+                        self.patch(block, draft)?;
+                    }
                     *after = Some(block.id.clone());
                     continue;
                 }
@@ -662,8 +665,8 @@ impl PageEdit {
                     "Cannot replace the type of block {} while it has children",
                     block.id,
                 );
-                if same_count {
-                    new_blocks.push(drafts.next().unwrap().into_payload()?);
+                if let Some(draft) = same_count.then(|| drafts.next()).flatten() {
+                    new_blocks.push(draft.into_payload()?);
                 }
             }
             // Hidden children (e.g. depth-capped reads) and structural blocks keep their IDs.
@@ -812,8 +815,8 @@ fn collect_same_depth_columns<'a>(
         if !is_direct_cl && !is_synced_with_cl {
             continue;
         }
-        if run_start < idx {
-            seg_groups.last_mut().unwrap().push(SegmentGroup {
+        if let Some(group) = (run_start < idx).then(|| seg_groups.last_mut()).flatten() {
+            group.push(SegmentGroup {
                 parent,
                 blocks: &old[run_start..idx],
                 after: run_after.clone(),
@@ -843,8 +846,11 @@ fn collect_same_depth_columns<'a>(
         }
     }
 
-    if run_start < old.len() {
-        seg_groups.last_mut().unwrap().push(SegmentGroup {
+    if let Some(group) = (run_start < old.len())
+        .then(|| seg_groups.last_mut())
+        .flatten()
+    {
+        group.push(SegmentGroup {
             parent,
             blocks: &old[run_start..],
             after: run_after,
@@ -1072,10 +1078,10 @@ fn find_unchanged_protected_anchor(
         let rendered = crate::parser::blocks_to_markdown(std::slice::from_ref(block));
         let rendered_lines: Vec<&str> = rendered.lines().collect();
         let vis = visible_lines(&rendered_lines);
-        if vis.is_empty() {
+        let (Some(&first_vis), Some(&last_vis)) = (vis.first(), vis.last()) else {
             continue;
-        }
-        let needle_raw = &rendered_lines[vis[0]..=*vis.last().unwrap()];
+        };
+        let needle_raw = &rendered_lines[first_vis..=last_vis];
         let needle = comparable_lines(needle_raw, &hosted);
         if needle.len() > new_display.len() {
             continue;
@@ -1133,6 +1139,12 @@ fn parse_drafts(lines: &[&str]) -> Result<Vec<Draft>> {
         let head = lines[start..i].join("\n");
         let mut payloads = markdown_to_notion_blocks(&head);
         ensure!(payloads.len() == 1, "Cannot parse an edited Markdown block");
+        let Some(payload) = payloads.pop() else {
+            bail!("Cannot parse an edited Markdown block");
+        };
+        let Some(kind) = payload["type"].as_str().map(str::to_owned) else {
+            bail!("Cannot parse an edited Markdown block");
+        };
         let child_start = i;
         // A table's rows are its children; it takes no indented child blocks.
         while !is_table && i < lines.len() && (lines[i].trim().is_empty() || lines[i].starts_with("  ")) {
@@ -1144,8 +1156,9 @@ fn parse_drafts(lines: &[&str]) -> Result<Vec<Draft>> {
             .collect();
         let children_markdown = child_lines.join("\n");
         out.push(Draft {
+            kind,
             source: lines[start..i].join("\n"),
-            payload: payloads.pop().unwrap(),
+            payload,
             children_markdown,
         });
     }
@@ -1225,7 +1238,7 @@ fn align_range<T: PartialEq>(old: &[T], new: &[T], offset: usize, matches: &mut 
         (0..=new.len())
             .rev()
             .max_by_key(|&i| prefix_scores[i] + suffix_scores[new.len() - i])
-            .unwrap()
+            .unwrap_or(0)
     };
     let (left_matches, right_matches) = matches.split_at_mut(mid);
     align_range(&old[..mid], &new[..split], offset, left_matches);
@@ -1292,7 +1305,9 @@ pub(crate) fn edited_rich_text(original: &[Value], edited: &str) -> Result<Vec<V
             let mut template = span.clone();
             template.plain_text = "\0".into();
             let markup = rich_text_to_markdown(&[template]);
-            let (prefix, suffix) = markup.split_once('\0').expect("rendered text");
+            let Some((prefix, suffix)) = markup.split_once('\0') else {
+                bail!("Failed to split rendered rich text template");
+            };
             let matched = matches[start]
                 .zip(matches[end - 1])
                 .map(|(first, last)| first..last + 1);

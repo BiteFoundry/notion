@@ -135,7 +135,7 @@ where
 
         for p in &batch.pages {
             if let Some(ts) = p.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
-                if newest_edited.as_deref().map_or(true, |cur| ts > cur) {
+                if newest_edited.as_deref().is_none_or(|cur| ts > cur) {
                     newest_edited = Some(ts.to_string());
                 }
             }
@@ -145,7 +145,7 @@ where
         }
         for d in &batch.databases {
             if let Some(ts) = d.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
-                if newest_edited.as_deref().map_or(true, |cur| ts > cur) {
+                if newest_edited.as_deref().is_none_or(|cur| ts > cur) {
                     newest_edited = Some(ts.to_string());
                 }
             }
@@ -158,14 +158,14 @@ where
             let mut oldest_in_batch: Option<&str> = None;
             for p in &batch.pages {
                 if let Some(ts) = p.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
-                    if oldest_in_batch.map_or(true, |cur| ts < cur) {
+                    if oldest_in_batch.is_none_or(|cur| ts < cur) {
                         oldest_in_batch = Some(ts);
                     }
                 }
             }
             for d in &batch.databases {
                 if let Some(ts) = d.last_edited_time.as_deref().filter(|s| !s.is_empty()) {
-                    if oldest_in_batch.map_or(true, |cur| ts < cur) {
+                    if oldest_in_batch.is_none_or(|cur| ts < cur) {
                         oldest_in_batch = Some(ts);
                     }
                 }
@@ -936,6 +936,14 @@ struct PendingActive {
     interactive: bool,
 }
 
+struct ActiveDatabaseOutcome {
+    database_id: String,
+    database: Option<NotionDatabase>,
+    rows: Vec<NotionPage>,
+    rows_truncated: bool,
+    changed: bool,
+}
+
 enum ActiveOutcome {
     Page {
         detail: Box<NotionPageDetail>,
@@ -943,13 +951,7 @@ enum ActiveOutcome {
         fetched_body: bool,
         http_requests: usize,
     },
-    Database {
-        database_id: String,
-        database: Option<NotionDatabase>,
-        rows: Vec<NotionPage>,
-        rows_truncated: bool,
-        changed: bool,
-    },
+    Database(Box<ActiveDatabaseOutcome>),
     Err,
 }
 
@@ -1186,7 +1188,7 @@ pub fn spawn_sync_engine(
 
             let db_max_rows = match &target {
                 ActiveTarget::Database(did) => {
-                    let mut exp = expanded_db.lock().unwrap();
+                    let mut exp = expanded_db.lock().unwrap_or_else(|e| e.into_inner());
                     if explicit_db {
                         *exp = Some(did.clone());
                         EXPLICIT_DATABASE_ROW_LIMIT
@@ -1198,7 +1200,7 @@ pub fn spawn_sync_engine(
                     }
                 }
                 ActiveTarget::Page(_) => {
-                    *expanded_db.lock().unwrap() = None;
+                    *expanded_db.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     TUI_DATABASE_ROW_LIMIT
                 }
             };
@@ -1517,7 +1519,7 @@ pub fn spawn_sync_engine(
                             );
                         } else {
                             // Focus cleared (e.g., last daemon TUI client detached): stop active polling.
-                            *expanded_db.lock().unwrap() = None;
+                            *expanded_db.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             if let Some(prefetch) = in_flight_prefetch.take() {
                                 prefetch.abort();
                             }
@@ -1590,13 +1592,9 @@ pub fn spawn_sync_engine(
                     }
                 }
                 Some(done) = active_done_rx.recv() => {
-                    let matches_current = in_flight_active
-                        .as_ref()
-                        .is_some_and(|cur| cur.id == done.id);
-                    if !matches_current {
+                    let Some(cur) = in_flight_active.take_if(|cur| cur.id == done.id) else {
                         continue;
-                    }
-                    let cur = in_flight_active.take().unwrap();
+                    };
                     if cur.show_busy {
                         loud_active_busy = false;
                     }
@@ -1633,13 +1631,14 @@ pub fn spawn_sync_engine(
                             }
                             (true, http_requests)
                         }
-                        ActiveOutcome::Database {
-                            database_id,
-                            database,
-                            rows,
-                            rows_truncated,
-                            changed,
-                        } => {
+                        ActiveOutcome::Database(db_outcome) => {
+                            let ActiveDatabaseOutcome {
+                                database_id,
+                                database,
+                                rows,
+                                rows_truncated,
+                                changed,
+                            } = *db_outcome;
                             if !will_run_pending_same_target && (upgraded_emit || changed) {
                                 let _ = event_tx.send(CoreEvent::DatabaseRowsUpdated {
                                     database_id,
@@ -1983,7 +1982,7 @@ async fn run_page_refresh(
             let http_requests = estimate_page_detail_http_requests(&detail.blocks);
             let changed = prev_cached
                 .as_ref()
-                .map_or(true, |prev| !page_detail_semantically_equal(prev, &detail));
+                .is_none_or(|prev| !page_detail_semantically_equal(prev, &detail));
             ActiveOutcome::Page {
                 detail: Box::new(detail),
                 changed,
@@ -2046,13 +2045,13 @@ async fn run_db_refresh(
                 }
                 _ => true,
             };
-            ActiveOutcome::Database {
+            ActiveOutcome::Database(Box::new(ActiveDatabaseOutcome {
                 database_id: database_id.to_string(),
                 database,
                 rows,
                 rows_truncated,
                 changed,
-            }
+            }))
         }
         Err(err) => {
             let _ = event_tx.send(CoreEvent::SyncError(err.to_string()));
@@ -2200,8 +2199,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("sync_overlap.db")).unwrap();
-        let mut cfg = crate::config::AppConfig::default();
-        cfg.api_base_url = format!("http://{addr}/v1");
+        let cfg = crate::config::AppConfig {
+            api_base_url: format!("http://{addr}/v1"),
+            ..Default::default()
+        };
         let auth = crate::auth::AuthManager::from_token(cfg.clone(), "ntn_overlap");
         let client = NotionClient::new(&cfg, auth).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2310,8 +2311,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("block_owners.db")).unwrap();
-        let mut cfg = crate::config::AppConfig::default();
-        cfg.api_base_url = format!("http://{addr}/v1");
+        let cfg = crate::config::AppConfig {
+            api_base_url: format!("http://{addr}/v1"),
+            ..Default::default()
+        };
         let auth = crate::auth::AuthManager::from_token(cfg.clone(), "ntn_owners");
         let client = NotionClient::new(&cfg, auth).unwrap();
 
@@ -2431,10 +2434,12 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("prefetch.db")).unwrap();
-        let mut cfg = crate::config::AppConfig::default();
-        cfg.api_base_url = format!("http://{addr}/v1");
-        cfg.active_poll_ms = 120;
-        cfg.sync_poll_ms = 60_000;
+        let cfg = crate::config::AppConfig {
+            api_base_url: format!("http://{addr}/v1"),
+            active_poll_ms: 120,
+            sync_poll_ms: 60_000,
+            ..Default::default()
+        };
         let auth = crate::auth::AuthManager::from_token(cfg.clone(), "ntn_prefetch");
         let ws_id = auth.active_workspace_id().await;
 

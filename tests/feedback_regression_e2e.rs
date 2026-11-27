@@ -543,8 +543,10 @@ sed -i 's/LEFT BOTH/LEFT DURING DRIFT/g' "$1"
 async fn e2e_cli_and_tui_column_layout_remote_drift_and_inline_editor() {
     let (base_url, state, server) = start_column_mock_server().await;
 
-    let mut cfg = AppConfig::default();
-    cfg.api_base_url = format!("{base_url}/v1");
+    let mut cfg = AppConfig {
+        api_base_url: format!("{base_url}/v1"),
+        ..Default::default()
+    };
     cfg.upsert_workspace(
         WorkspaceProfile {
             name: "col".into(),
@@ -1934,8 +1936,10 @@ async fn regression_notion_bug_04_children_of_headings_quote_paragraph_render_an
     assert_all_markers_once_in_order("blocks list", &String::from_utf8(out.stdout).unwrap());
 
     // 6. MCP get_page(compact: true)
-    let mut cfg = AppConfig::default();
-    cfg.api_base_url = format!("{base_url}/v1");
+    let mut cfg = AppConfig {
+        api_base_url: format!("{base_url}/v1"),
+        ..Default::default()
+    };
     cfg.upsert_workspace(
         WorkspaceProfile {
             name: "bug04".into(),

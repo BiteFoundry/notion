@@ -1583,11 +1583,11 @@ impl AppState {
         let new_kind = bed.kind.clone();
 
         if let Some(ref mut detail) = self.active_page_detail {
-            if detail.page.id == page_id {
-                if update_block_in_tree(&mut detail.blocks, &block_id, &new_type, &new_kind) {
-                    detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
-                    detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
-                }
+            if detail.page.id == page_id
+                && update_block_in_tree(&mut detail.blocks, &block_id, &new_type, &new_kind)
+            {
+                detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
+                detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
             }
         }
     }
@@ -2317,7 +2317,7 @@ impl AppState {
                             ed.remote_conflict = None;
                             ed.confirm_overwrite = false;
                             if self.active_page_id.as_deref() == Some(detail.page.id.as_str()) {
-                                let detail_changed = self.active_page_detail.as_ref().map_or(true, |cur| {
+                                let detail_changed = self.active_page_detail.as_ref().is_none_or(|cur| {
                                     !crate::sync::page_detail_semantically_equal(cur, &detail)
                                 });
                                 if detail_changed {
@@ -2361,7 +2361,7 @@ impl AppState {
                     return visual_changed;
                 }
                 if self.active_page_id.as_deref() == Some(detail.page.id.as_str()) {
-                    let detail_changed = self.active_page_detail.as_ref().map_or(true, |cur| {
+                    let detail_changed = self.active_page_detail.as_ref().is_none_or(|cur| {
                         !crate::sync::page_detail_semantically_equal(cur, &detail)
                     });
                     if !detail_changed && !summary_changed {
@@ -3442,8 +3442,10 @@ impl AppState {
         match ui.db_sort {
             DatabaseSortMode::LastEditedDesc => rows.sort_by(|a, b| b.last_edited_time.cmp(&a.last_edited_time)),
             DatabaseSortMode::LastEditedAsc => rows.sort_by(|a, b| a.last_edited_time.cmp(&b.last_edited_time)),
-            DatabaseSortMode::TitleAsc => rows.sort_by(|a, b| a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase())),
-            DatabaseSortMode::TitleDesc => rows.sort_by(|a, b| b.title.to_ascii_lowercase().cmp(&a.title.to_ascii_lowercase())),
+            DatabaseSortMode::TitleAsc => rows.sort_by_key(|a| a.title.to_ascii_lowercase()),
+            DatabaseSortMode::TitleDesc => {
+                rows.sort_by_key(|a| std::cmp::Reverse(a.title.to_ascii_lowercase()));
+            }
             DatabaseSortMode::StatusAsc => {
                 let status_key = |p: &NotionPage| -> String {
                     p.properties

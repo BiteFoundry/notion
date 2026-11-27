@@ -278,14 +278,12 @@ struct TerminalGuard {
     orig_conin_mode: Option<u32>,
 }
 
+type TuiTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+
 impl TerminalGuard {
     fn enter(
         image_protocol: ImageProtocolPreference,
-    ) -> Result<(
-        Self,
-        Terminal<CrosstermBackend<BufWriter<Stdout>>>,
-        TerminalGraphicsCaps,
-    )> {
+    ) -> Result<(Self, TuiTerminal, TerminalGraphicsCaps)> {
         #[cfg(windows)]
         let orig_conin_mode = win_console::snapshot_console_mode();
 
@@ -875,8 +873,7 @@ fn draw_frame(
                         .write_all(img_preview::kitty_delete_all_sequence().as_bytes())?;
                 }
             }
-            for (graphic, prebuilt_payload) in desired.into_iter().zip(desired_payloads.into_iter())
-            {
+            for (graphic, prebuilt_payload) in desired.into_iter().zip(desired_payloads) {
                 let payload: Option<Cow<'_, str>> = if let Some(p) = prebuilt_payload {
                     Some(Cow::Owned(p))
                 } else {
@@ -1393,10 +1390,11 @@ pub async fn run(
 
             match result {
                 Ok(edited) => {
-                    if edited.trim() != initial_md.trim() && !edited.trim().is_empty() {
-                        if app.submit_page_edit_markdown(&mut ui, edited) {
-                            ui.info("Syncing edited Markdown to Notion...");
-                        }
+                    if edited.trim() != initial_md.trim()
+                        && !edited.trim().is_empty()
+                        && app.submit_page_edit_markdown(&mut ui, edited)
+                    {
+                        ui.info("Syncing edited Markdown to Notion...");
                     }
                 }
                 Err(err) => ui.error(format!("External editor error: {err}")),
@@ -1575,7 +1573,7 @@ mod tests {
         tracker.commit(vec![img_a.clone()], (120, 36));
 
         // Same graphic & size -> skip erase and emit
-        let noop = tracker.plan_transition(&[img_a.clone()], (120, 36), false);
+        let noop = tracker.plan_transition(std::slice::from_ref(&img_a), (120, 36), false);
         assert!(!noop.erase_and_redraw);
         assert!(!noop.emit_desired);
 

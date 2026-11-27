@@ -888,9 +888,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
 
-        let mut cfg = AppConfig::default();
-        cfg.page_width = PageWidthMode::Full;
-        cfg.theme = ThemePreset::WarmPaper;
+        let mut cfg = AppConfig {
+            page_width: PageWidthMode::Full,
+            theme: ThemePreset::WarmPaper,
+            ..Default::default()
+        };
         cfg.upsert_workspace(
             WorkspaceProfile {
                 name: "acme".into(),
