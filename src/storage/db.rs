@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 22;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 23;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 24;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 25;
 
 /// Initializes SQLite WAL PRAGMAs, Notion workspace-scoped tables, indexes, and `pages_fts`.
 /// Returns `true` if `pages_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -29,7 +29,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
     )
     .context("Failed to configure SQLite PRAGMAs")?;
 
-    if !is_memory {
+    let prev_user_version: i32 = if !is_memory {
         let _ = conn.execute_batch("PRAGMA mmap_size = 67108864;");
         let user_version: i32 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
@@ -54,7 +54,10 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
                 return Ok(user_version == SCHEMA_USER_VERSION_TRIGRAM);
             }
         }
-    }
+        user_version
+    } else {
+        0
+    };
 
     conn.execute_batch(
         "
@@ -230,6 +233,24 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
     )?;
 
     if !is_memory {
+        if prev_user_version < SCHEMA_USER_VERSION_UNICODE61 {
+            // Migrate pre-v24 caches so `pages_fts.rowid` mirrors `pages.rowid * 2` and
+            // `databases.rowid * 2 + 1`, enabling O(log N) `WHERE rowid = ?1` FTS5 deletes.
+            conn.execute_batch(
+                "
+                BEGIN IMMEDIATE;
+                DELETE FROM pages_fts;
+                INSERT INTO pages_fts (rowid, page_id, workspace_id, item_type, title, plain_text, properties_summary)
+                SELECT rowid * 2, id, workspace_id, 'page', title, plain_text, properties_summary
+                FROM pages WHERE archived = 0;
+                INSERT INTO pages_fts (rowid, page_id, workspace_id, item_type, title, plain_text, properties_summary)
+                SELECT rowid * 2 + 1, id, workspace_id, 'database', title, description, ''
+                FROM databases WHERE archived = 0;
+                COMMIT;
+                ",
+            )
+            .context("Failed to migrate pages_fts to rowid-indexed layout")?;
+        }
         let version = if trigram {
             SCHEMA_USER_VERSION_TRIGRAM
         } else {

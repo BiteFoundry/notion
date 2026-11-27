@@ -6,6 +6,8 @@
 //!     Inline Images, Child Page/Database Cards, + Comments Peek Drawer `C`)
 //!   - Database View (`1 Table`, `2 Board` Kanban, `3 List`, Filter `f`, Sort `s`, New Item `n`).
 
+use std::sync::Arc;
+
 use bitefoundry_html::layout::{
     pad_display_width, render_wrapped_table, wrap_styled_spans, TableAlign, TableBorder, TableSpec,
     WrapPrefix,
@@ -275,9 +277,45 @@ fn draw_page_canvas(
         return;
     }
 
-    let scene = build_page_canvas_scene(app, detail, ui, &theme, content_area.width);
-    let rendered_lines = scene.lines;
-    let inline_hits = scene.inline_hits;
+    let has_active_block_editor = ui
+        .block_editor
+        .as_ref()
+        .is_some_and(|b| b.page_id == detail.page.id);
+    let scene: Arc<PageCanvasScene> = if has_active_block_editor {
+        ui.canvas_scene_cache = None;
+        Arc::new(build_page_canvas_scene(
+            app,
+            detail,
+            ui,
+            &theme,
+            content_area.width,
+        ))
+    } else {
+        let cache_key = PageCanvasCacheKey::from_state(app, detail, ui, &theme, content_area.width);
+        let cached = ui
+            .canvas_scene_cache
+            .as_ref()
+            .filter(|c| c.key == cache_key)
+            .map(|c| Arc::clone(&c.scene));
+        if let Some(hit) = cached {
+            hit
+        } else {
+            let built = Arc::new(build_page_canvas_scene(
+                app,
+                detail,
+                ui,
+                &theme,
+                content_area.width,
+            ));
+            ui.canvas_scene_cache = Some(PageCanvasSceneCache {
+                key: cache_key,
+                scene: Arc::clone(&built),
+            });
+            built
+        }
+    };
+    let rendered_lines = &scene.lines;
+    let inline_hits = &scene.inline_hits;
     let selected_line_range = scene.selected_line_range;
 
     // Keep the selected block (or active block-editor cursor line) visible when navigating
@@ -343,6 +381,10 @@ fn draw_page_canvas(
         }
     }
 
+    let mut hit_idx = inline_hits.partition_point(|&(hl_idx, _, _, _)| hl_idx < scroll);
+    let mut link_idx = scene
+        .inline_links
+        .partition_point(|&(ll_idx, _, _, _)| ll_idx < scroll);
     for (row_offset, (line, target)) in rendered_lines
         .iter()
         .skip(scroll)
@@ -356,16 +398,19 @@ fn draw_page_canvas(
         if let Some(hit) = *target {
             hitmap.add_line(content_area.x, y, content_area.width, hit);
         }
-        for &(hl_idx, rel_x, w, hit) in &inline_hits {
-            if hl_idx == line_idx && rel_x < content_area.width {
+        while hit_idx < inline_hits.len() && inline_hits[hit_idx].0 == line_idx {
+            let (_, rel_x, w, hit) = inline_hits[hit_idx];
+            if rel_x < content_area.width {
                 let clamped_w = w.min(content_area.width.saturating_sub(rel_x));
                 if clamped_w > 0 {
                     hitmap.add_line(content_area.x.saturating_add(rel_x), y, clamped_w, hit);
                 }
             }
+            hit_idx += 1;
         }
-        for &(ll_idx, rel_x, w, ref url) in &scene.inline_links {
-            if ll_idx == line_idx && rel_x < content_area.width {
+        while link_idx < scene.inline_links.len() && scene.inline_links[link_idx].0 == line_idx {
+            let (_, rel_x, w, ref url) = scene.inline_links[link_idx];
+            if rel_x < content_area.width {
                 let clamped_w = w.min(content_area.width.saturating_sub(rel_x));
                 if clamped_w > 0 {
                     ui.canvas_link_hits.push(CanvasLinkHit {
@@ -374,18 +419,19 @@ fn draw_page_canvas(
                     });
                 }
             }
+            link_idx += 1;
         }
     }
 
     // Update active in-place block editor screen geometry and expose exact hardware terminal cursor.
-    if let (Some(active), Some(bed)) = (scene.active_block_edit, ui.block_editor.as_mut()) {
+    if let (Some(ref active), Some(bed)) = (&scene.active_block_edit, ui.block_editor.as_mut()) {
         bed.last_text_x = content_area.x.saturating_add(active.prefix_w);
         bed.last_first_screen_row = content_area
             .y
             .saturating_add(active.text_start_line.saturating_sub(scroll) as u16);
         bed.last_screen_rows = active.total_text_rows;
         bed.last_wrap_width = active.wrap_w;
-        bed.last_visual_lines = active.visual_lines;
+        bed.last_visual_lines = active.visual_lines.clone();
         bed.last_cursor_visual_row = active.cursor_row;
 
         let cursor_line_idx = active.text_start_line.saturating_add(active.cursor_row);
@@ -933,6 +979,62 @@ struct ActiveBlockRenderInfo {
     total_text_rows: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageCanvasCacheKey {
+    page_id: String,
+    blocks_gen: u64,
+    blocks_len: usize,
+    blocks_ptr: usize,
+    comments_len: usize,
+    media_len: usize,
+    is_favorite: bool,
+    last_edited_time: Option<String>,
+    width: u16,
+    canvas_focused: bool,
+    selected_block: usize,
+    show_inline_hrefs: bool,
+    expanded_toggles_len: usize,
+    expanded_toggles_hash: u64,
+    hydrating_blocks_len: usize,
+    hydrating_blocks_hash: u64,
+    theme: Theme,
+}
+
+impl PageCanvasCacheKey {
+    fn from_state(
+        app: &AppState,
+        detail: &NotionPageDetail,
+        ui: &UiState,
+        theme: &Theme,
+        width: u16,
+    ) -> Self {
+        Self {
+            page_id: detail.page.id.clone(),
+            blocks_gen: app.blocks_gen,
+            blocks_len: detail.blocks.len(),
+            blocks_ptr: detail.blocks.as_ptr() as usize,
+            comments_len: detail.comments.len(),
+            media_len: detail.media.len(),
+            is_favorite: detail.page.is_favorite,
+            last_edited_time: detail.page.last_edited_time.clone(),
+            width,
+            canvas_focused: ui.focus == Focus::Canvas,
+            selected_block: ui.selected_block,
+            show_inline_hrefs: ui.show_inline_hrefs,
+            expanded_toggles_len: ui.expanded_toggles.len(),
+            expanded_toggles_hash: crate::ui::app::hash_string_set(&ui.expanded_toggles),
+            hydrating_blocks_len: ui.hydrating_blocks.len(),
+            hydrating_blocks_hash: crate::ui::app::hash_string_set(&ui.hydrating_blocks),
+            theme: theme.clone(),
+        }
+    }
+}
+
+pub(crate) struct PageCanvasSceneCache {
+    key: PageCanvasCacheKey,
+    scene: Arc<PageCanvasScene>,
+}
+
 struct PageCanvasScene {
     lines: Vec<(Line<'static>, Option<HitTarget>)>,
     inline_hits: Vec<(usize, u16, u16, HitTarget)>,
@@ -1238,6 +1340,8 @@ fn build_page_canvas_scene(
         }
     }
 
+    inline_hits.sort_by_key(|&(l_idx, _, _, _)| l_idx);
+    inline_links.sort_by_key(|&(l_idx, _, _, _)| l_idx);
     PageCanvasScene {
         lines: rendered_lines,
         inline_hits,
@@ -3188,7 +3292,7 @@ fn draw_db_table(
     hitmap: &mut HitMap,
 ) {
     let theme = &ui.theme;
-    let rows = app.filtered_sorted_db_rows(ui);
+    let rows = app.filtered_sorted_db_row_refs(ui);
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -3502,7 +3606,7 @@ fn draw_db_list(
     hitmap: &mut HitMap,
 ) {
     let theme = &ui.theme;
-    let rows = app.filtered_sorted_db_rows(ui);
+    let rows = app.filtered_sorted_db_row_refs(ui);
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled(

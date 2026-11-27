@@ -85,10 +85,11 @@ pub(super) fn try_dispatch(
         }
         Action::SidebarCollapseOrPrevFocus => {
             if ui.focus == Focus::Sidebar {
-                let items = app.build_sidebar_items(ui);
+                let items = app.sidebar_items_cached(ui);
                 if let Some(item) = items.get(ui.sidebar_selected) {
                     if item.collapsible && !ui.collapsed_nodes.contains(&item.id) {
                         ui.collapsed_nodes.insert(item.id.clone());
+                        ui.collapsed_gen = ui.collapsed_gen.wrapping_add(1);
                         app.snap_sidebar_selection(ui);
                         return Ok(false);
                     }
@@ -100,10 +101,11 @@ pub(super) fn try_dispatch(
         }
         Action::SidebarExpandOrNextFocus => {
             if ui.focus == Focus::Sidebar {
-                let items = app.build_sidebar_items(ui);
+                let items = app.sidebar_items_cached(ui);
                 if let Some(item) = items.get(ui.sidebar_selected) {
                     if item.collapsible && ui.collapsed_nodes.contains(&item.id) {
                         ui.collapsed_nodes.remove(&item.id);
+                        ui.collapsed_gen = ui.collapsed_gen.wrapping_add(1);
                         app.snap_sidebar_selection(ui);
                         return Ok(false);
                     }
@@ -547,9 +549,11 @@ pub(super) fn try_dispatch(
                         if let Ok(fav) = app.storage.toggle_page_favorite(&ws, pid) {
                             if let Some(p) = app.pages.iter_mut().find(|p| p.id == *pid) {
                                 p.is_favorite = fav;
+                                app.bump_pages_gen();
                             }
                             if let Some(ref mut d) = app.active_page_detail {
                                 d.page.is_favorite = fav;
+                                app.bump_blocks_gen();
                             }
                             app.snap_sidebar_selection(ui);
                             ui.success(if fav {
@@ -565,6 +569,7 @@ pub(super) fn try_dispatch(
                         if let Ok(fav) = app.storage.toggle_database_favorite(&ws, did) {
                             if let Some(d) = app.databases.iter_mut().find(|d| d.id == *did) {
                                 d.is_favorite = fav;
+                                app.bump_dbs_gen();
                             }
                             app.snap_sidebar_selection(ui);
                             ui.success(if fav {
@@ -583,6 +588,7 @@ pub(super) fn try_dispatch(
                 if let Ok(fav) = app.storage.toggle_database_favorite(&ws, &id) {
                     if let Some(d) = app.databases.iter_mut().find(|d| d.id == id) {
                         d.is_favorite = fav;
+                        app.bump_dbs_gen();
                     }
                     app.snap_sidebar_selection(ui);
                     ui.success(if fav {
@@ -594,10 +600,12 @@ pub(super) fn try_dispatch(
             } else if let Ok(fav) = app.storage.toggle_page_favorite(&ws, &id) {
                 if let Some(p) = app.pages.iter_mut().find(|p| p.id == id) {
                     p.is_favorite = fav;
+                    app.bump_pages_gen();
                 }
                 if let Some(ref mut d) = app.active_page_detail {
                     if d.page.id == id {
                         d.page.is_favorite = fav;
+                        app.bump_blocks_gen();
                     }
                 }
                 app.snap_sidebar_selection(ui);

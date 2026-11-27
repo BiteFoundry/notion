@@ -154,7 +154,8 @@ async fn search_pages_for_write(
         let res = client
             .search(Some(query), SearchFilterObject::Page, 100, cursor.as_deref())
             .await?;
-        let _ = storage.upsert_pages(&res.pages);
+        let pages_c = res.pages.clone();
+        let _ = storage.blocking(move |st| st.upsert_pages(&pages_c)).await;
 
         for p in res.pages {
             if p.id.eq_ignore_ascii_case(query) {
@@ -212,7 +213,8 @@ async fn verify_cached_pages_for_write(
         if p.title.eq_ignore_ascii_case(query) && p.archived == want_archived {
             match client.get_page(&p.id).await {
                 Ok(fresh) => {
-                    let _ = storage.upsert_page(&fresh);
+                    let fresh_c = fresh.clone();
+                    let _ = storage.blocking(move |st| st.upsert_page(&fresh_c)).await;
                     if fresh.title.eq_ignore_ascii_case(query) && fresh.archived == want_archived {
                         if !state.exact.iter().any(|e| e.id == fresh.id) {
                             state.exact.push(fresh);
@@ -223,7 +225,11 @@ async fn verify_cached_pages_for_write(
                     }
                 }
                 Err(err) if NotionClient::is_authoritative_not_found(&err) => {
-                    let _ = storage.mark_page_archived(workspace_id, &p.id);
+                    let ws_c = workspace_id.to_string();
+                    let pid_c = p.id.clone();
+                    let _ = storage
+                        .blocking(move |st| st.mark_page_archived(&ws_c, &pid_c))
+                        .await;
                 }
                 Err(err) => return Err(err),
             }
@@ -259,7 +265,11 @@ pub async fn resolve_page_id_for_write(
         return Ok(normalize_notion_id(trimmed));
     }
 
-    let cached_pages = storage.list_pages(workspace_id, true).unwrap_or_default();
+    let ws_c = workspace_id.to_string();
+    let cached_pages = storage
+        .blocking(move |st| st.list_pages(&ws_c, true))
+        .await
+        .unwrap_or_default();
     if let Some(found) = cached_pages
         .iter()
         .find(|p| p.id.eq_ignore_ascii_case(trimmed))
@@ -314,7 +324,8 @@ async fn search_databases_for_write(
                 cursor.as_deref(),
             )
             .await?;
-        let _ = storage.upsert_databases(&res.databases);
+        let dbs_c = res.databases.clone();
+        let _ = storage.blocking(move |st| st.upsert_databases(&dbs_c)).await;
 
         for d in res.databases {
             if d.id.eq_ignore_ascii_case(query) {
@@ -371,7 +382,8 @@ async fn verify_cached_databases_for_write(
         if d.title.eq_ignore_ascii_case(query) && !d.archived {
             match client.get_database(&d.id).await {
                 Ok(fresh) => {
-                    let _ = storage.upsert_database(&fresh);
+                    let fresh_c = fresh.clone();
+                    let _ = storage.blocking(move |st| st.upsert_database(&fresh_c)).await;
                     if fresh.title.eq_ignore_ascii_case(query) && !fresh.archived {
                         if !state.exact.iter().any(|e| e.id == fresh.id) {
                             state.exact.push(fresh);
@@ -382,7 +394,11 @@ async fn verify_cached_databases_for_write(
                     }
                 }
                 Err(err) if NotionClient::is_authoritative_not_found(&err) => {
-                    let _ = storage.mark_database_archived(workspace_id, &d.id);
+                    let ws_c = workspace_id.to_string();
+                    let did_c = d.id.clone();
+                    let _ = storage
+                        .blocking(move |st| st.mark_database_archived(&ws_c, &did_c))
+                        .await;
                 }
                 Err(err) => return Err(err),
             }
@@ -416,7 +432,11 @@ pub async fn resolve_database_id_for_write(
         return Ok(normalize_notion_id(trimmed));
     }
 
-    let cached_dbs = storage.list_databases(workspace_id).unwrap_or_default();
+    let ws_c = workspace_id.to_string();
+    let cached_dbs = storage
+        .blocking(move |st| st.list_databases(&ws_c))
+        .await
+        .unwrap_or_default();
     if let Some(found) = cached_dbs
         .iter()
         .find(|d| d.id.eq_ignore_ascii_case(trimmed))
@@ -466,7 +486,8 @@ pub async fn resolve_page_id(
 
     // Check exact ID or exact title in local cache (active before archived).
     let mut local_partial: Option<String> = None;
-    if let Ok(pages) = storage.list_pages(workspace_id, true) {
+    let ws_c = workspace_id.to_string();
+    if let Ok(pages) = storage.blocking(move |st| st.list_pages(&ws_c, true)).await {
         if let Some(found) = match_page_exact(&pages, trimmed) {
             return Ok(found.id.clone());
         }
@@ -480,7 +501,8 @@ pub async fn resolve_page_id(
         let res = api
             .search(Some(trimmed), SearchFilterObject::Page, 25, None)
             .await?;
-        let _ = storage.upsert_pages(&res.pages);
+        let pages_c = res.pages.clone();
+        let _ = storage.blocking(move |st| st.upsert_pages(&pages_c)).await;
         if let Some(found) = match_page_exact(&res.pages, trimmed) {
             return Ok(found.id.clone());
         }
@@ -520,7 +542,8 @@ pub async fn resolve_database_id(
     }
 
     let mut local_partial: Option<String> = None;
-    if let Ok(dbs) = storage.list_databases(workspace_id) {
+    let ws_c = workspace_id.to_string();
+    if let Ok(dbs) = storage.blocking(move |st| st.list_databases(&ws_c)).await {
         if let Some(found) = match_database_exact(&dbs, trimmed) {
             return Ok(found.id.clone());
         }
@@ -533,7 +556,8 @@ pub async fn resolve_database_id(
         let res = api
             .search(Some(trimmed), SearchFilterObject::Database, 25, None)
             .await?;
-        let _ = storage.upsert_databases(&res.databases);
+        let dbs_c = res.databases.clone();
+        let _ = storage.blocking(move |st| st.upsert_databases(&dbs_c)).await;
         if let Some(found) = match_database_exact(&res.databases, trimmed) {
             return Ok(found.id.clone());
         }

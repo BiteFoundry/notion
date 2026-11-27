@@ -39,6 +39,8 @@ impl AppState {
                 self.workspace_id = workspace_id;
                 self.pages = pages;
                 self.databases = databases;
+                self.bump_pages_gen();
+                self.bump_dbs_gen();
                 self.reload_page_parent_hints();
                 if self.active_page_id.is_none() && self.active_database_id.is_none() {
                     if let Some(first) = self.pages.iter().find(|p| !p.archived).cloned() {
@@ -117,6 +119,7 @@ impl AppState {
                                 if detail_changed {
                                     self.reload_page_parent_hints();
                                     self.active_page_detail = Some(*detail);
+                                    self.bump_blocks_gen();
                                     visual_changed = true;
                                 }
                             }
@@ -147,6 +150,7 @@ impl AppState {
                                     active.page.title = detail.page.title;
                                     active.page.icon = detail.page.icon;
                                     active.comments = detail.comments;
+                                    self.bump_blocks_gen();
                                     visual_changed = true;
                                 }
                             }
@@ -163,6 +167,7 @@ impl AppState {
                     }
                     self.reload_page_parent_hints();
                     self.active_page_detail = Some(*detail);
+                    self.bump_blocks_gen();
                     self.clamp_canvas_selection(ui);
                     return true;
                 }
@@ -202,10 +207,12 @@ impl AppState {
                     if let Some(existing) = self.databases.iter_mut().find(|d| d.id == db.id) {
                         if !crate::sync::database_semantically_equal(existing, &db) {
                             *existing = db;
+                            self.bump_dbs_gen();
                             changed = true;
                         }
                     } else {
                         self.databases.push(db);
+                        self.bump_dbs_gen();
                         changed = true;
                     }
                 }
@@ -273,6 +280,7 @@ impl AppState {
                     }
                     if detail.page.id == page_id && detail.comments != comments {
                         detail.comments = comments;
+                        self.bump_blocks_gen();
                         return true;
                     }
                 }

@@ -331,17 +331,32 @@ pub async fn op_list_pages(
     let _ = parse_offset_cursor(cursor)?;
     let ws_id = client.auth().active_workspace_id().await;
     let all = if !offline {
-        if refresh || !sync::workspace_cache_complete(storage, &ws_id) {
+        let ws_c = ws_id.clone();
+        let complete = if refresh {
+            false
+        } else {
+            storage
+                .blocking(move |st| Ok(sync::workspace_cache_complete(st, &ws_c)))
+                .await
+                .unwrap_or(false)
+        };
+        if refresh || !complete {
             let (_, pages, _) = sync::sync_workspace_tree(client, storage).await?;
             pages
                 .into_iter()
                 .filter(|p| include_archived || !p.archived)
                 .collect()
         } else {
-            storage.list_pages(&ws_id, include_archived)?
+            let ws_c = ws_id.clone();
+            storage
+                .blocking(move |st| st.list_pages(&ws_c, include_archived))
+                .await?
         }
     } else {
-        storage.list_pages(&ws_id, include_archived)?
+        let ws_c = ws_id.clone();
+        storage
+            .blocking(move |st| st.list_pages(&ws_c, include_archived))
+            .await?
     };
     offset_page(all, limit, cursor)
 }
@@ -365,26 +380,31 @@ pub async fn op_get_page_with_options(
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id(storage, (!offline).then_some(client), &ws_id, page).await?;
     if offline {
-        let mut detail = storage
-            .load_page_detail(&ws_id, &id)?
-            .ok_or_else(|| coded("not_cached", format!("Page '{page}' not found in local cache")))?;
-        if storage.load_cached_children(&ws_id, &id)?.is_none() {
-            return Err(coded(
-                "not_cached",
-                format!(
-                    "Page '{page}' body not found in offline cache (not fetched); read it online once"
-                ),
-            ));
-        }
-        if detail.comments_error.is_none()
-            && matches!(
-                storage.load_cached_comments(&ws_id, &id)?,
-                CachedComments::NotFetched
-            )
-        {
-            detail.comments_error = Some("Comments not fetched into the offline cache".into());
-        }
-        return Ok(detail);
+        let ws_c = ws_id.clone();
+        let id_c = id.clone();
+        let page_label = page.to_string();
+        return storage
+            .blocking(move |st| {
+                let mut detail = st.load_page_detail(&ws_c, &id_c)?.ok_or_else(|| {
+                    coded("not_cached", format!("Page '{page_label}' not found in local cache"))
+                })?;
+                if st.load_cached_children(&ws_c, &id_c)?.is_none() {
+                    return Err(coded(
+                        "not_cached",
+                        format!(
+                            "Page '{page_label}' body not found in offline cache (not fetched); read it online once"
+                        ),
+                    ));
+                }
+                if detail.comments_error.is_none()
+                    && matches!(st.load_cached_comments(&ws_c, &id_c)?, CachedComments::NotFetched)
+                {
+                    detail.comments_error =
+                        Some("Comments not fetched into the offline cache".into());
+                }
+                Ok(detail)
+            })
+            .await;
     }
     if refresh {
         sync::sync_page_detail_force(client, storage, &id).await
@@ -405,22 +425,33 @@ pub async fn op_get_page_compact(
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id(storage, (!offline).then_some(client), &ws_id, page).await?;
     let detail = if offline {
-        let detail = storage
-            .load_page_detail(&ws_id, &id)?
-            .ok_or_else(|| coded("not_cached", format!("Page '{page}' not found in local cache")))?;
-        if storage.load_cached_children(&ws_id, &id)?.is_none() {
-            return Err(coded(
-                "not_cached",
-                format!(
-                    "Page '{page}' body not found in offline cache (not fetched); read it online once"
-                ),
-            ));
-        }
-        detail
+        let ws_c = ws_id.clone();
+        let id_c = id.clone();
+        let page_label = page.to_string();
+        storage
+            .blocking(move |st| {
+                let detail = st.load_page_detail(&ws_c, &id_c)?.ok_or_else(|| {
+                    coded("not_cached", format!("Page '{page_label}' not found in local cache"))
+                })?;
+                if st.load_cached_children(&ws_c, &id_c)?.is_none() {
+                    return Err(coded(
+                        "not_cached",
+                        format!(
+                            "Page '{page_label}' body not found in offline cache (not fetched); read it online once"
+                        ),
+                    ));
+                }
+                Ok(detail)
+            })
+            .await?
     } else {
         sync::sync_page_body(client, storage, &id, refresh).await?
     };
-    let summary = storage.cached_comments_summary(&ws_id, &detail.page.id)?;
+    let ws_c = ws_id.clone();
+    let pid_c = detail.page.id.clone();
+    let summary = storage
+        .blocking(move |st| st.cached_comments_summary(&ws_c, &pid_c))
+        .await?;
     Ok(detail.compact(
         hint_for(&detail.page.id),
         summary.state,
@@ -452,18 +483,25 @@ pub async fn op_get_page_fields(
 
     if needs_blocks {
         let detail = if offline {
-            let detail = storage
-                .load_page_detail(&ws_id, &id)?
-                .ok_or_else(|| coded("not_cached", format!("Page '{page}' not found in local cache")))?;
-            if storage.load_cached_children(&ws_id, &id)?.is_none() {
-                return Err(coded(
-                    "not_cached",
-                    format!(
-                        "Page '{page}' body not found in offline cache (not fetched); read it online once"
-                    ),
-                ));
-            }
-            detail
+            let ws_c = ws_id.clone();
+            let id_c = id.clone();
+            let page_label = page.to_string();
+            storage
+                .blocking(move |st| {
+                    let detail = st.load_page_detail(&ws_c, &id_c)?.ok_or_else(|| {
+                        coded("not_cached", format!("Page '{page_label}' not found in local cache"))
+                    })?;
+                    if st.load_cached_children(&ws_c, &id_c)?.is_none() {
+                        return Err(coded(
+                            "not_cached",
+                            format!(
+                                "Page '{page_label}' body not found in offline cache (not fetched); read it online once"
+                            ),
+                        ));
+                    }
+                    Ok(detail)
+                })
+                .await?
         } else {
             sync::sync_page_body(client, storage, &id, refresh).await?
         };
@@ -471,12 +509,16 @@ pub async fn op_get_page_fields(
     }
 
     let loaded_page = if offline {
+        let ws_c = ws_id.clone();
+        let id_c = id.clone();
         storage
-            .get_page(&ws_id, &id)?
+            .blocking(move |st| st.get_page(&ws_c, &id_c))
+            .await?
             .ok_or_else(|| coded("not_cached", format!("Page '{page}' not found in local cache")))?
     } else {
         let fresh = client.get_page(&id).await?;
-        let _ = storage.upsert_page(&fresh);
+        let fresh_c = fresh.clone();
+        let _ = storage.blocking(move |st| st.upsert_page(&fresh_c)).await;
         fresh
     };
     let detail = NotionPageDetail {
@@ -498,9 +540,14 @@ pub async fn op_get_page_for_output(
     let detail = op_get_page_with_options(client, storage, page, refresh, offline).await?;
     let comments_has_more = if detail.comments_error.is_some() {
         false
+    } else if detail.comments.len() > DETAIL_COMMENTS_LIMIT {
+        true
     } else {
-        detail.comments.len() > DETAIL_COMMENTS_LIMIT
-            || storage.comments_partial(&ws_id, &detail.page.id)?
+        let ws_c = ws_id.clone();
+        let pid_c = detail.page.id.clone();
+        storage
+            .blocking(move |st| st.comments_partial(&ws_c, &pid_c))
+            .await?
     };
     Ok((detail, comments_has_more))
 }
@@ -569,10 +616,12 @@ pub async fn op_create_page(
     let mut cached_title_key: Option<String> = None;
     if !props.values().any(|value| value.get("title").is_some()) {
         let title_key = if parent_is_database {
-            if let Some(key) = storage
-                .get_database(&ws_id, &parent_id)?
-                .and_then(|db| title_key_from_database(&db))
-            {
+            let ws_c = ws_id.clone();
+            let pid_c = parent_id.clone();
+            let cached_db = storage
+                .blocking(move |st| st.get_database(&ws_c, &pid_c))
+                .await?;
+            if let Some(key) = cached_db.and_then(|db| title_key_from_database(&db)) {
                 cached_title_key = Some(key.clone());
                 key
             } else {
@@ -633,7 +682,8 @@ pub async fn op_create_page(
         }
         Err(err) => return Err(err),
     };
-    let _ = storage.upsert_page(&created);
+    let created_c = created.clone();
+    let _ = storage.blocking(move |st| st.upsert_page(&created_c)).await;
     if !overflow_blocks.is_empty() {
         if let Err(err) = client
             .append_block_children(&created.id, overflow_blocks)
@@ -665,15 +715,16 @@ pub(crate) async fn op_update_page_metadata(
     let id = resolver::resolve_page_id_for_write(storage, client, &ws_id, page, false).await?;
     let mut used_cached_key = false;
     let title_key = if title.is_some() {
-        if let Some(key) = storage
-            .get_page(&ws_id, &id)?
-            .and_then(|p| title_key_from_page(&p))
-        {
+        let ws_c = ws_id.clone();
+        let id_c = id.clone();
+        let cached = storage.blocking(move |st| st.get_page(&ws_c, &id_c)).await?;
+        if let Some(key) = cached.and_then(|p| title_key_from_page(&p)) {
             used_cached_key = true;
             key
         } else {
             let current = client.get_page(&id).await?;
-            let _ = storage.upsert_page(&current);
+            let current_c = current.clone();
+            let _ = storage.blocking(move |st| st.upsert_page(&current_c)).await;
             title_key_from_page(&current).context("Page has no accessible title property")?
         }
     } else {
@@ -684,7 +735,8 @@ pub(crate) async fn op_update_page_metadata(
         Ok(updated) => Ok(updated),
         Err(err) if used_cached_key && is_notion_validation_error(&err) => {
             let current = client.get_page(&id).await?;
-            let _ = storage.upsert_page(&current);
+            let current_c = current.clone();
+            let _ = storage.blocking(move |st| st.upsert_page(&current_c)).await;
             let fresh_key =
                 title_key_from_page(&current).context("Page has no accessible title property")?;
             if fresh_key != title_key {
@@ -721,7 +773,8 @@ async fn patch_page_metadata(
         payload.insert("icon".into(), value);
     }
     let updated = client.update_page(id, Value::Object(payload)).await?;
-    let _ = storage.upsert_page(&updated);
+    let updated_c = updated.clone();
+    let _ = storage.blocking(move |st| st.upsert_page(&updated_c)).await;
     Ok(updated)
 }
 
@@ -794,15 +847,17 @@ pub async fn op_patch_page(
 
     let mut used_cached_meta = false;
     let payload = if title.is_some() {
-        let cached_attempt = storage
-            .get_page(&ws_id, &id)?
-            .and_then(|cached| build_patch_payload(Some(&cached)).ok());
+        let ws_c = ws_id.clone();
+        let id_c = id.clone();
+        let cached = storage.blocking(move |st| st.get_page(&ws_c, &id_c)).await?;
+        let cached_attempt = cached.and_then(|cached| build_patch_payload(Some(&cached)).ok());
         if let Some(p) = cached_attempt {
             used_cached_meta = true;
             p
         } else {
             let current = client.get_page(&id).await?;
-            let _ = storage.upsert_page(&current);
+            let current_c = current.clone();
+            let _ = storage.blocking(move |st| st.upsert_page(&current_c)).await;
             build_patch_payload(Some(&current))?
         }
     } else {
@@ -812,13 +867,15 @@ pub async fn op_patch_page(
         Ok(u) => u,
         Err(err) if used_cached_meta && is_notion_validation_error(&err) => {
             let current = client.get_page(&id).await?;
-            let _ = storage.upsert_page(&current);
+            let current_c = current.clone();
+            let _ = storage.blocking(move |st| st.upsert_page(&current_c)).await;
             let fresh_payload = build_patch_payload(Some(&current))?;
             client.update_page(&id, Value::Object(fresh_payload)).await?
         }
         Err(err) => return Err(err),
     };
-    let _ = storage.upsert_page(&updated);
+    let updated_c = updated.clone();
+    let _ = storage.blocking(move |st| st.upsert_page(&updated_c)).await;
     Ok(updated)
 }
 
@@ -832,7 +889,8 @@ pub async fn op_archive_page(
     let id =
         resolver::resolve_page_id_for_write(storage, client, &ws_id, page, !archived).await?;
     let updated = client.set_page_archived(&id, archived).await?;
-    let _ = storage.upsert_page(&updated);
+    let updated_c = updated.clone();
+    let _ = storage.blocking(move |st| st.upsert_page(&updated_c)).await;
     Ok(updated)
 }
 

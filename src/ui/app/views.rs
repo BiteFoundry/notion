@@ -1,6 +1,9 @@
 //! Sidebar tree builder, visible block flattener, database query/Kanban views, and block tree helpers.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::models::{
     DatabaseSortMode, NotionBlock, NotionBlockKind, NotionColor, NotionDatabase, NotionPage,
@@ -15,8 +18,97 @@ use super::{
     },
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarCacheKey {
+    pages_gen: u64,
+    dbs_gen: u64,
+    collapsed_gen: u64,
+    workspace_id: String,
+    pages_len: usize,
+    pages_ptr: usize,
+    dbs_len: usize,
+    dbs_ptr: usize,
+    block_owners_len: usize,
+    child_positions_len: usize,
+    collapsed_len: usize,
+    collapsed_hash: u64,
+}
+
+pub(super) struct CachedSidebarItems {
+    key: SidebarCacheKey,
+    items: Arc<[SidebarItem]>,
+}
+
+pub(crate) fn hash_string_set(set: &HashSet<String>) -> u64 {
+    let mut acc = 0u64;
+    for s in set {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for b in s.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        acc ^= h;
+    }
+    acc
+}
+
+fn ascii_contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    let n = needle_lower.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    let h = haystack.as_bytes();
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len())
+        .any(|w| w.iter().zip(n.iter()).all(|(&a, &b)| a.to_ascii_lowercase() == b))
+}
+
 impl AppState {
+    pub fn sidebar_items_cached(&self, ui: &UiState) -> Arc<[SidebarItem]> {
+        let key = SidebarCacheKey {
+            pages_gen: self.pages_gen,
+            dbs_gen: self.dbs_gen,
+            collapsed_gen: ui.collapsed_gen,
+            workspace_id: self.workspace_id.clone(),
+            pages_len: self.pages.len(),
+            pages_ptr: self.pages.as_ptr() as usize,
+            dbs_len: self.databases.len(),
+            dbs_ptr: self.databases.as_ptr() as usize,
+            block_owners_len: self.block_owner_pages.len(),
+            child_positions_len: self.child_page_positions.len(),
+            collapsed_len: ui.collapsed_nodes.len(),
+            collapsed_hash: hash_string_set(&ui.collapsed_nodes),
+        };
+        {
+            let guard = self
+                .sidebar_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(ref cached) = *guard {
+                if cached.key == key {
+                    return Arc::clone(&cached.items);
+                }
+            }
+        }
+        let items: Arc<[SidebarItem]> = Arc::from(self.build_sidebar_items_uncached(ui));
+        let mut guard = self
+            .sidebar_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(CachedSidebarItems {
+            key,
+            items: Arc::clone(&items),
+        });
+        items
+    }
+
     pub fn build_sidebar_items(&self, ui: &UiState) -> Vec<SidebarItem> {
+        self.sidebar_items_cached(ui).to_vec()
+    }
+
+    fn build_sidebar_items_uncached(&self, ui: &UiState) -> Vec<SidebarItem> {
         let mut items = Vec::new();
         let active_pages: Vec<_> = self.pages.iter().filter(|p| !p.archived).collect();
         let trashed_pages: Vec<_> = self.pages.iter().filter(|p| p.archived).collect();
@@ -125,7 +217,7 @@ impl AppState {
             }
         }
 
-        let mut children_by_parent: HashMap<String, Vec<&NotionPageSummary>> = HashMap::new();
+        let mut children_by_parent: HashMap<&str, Vec<&NotionPageSummary>> = HashMap::new();
         let mut roots = Vec::new();
         for p in &active_pages {
             // Never dump database rows as top-level WORKSPACE pages (even if DB wasn't synced yet).
@@ -134,10 +226,7 @@ impl AppState {
             }
             if !cycle_nodes.contains(p.id.as_str()) {
                 if let Some(&pid) = effective_parent.get(p.id.as_str()) {
-                    children_by_parent
-                        .entry(pid.to_string())
-                        .or_default()
-                        .push(p);
+                    children_by_parent.entry(pid).or_default().push(p);
                     continue;
                 }
             }
@@ -150,42 +239,36 @@ impl AppState {
         };
 
         for kids in children_by_parent.values_mut() {
-            kids.sort_by(|a, b| {
-                let pos_a = self
+            kids.sort_by_cached_key(|p| {
+                let p = *p;
+                let pos = self
                     .child_page_positions
-                    .get(&a.id)
+                    .get(&p.id)
                     .copied()
                     .unwrap_or(i64::MAX);
-                let pos_b = self
-                    .child_page_positions
-                    .get(&b.id)
-                    .copied()
-                    .unwrap_or(i64::MAX);
-                pos_a
-                    .cmp(&pos_b)
-                    .then_with(|| is_untitled(a).cmp(&is_untitled(b)))
-                    .then_with(|| {
-                        natural_sort_key(a.display_title())
-                            .cmp(&natural_sort_key(b.display_title()))
-                    })
-                    .then_with(|| a.id.cmp(&b.id))
+                (
+                    pos,
+                    is_untitled(p),
+                    natural_sort_key(p.display_title()),
+                    p.id.as_str(),
+                )
             });
         }
 
-        roots.sort_by(|a, b| {
-            is_untitled(a)
-                .cmp(&is_untitled(b))
-                .then_with(|| b.is_favorite.cmp(&a.is_favorite))
-                .then_with(|| {
-                    natural_sort_key(a.display_title()).cmp(&natural_sort_key(b.display_title()))
-                })
-                .then_with(|| a.id.cmp(&b.id))
+        roots.sort_by_cached_key(|p| {
+            let p = *p;
+            (
+                is_untitled(p),
+                !p.is_favorite,
+                natural_sort_key(p.display_title()),
+                p.id.as_str(),
+            )
         });
 
         fn push_tree<'a>(
             node: &'a NotionPageSummary,
             depth: usize,
-            children_map: &HashMap<String, Vec<&'a NotionPageSummary>>,
+            children_map: &HashMap<&'a str, Vec<&'a NotionPageSummary>>,
             collapsed: &HashSet<String>,
             visited: &mut HashSet<&'a str>,
             out: &mut Vec<SidebarItem>,
@@ -194,7 +277,7 @@ impl AppState {
                 return;
             }
             let has_kids = children_map
-                .get(&node.id)
+                .get(node.id.as_str())
                 .is_some_and(|kids| !kids.is_empty());
             // Past the recursion cap the children cannot be listed, so show the node collapsed.
             let is_collapsed = collapsed.contains(&node.id) || depth >= SIDEBAR_MAX_TREE_DEPTH;
@@ -211,7 +294,7 @@ impl AppState {
                 archived: false,
             });
             if has_kids && !is_collapsed {
-                if let Some(kids) = children_map.get(&node.id) {
+                if let Some(kids) = children_map.get(node.id.as_str()) {
                     for kid in kids {
                         push_tree(kid, depth + 1, children_map, collapsed, visited, out);
                     }
@@ -309,10 +392,10 @@ impl AppState {
         out
     }
 
-    /// Returns filtered & sorted rows for the active Database.
-    pub fn filtered_sorted_db_rows(&self, ui: &UiState) -> Vec<NotionPage> {
+    /// Returns borrowed filtered & sorted rows for the active Database without cloning every `NotionPage`.
+    pub fn filtered_sorted_db_row_refs(&self, ui: &UiState) -> Vec<&NotionPage> {
         let q = ui.db_filter.trim().to_ascii_lowercase();
-        let mut rows: Vec<NotionPage> = self
+        let mut rows: Vec<&NotionPage> = self
             .active_database_rows
             .iter()
             .filter(|r| !r.archived)
@@ -320,36 +403,50 @@ impl AppState {
                 if q.is_empty() {
                     true
                 } else {
-                    r.title.to_ascii_lowercase().contains(&q)
-                        || r.properties_summary().to_ascii_lowercase().contains(&q)
+                    ascii_contains_ignore_case(&r.title, &q)
+                        || ascii_contains_ignore_case(&r.properties_summary(), &q)
                 }
             })
-            .cloned()
             .collect();
 
         match ui.db_sort {
-            DatabaseSortMode::LastEditedDesc => rows.sort_by(|a, b| b.last_edited_time.cmp(&a.last_edited_time)),
-            DatabaseSortMode::LastEditedAsc => rows.sort_by(|a, b| a.last_edited_time.cmp(&b.last_edited_time)),
-            DatabaseSortMode::TitleAsc => rows.sort_by_key(|a| a.title.to_ascii_lowercase()),
+            DatabaseSortMode::LastEditedDesc => {
+                rows.sort_by(|a, b| b.last_edited_time.cmp(&a.last_edited_time));
+            }
+            DatabaseSortMode::LastEditedAsc => {
+                rows.sort_by(|a, b| a.last_edited_time.cmp(&b.last_edited_time));
+            }
+            DatabaseSortMode::TitleAsc => {
+                rows.sort_by_cached_key(|a| a.title.to_ascii_lowercase());
+            }
             DatabaseSortMode::TitleDesc => {
-                rows.sort_by_key(|a| std::cmp::Reverse(a.title.to_ascii_lowercase()));
+                rows.sort_by_cached_key(|a| std::cmp::Reverse(a.title.to_ascii_lowercase()));
             }
             DatabaseSortMode::StatusAsc => {
                 let status_key = |p: &NotionPage| -> String {
                     p.properties
                         .values()
                         .find_map(|v| match v {
-                            NotionPropertyValue::Status(Some(o)) | NotionPropertyValue::Select(Some(o)) => {
+                            NotionPropertyValue::Status(Some(o))
+                            | NotionPropertyValue::Select(Some(o)) => {
                                 Some(o.name.to_ascii_lowercase())
                             }
                             _ => None,
                         })
                         .unwrap_or_else(|| "zzz".to_string())
                 };
-                rows.sort_by_key(|a| status_key(a));
+                rows.sort_by_cached_key(|a| status_key(a));
             }
         }
         rows
+    }
+
+    /// Returns filtered & sorted rows for the active Database.
+    pub fn filtered_sorted_db_rows(&self, ui: &UiState) -> Vec<NotionPage> {
+        self.filtered_sorted_db_row_refs(ui)
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     /// Groups active Database rows into Kanban columns by `status` (or first `select`) property.

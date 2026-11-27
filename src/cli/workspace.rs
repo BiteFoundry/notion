@@ -399,13 +399,27 @@ pub async fn op_search(
         let resp = client
             .search_all(Some(query), SearchFilterObject::All, limit)
             .await?;
-        let _ = storage.upsert_pages(&resp.pages);
-        let _ = storage.upsert_databases(&resp.databases);
+        let pages_to_save = resp.pages.clone();
+        let dbs_to_save = resp.databases.clone();
+        let _ = storage
+            .blocking(move |st| {
+                let _ = st.upsert_pages(&pages_to_save);
+                let _ = st.upsert_databases(&dbs_to_save);
+                Ok(())
+            })
+            .await;
         return Ok(search_hits_from_response(resp, limit));
     }
 
-    let local = storage.search_local(&ws_id, query, limit)?;
-    let complete = sync::workspace_cache_complete(storage, &ws_id);
+    let ws_local = ws_id.clone();
+    let q_local = query.to_string();
+    let (local, complete) = storage
+        .blocking(move |st| {
+            let local = st.search_local(&ws_local, &q_local, limit)?;
+            let complete = sync::workspace_cache_complete(st, &ws_local);
+            Ok((local, complete))
+        })
+        .await?;
     if offline || (!local.is_empty() && complete) {
         return Ok(local);
     }
@@ -413,9 +427,17 @@ pub async fn op_search(
     let resp = client
         .search_all(Some(query), SearchFilterObject::All, limit)
         .await?;
-    let _ = storage.upsert_pages(&resp.pages);
-    let _ = storage.upsert_databases(&resp.databases);
-    let refreshed = storage.search_local(&ws_id, query, limit)?;
+    let pages_to_save = resp.pages.clone();
+    let dbs_to_save = resp.databases.clone();
+    let ws_ref = ws_id.clone();
+    let q_ref = query.to_string();
+    let refreshed = storage
+        .blocking(move |st| {
+            let _ = st.upsert_pages(&pages_to_save);
+            let _ = st.upsert_databases(&dbs_to_save);
+            st.search_local(&ws_ref, &q_ref, limit)
+        })
+        .await?;
     if !refreshed.is_empty() {
         return Ok(refreshed);
     }
@@ -435,7 +457,12 @@ pub async fn op_list_comments(
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id(storage, (!offline).then_some(client), &ws_id, page).await?;
     if offline {
-        return match storage.load_cached_comments(&ws_id, &id)? {
+        let ws_c = ws_id.clone();
+        let id_c = id.clone();
+        let cached = storage
+            .blocking(move |st| st.load_cached_comments(&ws_c, &id_c))
+            .await?;
+        return match cached {
             CachedComments::NotFetched => Err(coded(
                 "not_cached",
                 format!("Comments of '{page}' not found in offline cache (not fetched)"),
@@ -460,7 +487,12 @@ pub async fn op_list_comments(
     }
     let (comments, has_more, next_cursor) = client.list_comments_page(&id, limit, cursor).await?;
     if cursor.is_none() && !has_more {
-        let _ = storage.replace_page_comments(&ws_id, &id, &comments, true);
+        let ws_c = ws_id.clone();
+        let id_c = id.clone();
+        let comments_c = comments.clone();
+        let _ = storage
+            .blocking(move |st| st.replace_page_comments(&ws_c, &id_c, &comments_c, true))
+            .await;
     }
     Ok(ListPage {
         items: comments,
@@ -480,7 +512,12 @@ pub async fn op_add_comment(
     let ws_id = client.auth().active_workspace_id().await;
     let id = resolver::resolve_page_id_for_write(storage, client, &ws_id, page, false).await?;
     let comment = client.add_comment(Some(&id), discussion_id, text).await?;
-    let _ = storage.append_cached_comment(&ws_id, &id, &comment);
+    let ws_c = ws_id.clone();
+    let id_c = id.clone();
+    let comment_c = comment.clone();
+    let _ = storage
+        .blocking(move |st| st.append_cached_comment(&ws_c, &id_c, &comment_c))
+        .await;
     Ok(comment)
 }
 

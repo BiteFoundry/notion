@@ -49,7 +49,7 @@ fn cacheable_synced_edited_time(last_edited_time: Option<&str>) -> Option<&str> 
 impl Storage {
     pub fn upsert_workspace(&self, profile: &WorkspaceProfile) -> Result<()> {
         let conn = self.writer();
-        conn.execute(
+        let mut stmt = conn.prepare_cached(
             "INSERT INTO workspaces (id, name, icon, bot_id, bot_name, auth_mode, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
@@ -59,16 +59,16 @@ impl Storage {
                 bot_name = excluded.bot_name,
                 auth_mode = excluded.auth_mode,
                 updated_at = excluded.updated_at",
-            params![
-                profile.effective_workspace_id(),
-                profile.display_name(),
-                profile.workspace_icon,
-                profile.bot_id,
-                profile.bot_name,
-                profile.auth_mode,
-                chrono::Utc::now().to_rfc3339(),
-            ],
         )?;
+        stmt.execute(params![
+            profile.effective_workspace_id(),
+            profile.display_name(),
+            profile.workspace_icon,
+            profile.bot_id,
+            profile.bot_name,
+            profile.auth_mode,
+            chrono::Utc::now().to_rfc3339(),
+        ])?;
         Ok(())
     }
 
@@ -143,10 +143,10 @@ impl Storage {
         let tx = conn.transaction()?;
         replace_page_comments_in_tx(&tx, workspace_id, page_id, comments)?;
         let fetched: i64 = if complete { 1 } else { 2 };
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE pages SET comments_error = NULL, comments_fetched = ?1 WHERE workspace_id = ?2 AND id = ?3",
-            params![fetched, workspace_id, page_id],
-        )?;
+        )?
+        .execute(params![fetched, workspace_id, page_id])?;
         tx.commit()?;
         Ok(())
     }
@@ -164,36 +164,35 @@ impl Storage {
         let mut conn = self.writer();
         let tx = conn.transaction()?;
         let row: Option<(i64, Option<String>)> = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT comments_fetched, comments_error FROM pages WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, page_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            )?
+            .query_row(params![workspace_id, page_id], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
         if matches!(row, Some((1, None))) {
             let rt_json = serde_json::to_string(&comment.rich_text).unwrap_or_else(|_| "[]".into());
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT OR REPLACE INTO comments
                  (id, workspace_id, page_id, discussion_id, author, body, rich_text_json, created_time)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    comment.id,
-                    workspace_id,
-                    page_id,
-                    comment.discussion_id,
-                    comment.author,
-                    comment.body,
-                    rt_json,
-                    comment.created_time
-                ],
-            )?;
+            )?
+            .execute(params![
+                comment.id,
+                workspace_id,
+                page_id,
+                comment.discussion_id,
+                comment.author,
+                comment.body,
+                rt_json,
+                comment.created_time
+            ])?;
             tx.commit()?;
             return Ok(true);
         }
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE pages SET detail_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
-            params![workspace_id, page_id],
-        )?;
+        )?
+        .execute(params![workspace_id, page_id])?;
         tx.commit()?;
         Ok(false)
     }
@@ -211,22 +210,22 @@ impl Storage {
         let mut conn = self.writer();
         let tx = conn.transaction()?;
         if let Some((owner_id, has_children)) = cached_child_parent(&tx, workspace_id, parent_id)? {
-            let fetched: bool = tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM block_children_fetched WHERE workspace_id = ?1 AND parent_id = ?2)",
-                params![workspace_id, parent_id],
-                |r| r.get(0),
-            )?;
-            let has_rows: bool = tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM blocks WHERE workspace_id = ?1 AND parent_block_id = ?2)",
-                params![workspace_id, parent_id],
-                |r| r.get(0),
-            )?;
+            let fetched: bool = tx
+                .prepare_cached(
+                    "SELECT EXISTS (SELECT 1 FROM block_children_fetched WHERE workspace_id = ?1 AND parent_id = ?2)",
+                )?
+                .query_row(params![workspace_id, parent_id], |r| r.get(0))?;
+            let has_rows: bool = tx
+                .prepare_cached(
+                    "SELECT EXISTS (SELECT 1 FROM blocks WHERE workspace_id = ?1 AND parent_block_id = ?2)",
+                )?
+                .query_row(params![workspace_id, parent_id], |r| r.get(0))?;
             if !has_children || fetched || has_rows {
-                let max_pos: i64 = tx.query_row(
-                    "SELECT COALESCE(MAX(position), -1) FROM blocks WHERE workspace_id = ?1 AND page_id = ?2",
-                    params![workspace_id, owner_id],
-                    |r| r.get(0),
-                )?;
+                let max_pos: i64 = tx
+                    .prepare_cached(
+                        "SELECT COALESCE(MAX(position), -1) FROM blocks WHERE workspace_id = ?1 AND page_id = ?2",
+                    )?
+                    .query_row(params![workspace_id, owner_id], |r| r.get(0))?;
                 let mut pos = max_pos + 1;
                 insert_blocks_recursive(
                     &tx,
@@ -237,65 +236,65 @@ impl Storage {
                     &mut pos,
                 )?;
                 if !appended.is_empty() {
-                    tx.execute(
+                    tx.prepare_cached(
                         "UPDATE blocks SET has_children = 1, content_json = json_set(content_json, '$.has_children', json('true'))
                          WHERE workspace_id = ?1 AND id = ?2",
-                        params![workspace_id, parent_id],
-                    )?;
+                    )?
+                    .execute(params![workspace_id, parent_id])?;
                 }
                 mark_children_fetched(&tx, workspace_id, parent_id)?;
-                tx.execute(
+                tx.prepare_cached(
                     "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL
                      WHERE workspace_id = ?1 AND id = ?2",
-                    params![workspace_id, owner_id],
-                )?;
+                )?
+                .execute(params![workspace_id, owner_id])?;
                 recompute_page_plain_text_in_tx(&tx, workspace_id, &owner_id)?;
                 tx.commit()?;
                 return Ok(true);
             }
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL
                  WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, owner_id],
-            )?;
+            )?
+            .execute(params![workspace_id, owner_id])?;
             tx.commit()?;
             return Ok(false);
         }
 
-        let fetched: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM block_children_fetched WHERE workspace_id = ?1 AND parent_id = ?2)",
-            params![workspace_id, parent_id],
-            |r| r.get(0),
-        )?;
-        let has_rows: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM blocks WHERE workspace_id = ?1 AND page_id = ?2)",
-            params![workspace_id, parent_id],
-            |r| r.get(0),
-        )?;
+        let fetched: bool = tx
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM block_children_fetched WHERE workspace_id = ?1 AND parent_id = ?2)",
+            )?
+            .query_row(params![workspace_id, parent_id], |r| r.get(0))?;
+        let has_rows: bool = tx
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM blocks WHERE workspace_id = ?1 AND page_id = ?2)",
+            )?
+            .query_row(params![workspace_id, parent_id], |r| r.get(0))?;
         if fetched || has_rows {
-            let max_pos: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(position), -1) FROM blocks WHERE workspace_id = ?1 AND page_id = ?2",
-                params![workspace_id, parent_id],
-                |r| r.get(0),
-            )?;
+            let max_pos: i64 = tx
+                .prepare_cached(
+                    "SELECT COALESCE(MAX(position), -1) FROM blocks WHERE workspace_id = ?1 AND page_id = ?2",
+                )?
+                .query_row(params![workspace_id, parent_id], |r| r.get(0))?;
             let mut pos = max_pos + 1;
             insert_blocks_recursive(&tx, workspace_id, parent_id, None, appended, &mut pos)?;
             mark_children_fetched(&tx, workspace_id, parent_id)?;
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL
                  WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, parent_id],
-            )?;
+            )?
+            .execute(params![workspace_id, parent_id])?;
             recompute_page_plain_text_in_tx(&tx, workspace_id, parent_id)?;
             tx.commit()?;
             return Ok(true);
         }
 
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL
              WHERE workspace_id = ?1 AND id = ?2",
-            params![workspace_id, parent_id],
-        )?;
+        )?
+        .execute(params![workspace_id, parent_id])?;
         tx.commit()?;
         Ok(false)
     }
@@ -315,10 +314,10 @@ impl Storage {
         upsert_page_in_tx(&tx, page)?;
         replace_page_blocks_in_tx(&tx, &page.workspace_id, &page.id, blocks)?;
         let body_synced = cacheable_synced_edited_time(page.last_edited_time.as_deref());
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE pages SET body_synced_edited_time = ?1 WHERE workspace_id = ?2 AND id = ?3",
-            params![body_synced, page.workspace_id, page.id],
-        )?;
+        )?
+        .execute(params![body_synced, page.workspace_id, page.id])?;
         tx.commit()?;
         Ok(())
     }
@@ -331,11 +330,10 @@ impl Storage {
     ) -> Result<Option<String>> {
         let conn = self.reader();
         let ts: Option<String> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT body_synced_edited_time FROM pages WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, page_id],
-                |r| r.get::<_, Option<String>>(0),
-            )
+            )?
+            .query_row(params![workspace_id, page_id], |r| r.get::<_, Option<String>>(0))
             .optional()?
             .flatten()
             .filter(|s| !s.trim().is_empty());
@@ -350,14 +348,13 @@ impl Storage {
     ) -> Result<CommentsSummary> {
         let conn = self.reader();
         let row: Option<(i64, Option<String>, i64)> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT comments_fetched, comments_error,
                         (SELECT COUNT(*) FROM comments
                          WHERE workspace_id = ?1 AND page_id = ?2)
                  FROM pages WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, page_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+            )?
+            .query_row(params![workspace_id, page_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
         Ok(match row {
             None => CommentsSummary {
@@ -401,10 +398,12 @@ impl Storage {
             conn.transaction()?
         };
         if check_current && page_detail_matches(&tx, detail)? {
-            tx.execute(
-                "UPDATE pages SET synced_at = ?1 WHERE workspace_id = ?2 AND id = ?3",
-                params![chrono::Utc::now().to_rfc3339(), detail.page.workspace_id, detail.page.id],
-            )?;
+            tx.prepare_cached("UPDATE pages SET synced_at = ?1 WHERE workspace_id = ?2 AND id = ?3")?
+                .execute(params![
+                    chrono::Utc::now().to_rfc3339(),
+                    detail.page.workspace_id,
+                    detail.page.id
+                ])?;
             tx.commit()?;
             return Ok(false);
         }
@@ -428,21 +427,30 @@ impl Storage {
                 } else {
                     1
                 };
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE pages SET comments_fetched = ?1 WHERE workspace_id = ?2 AND id = ?3",
-                params![comments_fetched, detail.page.workspace_id, detail.page.id],
-            )?;
+            )?
+            .execute(params![
+                comments_fetched,
+                detail.page.workspace_id,
+                detail.page.id
+            ])?;
         }
         let synced_edited = if detail.comments_error.is_none() {
             cacheable_synced_edited_time(detail.page.last_edited_time.as_deref())
         } else {
             None
         };
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE pages SET detail_synced_edited_time = ?1, comments_error = ?2
              WHERE workspace_id = ?3 AND id = ?4",
-            params![synced_edited, detail.comments_error, detail.page.workspace_id, detail.page.id],
-        )?;
+        )?
+        .execute(params![
+            synced_edited,
+            detail.comments_error,
+            detail.page.workspace_id,
+            detail.page.id
+        ])?;
         tx.commit()?;
         Ok(true)
     }
@@ -462,10 +470,10 @@ impl Storage {
     /// blocks & comments, while preserving cached blocks for offline reads.
     pub fn invalidate_page_detail(&self, workspace_id: &str, page_id: &str) -> Result<()> {
         let conn = self.writer();
-        conn.execute(
+        conn.prepare_cached(
             "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
-            params![workspace_id, page_id],
-        )?;
+        )?
+        .execute(params![workspace_id, page_id])?;
         Ok(())
     }
 
@@ -483,11 +491,12 @@ impl Storage {
         let tx = conn.transaction()?;
 
         let existing: Option<(String, Option<String>, i64)> = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT page_id, parent_block_id, has_children FROM blocks WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, block.id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+            )?
+            .query_row(params![workspace_id, block.id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .optional()?;
 
         if let Some((page_id, parent_block_id, existing_has_children)) = existing {
@@ -506,27 +515,27 @@ impl Storage {
             let plain = flat.plain_text();
             let has_children_i = i64::from(block.has_children || existing_has_children != 0);
 
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE blocks
                  SET block_type = ?1, content_json = ?2, plain_text = ?3, has_children = ?4
                  WHERE workspace_id = ?5 AND id = ?6",
-                params![
-                    block.block_type,
-                    content_json,
-                    plain,
-                    has_children_i,
-                    workspace_id,
-                    block.id,
-                ],
-            )?;
+            )?
+            .execute(params![
+                block.block_type,
+                content_json,
+                plain,
+                has_children_i,
+                workspace_id,
+                block.id,
+            ])?;
             recompute_page_plain_text_in_tx(&tx, workspace_id, &page_id)?;
 
             let needs_refetch = block.has_children && existing_has_children == 0;
             if needs_refetch {
-                tx.execute(
+                tx.prepare_cached(
                     "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
-                    params![workspace_id, page_id],
-                )?;
+                )?
+                .execute(params![workspace_id, page_id])?;
             }
             tx.commit()?;
             return Ok(Some((page_id, needs_refetch)));
@@ -534,10 +543,10 @@ impl Storage {
 
         // Block is not cached yet; invalidate owning page detail if known so next read refetches.
         if !block.page_id.trim().is_empty() {
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, block.page_id],
-            )?;
+            )?
+            .execute(params![workspace_id, block.page_id])?;
             tx.commit()?;
             return Ok(Some((block.page_id.clone(), true)));
         }
@@ -552,11 +561,8 @@ impl Storage {
         let mut conn = self.writer();
         let tx = conn.transaction()?;
         let page_id: Option<String> = tx
-            .query_row(
-                "SELECT page_id FROM blocks WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, block_id],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT page_id FROM blocks WHERE workspace_id = ?1 AND id = ?2")?
+            .query_row(params![workspace_id, block_id], |r| r.get(0))
             .optional()?;
 
         if let Some(pid) = page_id {
@@ -575,14 +581,15 @@ impl Storage {
     pub fn mark_page_archived(&self, workspace_id: &str, page_id: &str) -> Result<()> {
         let mut conn = self.writer();
         let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE pages SET archived = 1 WHERE workspace_id = ?1 AND id = ?2",
-            params![workspace_id, page_id],
-        )?;
-        tx.execute(
-            "DELETE FROM pages_fts WHERE workspace_id = ?1 AND page_id = ?2",
-            params![workspace_id, page_id],
-        )?;
+        let rowid: Option<i64> = tx
+            .prepare_cached(
+                "UPDATE pages SET archived = 1 WHERE workspace_id = ?1 AND id = ?2 RETURNING rowid",
+            )?
+            .query_row(params![workspace_id, page_id], |r| r.get(0))
+            .optional()?;
+        if let Some(rid) = rowid {
+            delete_fts_rowid(&tx, page_fts_rowid(rid))?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -592,14 +599,15 @@ impl Storage {
     pub fn mark_database_archived(&self, workspace_id: &str, database_id: &str) -> Result<()> {
         let mut conn = self.writer();
         let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE databases SET archived = 1 WHERE workspace_id = ?1 AND id = ?2",
-            params![workspace_id, database_id],
-        )?;
-        tx.execute(
-            "DELETE FROM pages_fts WHERE workspace_id = ?1 AND page_id = ?2",
-            params![workspace_id, database_id],
-        )?;
+        let rowid: Option<i64> = tx
+            .prepare_cached(
+                "UPDATE databases SET archived = 1 WHERE workspace_id = ?1 AND id = ?2 RETURNING rowid",
+            )?
+            .query_row(params![workspace_id, database_id], |r| r.get(0))
+            .optional()?;
+        if let Some(rid) = rowid {
+            delete_fts_rowid(&tx, database_fts_rowid(rid))?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -615,29 +623,27 @@ impl Storage {
         let mut conn = self.writer();
         let tx = conn.transaction()?;
 
-        let cached_rows: Vec<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM pages
+        let cached_rows: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT rowid, id FROM pages
                  WHERE workspace_id = ?1 AND parent_type = 'database_id' AND parent_id = ?2 AND archived = 0",
             )?;
             let ids = stmt
-                .query_map(params![workspace_id, database_id], |r| r.get(0))?
+                .query_map(params![workspace_id, database_id], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .filter_map(|r| r.ok())
                 .collect();
             ids
         };
         let mut archived_rows = 0usize;
-        for rid in cached_rows {
-            if !active_row_ids.contains(&rid) {
-                tx.execute(
-                    "UPDATE pages SET archived = 1 WHERE workspace_id = ?1 AND id = ?2",
-                    params![workspace_id, rid],
-                )?;
-                tx.execute(
-                    "DELETE FROM pages_fts WHERE workspace_id = ?1 AND page_id = ?2",
-                    params![workspace_id, rid],
-                )?;
-                archived_rows += 1;
+        {
+            let mut archive_stmt = tx.prepare_cached("UPDATE pages SET archived = 1 WHERE rowid = ?1")?;
+            let mut fts_del_stmt = tx.prepare_cached("DELETE FROM pages_fts WHERE rowid = ?1")?;
+            for (page_rowid, rid) in cached_rows {
+                if !active_row_ids.contains(&rid) {
+                    archive_stmt.execute(params![page_rowid])?;
+                    fts_del_stmt.execute(params![page_fts_rowid(page_rowid)])?;
+                    archived_rows += 1;
+                }
             }
         }
 
@@ -648,36 +654,34 @@ impl Storage {
     pub fn toggle_page_favorite(&self, workspace_id: &str, page_id: &str) -> Result<bool> {
         let conn = self.writer();
         let current: bool = conn
-            .query_row(
-                "SELECT is_favorite FROM pages WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, page_id],
-                |r| Ok(r.get::<_, i64>(0)? != 0),
-            )
+            .prepare_cached("SELECT is_favorite FROM pages WHERE workspace_id = ?1 AND id = ?2")?
+            .query_row(params![workspace_id, page_id], |r| Ok(r.get::<_, i64>(0)? != 0))
             .optional()?
             .unwrap_or(false);
         let next = !current;
-        conn.execute(
+        conn.prepare_cached(
             "UPDATE pages SET is_favorite = ?1 WHERE workspace_id = ?2 AND id = ?3",
-            params![i64::from(next), workspace_id, page_id],
-        )?;
+        )?
+        .execute(params![i64::from(next), workspace_id, page_id])?;
         Ok(next)
     }
 
     pub fn toggle_database_favorite(&self, workspace_id: &str, database_id: &str) -> Result<bool> {
         let conn = self.writer();
         let current: bool = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT is_favorite FROM databases WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, database_id],
-                |r| Ok(r.get::<_, i64>(0)? != 0),
-            )
+            )?
+            .query_row(params![workspace_id, database_id], |r| {
+                Ok(r.get::<_, i64>(0)? != 0)
+            })
             .optional()?
             .unwrap_or(false);
         let next = !current;
-        conn.execute(
+        conn.prepare_cached(
             "UPDATE databases SET is_favorite = ?1 WHERE workspace_id = ?2 AND id = ?3",
-            params![i64::from(next), workspace_id, database_id],
-        )?;
+        )?
+        .execute(params![i64::from(next), workspace_id, database_id])?;
         Ok(next)
     }
 
@@ -696,7 +700,7 @@ impl Storage {
              FROM pages WHERE workspace_id = ?1 AND archived = 0
              ORDER BY is_favorite DESC, last_edited_time DESC, title ASC"
         };
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
         let rows = stmt.query_map(params![workspace_id], map_page_row)?;
         let mut out = Vec::new();
         for row in rows {
@@ -707,7 +711,7 @@ impl Storage {
 
     pub(crate) fn list_page_summaries(&self, workspace_id: &str) -> Result<Vec<NotionPageSummary>> {
         let conn = self.reader();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, workspace_id, parent_type, parent_id, title, icon, url,
                     archived, is_favorite, properties_summary, last_edited_time
              FROM pages WHERE workspace_id = ?1
@@ -733,7 +737,7 @@ impl Storage {
 
     pub fn list_database_rows(&self, workspace_id: &str, database_id: &str) -> Result<Vec<NotionPage>> {
         let conn = self.reader();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, workspace_id, parent_type, parent_id, title, icon, cover_url, url,
                     archived, is_favorite, properties_json, plain_text, created_time, last_edited_time, synced_at,
                     created_by, last_edited_by
@@ -756,7 +760,7 @@ impl Storage {
 
     pub fn list_databases(&self, workspace_id: &str) -> Result<Vec<NotionDatabase>> {
         let conn = self.reader();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, workspace_id, parent_type, parent_id, title, icon, description, schema_json,
                     url, archived, is_favorite, last_edited_time, synced_at
              FROM databases WHERE workspace_id = ?1 AND archived = 0
@@ -772,15 +776,16 @@ impl Storage {
 
     pub fn get_database(&self, workspace_id: &str, database_id: &str) -> Result<Option<NotionDatabase>> {
         let conn = self.reader();
-        conn.query_row(
-            "SELECT id, workspace_id, parent_type, parent_id, title, icon, description, schema_json,
-                    url, archived, is_favorite, last_edited_time, synced_at
-             FROM databases WHERE workspace_id = ?1 AND id = ?2",
-            params![workspace_id, database_id],
-            map_database_row,
-        )
-        .optional()
-        .map_err(Into::into)
+        let res = conn
+            .prepare_cached(
+                "SELECT id, workspace_id, parent_type, parent_id, title, icon, description, schema_json,
+                        url, archived, is_favorite, last_edited_time, synced_at
+                 FROM databases WHERE workspace_id = ?1 AND id = ?2",
+            )?
+            .query_row(params![workspace_id, database_id], map_database_row)
+            .optional()
+            .map_err(Into::into);
+        res
     }
 
     pub fn load_page_blocks(&self, workspace_id: &str, page_id: &str) -> Result<Vec<NotionBlock>> {
@@ -790,15 +795,11 @@ impl Storage {
 
     pub(crate) fn has_cached_block(&self, workspace_id: &str, block_id: &str) -> bool {
         let conn = self.reader();
-        conn.query_row(
-            "SELECT 1 FROM blocks WHERE workspace_id = ?1 AND id = ?2 LIMIT 1",
-            params![workspace_id, block_id],
-            |_| Ok(()),
-        )
-        .optional()
-        .ok()
-        .flatten()
-        .is_some()
+        conn.prepare_cached("SELECT 1 FROM blocks WHERE workspace_id = ?1 AND id = ?2 LIMIT 1")
+            .and_then(|mut stmt| stmt.query_row(params![workspace_id, block_id], |_| Ok(())).optional())
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     pub(crate) fn load_cached_children(
@@ -820,12 +821,12 @@ impl Storage {
         if known_empty || !blocks.is_empty() {
             return Ok(Some(blocks));
         }
-        let fetched = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM block_children_fetched
-             WHERE workspace_id = ?1 AND parent_id = ?2)",
-            params![workspace_id, parent_id],
-            |row| row.get::<_, bool>(0),
-        )?;
+        let fetched = tx
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM block_children_fetched
+                 WHERE workspace_id = ?1 AND parent_id = ?2)",
+            )?
+            .query_row(params![workspace_id, parent_id], |row| row.get::<_, bool>(0))?;
         Ok(fetched.then_some(blocks))
     }
 
@@ -845,11 +846,10 @@ impl Storage {
     ) -> Result<CachedComments> {
         let conn = self.reader();
         let row: Option<(i64, Option<String>)> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT comments_fetched, comments_error FROM pages WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, page_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            )?
+            .query_row(params![workspace_id, page_id], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
         match row {
             None => Ok(CachedComments::NotFetched),
@@ -872,11 +872,10 @@ impl Storage {
     pub(crate) fn comments_partial(&self, workspace_id: &str, page_id: &str) -> Result<bool> {
         let conn = self.reader();
         let fetched: Option<i64> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT comments_fetched FROM pages WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, page_id],
-                |r| r.get(0),
-            )
+            )?
+            .query_row(params![workspace_id, page_id], |r| r.get(0))
             .optional()?;
         Ok(fetched == Some(2))
     }
@@ -886,16 +885,17 @@ impl Storage {
         workspace_id: &str,
         page_id: &str,
     ) -> Result<Option<NotionPageDetail>> {
-        let Some(page) = self.get_page(workspace_id, page_id)? else {
+        let conn = self.reader();
+        let Some(page) = get_page(&conn, workspace_id, page_id)? else {
             return Ok(None);
         };
-        let blocks = self.load_page_blocks(workspace_id, page_id)?;
-        let comments = self.load_page_comments(workspace_id, page_id)?;
-        let comments_error = self.reader().query_row(
-            "SELECT comments_error FROM pages WHERE workspace_id = ?1 AND id = ?2",
-            params![workspace_id, page_id],
-            |row| row.get(0),
-        ).optional()?.flatten();
+        let blocks = load_page_blocks(&conn, workspace_id, page_id)?;
+        let comments = load_page_comments(&conn, workspace_id, page_id)?;
+        let comments_error = conn
+            .prepare_cached("SELECT comments_error FROM pages WHERE workspace_id = ?1 AND id = ?2")?
+            .query_row(params![workspace_id, page_id], |row| row.get(0))
+            .optional()?
+            .flatten();
         let markdown = blocks_to_markdown(&blocks);
         let media = collect_media_refs(&blocks);
         Ok(Some(NotionPageDetail {
@@ -932,28 +932,41 @@ impl Storage {
         let mut hits = Vec::new();
         if !use_like_only {
             let fts_query = build_fts_query(trimmed);
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT f.page_id, f.workspace_id, f.item_type, f.title,
-                        snippet(pages_fts, 4, '[', ']', '...', 18) AS snip
-                 FROM pages_fts f
-                 WHERE f.workspace_id = ?1 AND pages_fts MATCH ?2
+            if let Ok(mut stmt) = conn.prepare_cached(
+                "SELECT pages_fts.page_id, pages_fts.workspace_id, pages_fts.item_type, pages_fts.title,
+                        snippet(pages_fts, 4, '[', ']', '...', 18) AS snip,
+                        CASE WHEN pages_fts.item_type = 'database' THEN d.icon ELSE p.icon END,
+                        CASE WHEN pages_fts.item_type = 'database' THEN d.url ELSE p.url END,
+                        CASE WHEN pages_fts.item_type = 'database' THEN d.last_edited_time ELSE p.last_edited_time END
+                 FROM pages_fts
+                 LEFT JOIN pages p
+                   ON pages_fts.item_type != 'database'
+                  AND p.workspace_id = pages_fts.workspace_id
+                  AND p.id = pages_fts.page_id
+                 LEFT JOIN databases d
+                   ON pages_fts.item_type = 'database'
+                  AND d.workspace_id = pages_fts.workspace_id
+                  AND d.id = pages_fts.page_id
+                 WHERE pages_fts.workspace_id = ?1 AND pages_fts MATCH ?2
+                   AND ((pages_fts.item_type = 'database' AND d.id IS NOT NULL)
+                        OR (pages_fts.item_type != 'database' AND p.id IS NOT NULL))
                  ORDER BY bm25(pages_fts)
                  LIMIT ?3",
             ) {
                 if let Ok(rows) = stmt.query_map(params![workspace_id, fts_query, lim], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                    ))
+                    Ok(NotionSearchHit {
+                        id: r.get(0)?,
+                        workspace_id: r.get(1)?,
+                        item_type: r.get(2)?,
+                        title: r.get(3)?,
+                        snippet: r.get::<_, String>(4)?.replace('\n', " "),
+                        icon: r.get(5)?,
+                        url: r.get(6)?,
+                        last_edited_time: r.get(7)?,
+                    })
                 }) {
-                    for row in rows.flatten() {
-                        if let Some(hit) = hydrate_search_hit(&conn, row.0, row.1, row.2, row.3, row.4)
-                        {
-                            hits.push(hit);
-                        }
+                    for hit in rows.flatten() {
+                        hits.push(hit);
                     }
                 }
             }
@@ -962,7 +975,7 @@ impl Storage {
         if hits.is_empty() {
             // Korean <3 char & substring LIKE fallback across both pages and databases
             let like_pat = format!("%{}%", escape_like(trimmed));
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT id, workspace_id, 'page' AS item_type, title, icon, url, last_edited_time,
                         CASE
                             WHEN plain_text != '' THEN substr(plain_text, 1, 140)
@@ -1009,37 +1022,37 @@ impl Storage {
 
     pub fn set_sync_cursor(&self, scope_key: &str, cursor: Option<&str>) -> Result<()> {
         let conn = self.writer();
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO sync_cursors (scope_key, cursor, last_synced_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(scope_key) DO UPDATE SET
                 cursor = excluded.cursor,
                 last_synced_at = excluded.last_synced_at",
-            params![scope_key, cursor, chrono::Utc::now().to_rfc3339()],
-        )?;
+        )?
+        .execute(params![scope_key, cursor, chrono::Utc::now().to_rfc3339()])?;
         Ok(())
     }
 
     pub fn get_sync_cursor(&self, scope_key: &str) -> Option<String> {
         let conn = self.reader();
-        conn.query_row(
-            "SELECT cursor FROM sync_cursors WHERE scope_key = ?1",
-            params![scope_key],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
+        let res = conn
+            .prepare_cached("SELECT cursor FROM sync_cursors WHERE scope_key = ?1")
+            .ok()?
+            .query_row(params![scope_key], |r| r.get::<_, Option<String>>(0))
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty());
+        res
     }
 
     pub fn last_synced_at(&self, scope_key: &str) -> Option<String> {
         let conn = self.reader();
-        conn.query_row(
-            "SELECT last_synced_at FROM sync_cursors WHERE scope_key = ?1",
-            params![scope_key],
-            |r| r.get(0),
-        )
-        .ok()
+        let res = conn
+            .prepare_cached("SELECT last_synced_at FROM sync_cursors WHERE scope_key = ?1")
+            .ok()?
+            .query_row(params![scope_key], |r| r.get(0))
+            .ok();
+        res
     }
 
     /// Persists resolved `block_id -> owner_page_id` mappings (for pages whose `parent_type == "block_id"`).
@@ -1054,18 +1067,20 @@ impl Storage {
         let mut conn = self.writer();
         let tx = conn.transaction()?;
         let now = chrono::Utc::now().to_rfc3339();
-        for (block_id, owner_page_id) in entries {
-            if block_id.trim().is_empty() || owner_page_id.trim().is_empty() {
-                continue;
-            }
-            tx.execute(
+        {
+            let mut stmt = tx.prepare_cached(
                 "INSERT INTO block_owners (workspace_id, block_id, owner_page_id, updated_at)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(workspace_id, block_id) DO UPDATE SET
                     owner_page_id = excluded.owner_page_id,
                     updated_at = excluded.updated_at",
-                params![workspace_id, block_id, owner_page_id, now],
             )?;
+            for (block_id, owner_page_id) in entries {
+                if block_id.trim().is_empty() || owner_page_id.trim().is_empty() {
+                    continue;
+                }
+                stmt.execute(params![workspace_id, block_id, owner_page_id, now])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -1083,7 +1098,7 @@ impl Storage {
         let mut block_owner_pages: HashMap<String, String> = HashMap::new();
         let mut child_page_positions: HashMap<String, i64> = HashMap::new();
 
-        if let Ok(mut stmt) = conn.prepare(
+        if let Ok(mut stmt) = conn.prepare_cached(
             "SELECT block_id, owner_page_id FROM block_owners WHERE workspace_id = ?1",
         ) {
             if let Ok(rows) = stmt.query_map(params![workspace_id], |r| {
@@ -1095,7 +1110,7 @@ impl Storage {
             }
         }
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, page_id, block_type, position
              FROM blocks
              WHERE workspace_id = ?1",
@@ -1120,26 +1135,40 @@ impl Storage {
     }
 }
 
+#[inline]
+fn page_fts_rowid(page_rowid: i64) -> i64 {
+    page_rowid.saturating_mul(2)
+}
+
+#[inline]
+fn database_fts_rowid(db_rowid: i64) -> i64 {
+    db_rowid.saturating_mul(2).saturating_add(1)
+}
+
+fn delete_fts_rowid(tx: &Connection, fts_rowid: i64) -> Result<()> {
+    tx.prepare_cached("DELETE FROM pages_fts WHERE rowid = ?1")?
+        .execute(params![fts_rowid])?;
+    Ok(())
+}
+
 fn get_page(conn: &Connection, workspace_id: &str, page_id: &str) -> Result<Option<NotionPage>> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT id, workspace_id, parent_type, parent_id, title, icon, cover_url, url,
                 archived, is_favorite, properties_json, plain_text, created_time, last_edited_time, synced_at,
                 created_by, last_edited_by
          FROM pages WHERE workspace_id = ?1 AND id = ?2",
-        params![workspace_id, page_id],
-        map_page_row,
-    )
+    )?
+    .query_row(params![workspace_id, page_id], map_page_row)
     .optional()
     .map_err(Into::into)
 }
 
 fn detail_sync_marker(conn: &Connection, workspace_id: &str, page_id: &str) -> Result<Option<String>> {
     let ts: Option<String> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT detail_synced_edited_time FROM pages WHERE workspace_id = ?1 AND id = ?2",
-            params![workspace_id, page_id],
-            |r| r.get::<_, Option<String>>(0),
-        )
+        )?
+        .query_row(params![workspace_id, page_id], |r| r.get::<_, Option<String>>(0))
         .optional()?
         .flatten()
         .filter(|s| !s.trim().is_empty());
@@ -1167,12 +1196,16 @@ fn page_detail_matches(conn: &Connection, detail: &NotionPageDetail) -> Result<b
     if page.archived {
         return Ok(true);
     }
-    Ok(conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM pages_fts
-         WHERE workspace_id = ?1 AND page_id = ?2 AND item_type = 'page')",
-        params![workspace_id, page_id],
-        |row| row.get(0),
-    )?)
+    let page_rowid: Option<i64> = conn
+        .prepare_cached("SELECT rowid FROM pages WHERE workspace_id = ?1 AND id = ?2")?
+        .query_row(params![workspace_id, page_id], |row| row.get(0))
+        .optional()?;
+    let Some(rid) = page_rowid else {
+        return Ok(false);
+    };
+    Ok(conn
+        .prepare_cached("SELECT EXISTS (SELECT 1 FROM pages_fts WHERE rowid = ?1)")?
+        .query_row(params![page_fts_rowid(rid)], |row| row.get(0))?)
 }
 
 fn load_page_blocks(conn: &Connection, workspace_id: &str, page_id: &str) -> Result<Vec<NotionBlock>> {
@@ -1185,7 +1218,7 @@ fn load_blocks_under(
     page_id: &str,
     parent_id: Option<&str>,
 ) -> Result<Vec<NotionBlock>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, parent_block_id, content_json
          FROM blocks
          WHERE workspace_id = ?1 AND page_id = ?2
@@ -1214,14 +1247,15 @@ fn cached_child_parent(
     workspace_id: &str,
     parent_id: &str,
 ) -> Result<Option<(String, bool)>> {
-    Ok(conn.query_row(
-        "SELECT page_id, has_children FROM blocks
-         WHERE workspace_id = ?1 AND id = ?2
-           AND block_type NOT IN ('child_page', 'child_database')
-           AND NOT EXISTS (SELECT 1 FROM pages WHERE workspace_id = ?1 AND id = ?2)",
-        params![workspace_id, parent_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).optional()?)
+    Ok(conn
+        .prepare_cached(
+            "SELECT page_id, has_children FROM blocks
+             WHERE workspace_id = ?1 AND id = ?2
+               AND block_type NOT IN ('child_page', 'child_database')
+               AND NOT EXISTS (SELECT 1 FROM pages WHERE workspace_id = ?1 AND id = ?2)",
+        )?
+        .query_row(params![workspace_id, parent_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?)
 }
 
 fn set_tree_page_id(blocks: &mut [NotionBlock], page_id: &str) {
@@ -1236,7 +1270,7 @@ fn load_page_comments(
     workspace_id: &str,
     page_id: &str,
 ) -> Result<Vec<NotionComment>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, page_id, discussion_id, author, body, rich_text_json, created_time
          FROM comments
          WHERE workspace_id = ?1 AND page_id = ?2
@@ -1268,11 +1302,10 @@ fn upsert_page_in_tx(tx: &Connection, page: &NotionPage) -> Result<()> {
 
     // Preserve local `is_favorite` and non-empty `plain_text` if incoming sync only had page metadata
     let existing: Option<(i64, String)> = tx
-        .query_row(
+        .prepare_cached(
             "SELECT is_favorite, plain_text FROM pages WHERE workspace_id = ?1 AND id = ?2",
-            params![page.workspace_id, page.id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        )?
+        .query_row(params![page.workspace_id, page.id], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     let is_fav = page.is_favorite || existing.as_ref().is_some_and(|(f, _)| *f != 0);
     let effective_plain = if page.plain_text.trim().is_empty() {
@@ -1281,61 +1314,65 @@ fn upsert_page_in_tx(tx: &Connection, page: &NotionPage) -> Result<()> {
         page.plain_text.clone()
     };
 
-    tx.execute(
-        "INSERT INTO pages (
-            id, workspace_id, parent_type, parent_id, title, icon, cover_url, url,
-            archived, is_favorite, properties_json, properties_summary, plain_text,
-            created_time, last_edited_time, created_by, last_edited_by, synced_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
-         ON CONFLICT(workspace_id, id) DO UPDATE SET
-            parent_type = excluded.parent_type,
-            parent_id = excluded.parent_id,
-            title = excluded.title,
-            icon = excluded.icon,
-            cover_url = excluded.cover_url,
-            url = excluded.url,
-            archived = excluded.archived,
-            is_favorite = excluded.is_favorite,
-            properties_json = excluded.properties_json,
-            properties_summary = excluded.properties_summary,
-            plain_text = excluded.plain_text,
-            created_time = COALESCE(excluded.created_time, pages.created_time),
-            last_edited_time = excluded.last_edited_time,
-            created_by = COALESCE(excluded.created_by, pages.created_by),
-            last_edited_by = COALESCE(excluded.last_edited_by, pages.last_edited_by),
-            synced_at = excluded.synced_at",
-        params![
-            page.id,
-            page.workspace_id,
-            page.parent_type,
-            page.parent_id,
-            page.title,
-            page.icon,
-            page.cover_url,
-            page.url,
-            i64::from(page.archived),
-            i64::from(is_fav),
-            props_json,
-            props_summary,
-            effective_plain,
-            page.created_time,
-            page.last_edited_time,
-            page.created_by,
-            page.last_edited_by,
-            page.synced_at
-                .clone()
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-        ],
-    )?;
-
-    if page.archived {
-        tx.execute(
-            "DELETE FROM pages_fts WHERE workspace_id = ?1 AND page_id = ?2",
-            params![page.workspace_id, page.id],
+    let page_rowid: i64 = tx
+        .prepare_cached(
+            "INSERT INTO pages (
+                id, workspace_id, parent_type, parent_id, title, icon, cover_url, url,
+                archived, is_favorite, properties_json, properties_summary, plain_text,
+                created_time, last_edited_time, created_by, last_edited_by, synced_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+             ON CONFLICT(workspace_id, id) DO UPDATE SET
+                parent_type = excluded.parent_type,
+                parent_id = excluded.parent_id,
+                title = excluded.title,
+                icon = excluded.icon,
+                cover_url = excluded.cover_url,
+                url = excluded.url,
+                archived = excluded.archived,
+                is_favorite = excluded.is_favorite,
+                properties_json = excluded.properties_json,
+                properties_summary = excluded.properties_summary,
+                plain_text = excluded.plain_text,
+                created_time = COALESCE(excluded.created_time, pages.created_time),
+                last_edited_time = excluded.last_edited_time,
+                created_by = COALESCE(excluded.created_by, pages.created_by),
+                last_edited_by = COALESCE(excluded.last_edited_by, pages.last_edited_by),
+                synced_at = excluded.synced_at
+             RETURNING rowid",
+        )?
+        .query_row(
+            params![
+                page.id,
+                page.workspace_id,
+                page.parent_type,
+                page.parent_id,
+                page.title,
+                page.icon,
+                page.cover_url,
+                page.url,
+                i64::from(page.archived),
+                i64::from(is_fav),
+                props_json,
+                props_summary,
+                effective_plain,
+                page.created_time,
+                page.last_edited_time,
+                page.created_by,
+                page.last_edited_by,
+                page.synced_at
+                    .clone()
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+            ],
+            |r| r.get(0),
         )?;
+
+    let fts_rowid = page_fts_rowid(page_rowid);
+    if page.archived {
+        delete_fts_rowid(tx, fts_rowid)?;
     } else {
         refresh_fts_row(
             tx,
+            fts_rowid,
             &page.id,
             &page.workspace_id,
             "page",
@@ -1350,59 +1387,60 @@ fn upsert_page_in_tx(tx: &Connection, page: &NotionPage) -> Result<()> {
 fn upsert_database_in_tx(tx: &Connection, db: &NotionDatabase) -> Result<()> {
     let schema_json = serde_json::to_string(&db.schema).unwrap_or_else(|_| "{}".into());
     let existing_fav: i64 = tx
-        .query_row(
-            "SELECT is_favorite FROM databases WHERE workspace_id = ?1 AND id = ?2",
-            params![db.workspace_id, db.id],
-            |r| r.get(0),
-        )
+        .prepare_cached("SELECT is_favorite FROM databases WHERE workspace_id = ?1 AND id = ?2")?
+        .query_row(params![db.workspace_id, db.id], |r| r.get(0))
         .optional()?
         .unwrap_or(0);
     let is_fav = db.is_favorite || existing_fav != 0;
 
-    tx.execute(
-        "INSERT INTO databases (
-            id, workspace_id, parent_type, parent_id, title, icon, description, schema_json,
-            url, archived, is_favorite, last_edited_time, synced_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-         ON CONFLICT(workspace_id, id) DO UPDATE SET
-            parent_type = excluded.parent_type,
-            parent_id = excluded.parent_id,
-            title = excluded.title,
-            icon = excluded.icon,
-            description = excluded.description,
-            schema_json = excluded.schema_json,
-            url = excluded.url,
-            archived = excluded.archived,
-            is_favorite = excluded.is_favorite,
-            last_edited_time = excluded.last_edited_time,
-            synced_at = excluded.synced_at",
-        params![
-            db.id,
-            db.workspace_id,
-            db.parent_type,
-            db.parent_id,
-            db.title,
-            db.icon,
-            db.description,
-            schema_json,
-            db.url,
-            i64::from(db.archived),
-            i64::from(is_fav),
-            db.last_edited_time,
-            db.synced_at
-                .clone()
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-        ],
-    )?;
-
-    if db.archived {
-        tx.execute(
-            "DELETE FROM pages_fts WHERE workspace_id = ?1 AND page_id = ?2",
-            params![db.workspace_id, db.id],
+    let db_rowid: i64 = tx
+        .prepare_cached(
+            "INSERT INTO databases (
+                id, workspace_id, parent_type, parent_id, title, icon, description, schema_json,
+                url, archived, is_favorite, last_edited_time, synced_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(workspace_id, id) DO UPDATE SET
+                parent_type = excluded.parent_type,
+                parent_id = excluded.parent_id,
+                title = excluded.title,
+                icon = excluded.icon,
+                description = excluded.description,
+                schema_json = excluded.schema_json,
+                url = excluded.url,
+                archived = excluded.archived,
+                is_favorite = excluded.is_favorite,
+                last_edited_time = excluded.last_edited_time,
+                synced_at = excluded.synced_at
+             RETURNING rowid",
+        )?
+        .query_row(
+            params![
+                db.id,
+                db.workspace_id,
+                db.parent_type,
+                db.parent_id,
+                db.title,
+                db.icon,
+                db.description,
+                schema_json,
+                db.url,
+                i64::from(db.archived),
+                i64::from(is_fav),
+                db.last_edited_time,
+                db.synced_at
+                    .clone()
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+            ],
+            |r| r.get(0),
         )?;
+
+    let fts_rowid = database_fts_rowid(db_rowid);
+    if db.archived {
+        delete_fts_rowid(tx, fts_rowid)?;
     } else {
         refresh_fts_row(
             tx,
+            fts_rowid,
             &db.id,
             &db.workspace_id,
             "database",
@@ -1420,10 +1458,8 @@ fn replace_page_blocks_in_tx(
     page_id: &str,
     blocks: &[NotionBlock],
 ) -> Result<()> {
-    tx.execute(
-        "DELETE FROM blocks WHERE workspace_id = ?1 AND page_id = ?2",
-        params![workspace_id, page_id],
-    )?;
+    tx.prepare_cached("DELETE FROM blocks WHERE workspace_id = ?1 AND page_id = ?2")?
+        .execute(params![workspace_id, page_id])?;
     let mut position = 0i64;
     insert_blocks_recursive(tx, workspace_id, page_id, None, blocks, &mut position)?;
     mark_children_fetched(tx, workspace_id, page_id)?;
@@ -1438,7 +1474,7 @@ fn replace_nested_children(
     blocks: &[NotionBlock],
 ) -> Result<()> {
     // Store a nested read under its owning page. The block ID is unique per workspace.
-    tx.execute(
+    tx.prepare_cached(
         "WITH RECURSIVE descendants(id) AS (
              SELECT id FROM blocks WHERE workspace_id = ?1 AND parent_block_id = ?2
              UNION
@@ -1447,29 +1483,34 @@ fn replace_nested_children(
          )
          DELETE FROM blocks WHERE workspace_id = ?1
            AND (page_id = ?2 OR id IN (SELECT id FROM descendants))",
-        params![workspace_id, parent_id],
-    )?;
+    )?
+    .execute(params![workspace_id, parent_id])?;
     let mut position = 0;
     insert_blocks_recursive(tx, workspace_id, owner_id, Some(parent_id), blocks, &mut position)?;
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE blocks SET has_children = ?1, content_json = json_set(content_json, '$.has_children', json(?2))
          WHERE workspace_id = ?3 AND id = ?4",
-        params![!blocks.is_empty(), if blocks.is_empty() { "false" } else { "true" }, workspace_id, parent_id],
-    )?;
+    )?
+    .execute(params![
+        !blocks.is_empty(),
+        if blocks.is_empty() { "false" } else { "true" },
+        workspace_id,
+        parent_id
+    ])?;
     // Page detail may have changed remotely in addition to this subtree.
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE pages SET detail_synced_edited_time = NULL, body_synced_edited_time = NULL WHERE workspace_id = ?1 AND id = ?2",
-        params![workspace_id, owner_id],
-    )?;
+    )?
+    .execute(params![workspace_id, owner_id])?;
     mark_children_fetched(tx, workspace_id, parent_id)?;
     recompute_page_plain_text_in_tx(tx, workspace_id, owner_id)
 }
 
 fn mark_children_fetched(tx: &Connection, workspace_id: &str, parent_id: &str) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT OR IGNORE INTO block_children_fetched (workspace_id, parent_id) VALUES (?1, ?2)",
-        params![workspace_id, parent_id],
-    )?;
+    )?
+    .execute(params![workspace_id, parent_id])?;
     Ok(())
 }
 
@@ -1479,33 +1520,31 @@ fn replace_page_comments_in_tx(
     page_id: &str,
     comments: &[NotionComment],
 ) -> Result<()> {
-    tx.execute(
-        "DELETE FROM comments WHERE workspace_id = ?1 AND page_id = ?2",
-        params![workspace_id, page_id],
+    tx.prepare_cached("DELETE FROM comments WHERE workspace_id = ?1 AND page_id = ?2")?
+        .execute(params![workspace_id, page_id])?;
+    let mut stmt = tx.prepare_cached(
+        "INSERT OR REPLACE INTO comments
+         (id, workspace_id, page_id, discussion_id, author, body, rich_text_json, created_time)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     for c in comments {
         let rt_json = serde_json::to_string(&c.rich_text).unwrap_or_else(|_| "[]".into());
-        tx.execute(
-            "INSERT OR REPLACE INTO comments
-             (id, workspace_id, page_id, discussion_id, author, body, rich_text_json, created_time)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                c.id,
-                workspace_id,
-                page_id,
-                c.discussion_id,
-                c.author,
-                c.body,
-                rt_json,
-                c.created_time
-            ],
-        )?;
+        stmt.execute(params![
+            c.id,
+            workspace_id,
+            page_id,
+            c.discussion_id,
+            c.author,
+            c.body,
+            rt_json,
+            c.created_time
+        ])?;
     }
     Ok(())
 }
 
 fn delete_block_subtree_in_tx(tx: &Connection, workspace_id: &str, block_id: &str) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "WITH RECURSIVE sub(id) AS (
              SELECT ?2
              UNION ALL
@@ -1514,8 +1553,8 @@ fn delete_block_subtree_in_tx(tx: &Connection, workspace_id: &str, block_id: &st
              WHERE b.workspace_id = ?1
          )
          DELETE FROM blocks WHERE workspace_id = ?1 AND id IN (SELECT id FROM sub)",
-        params![workspace_id, block_id],
-    )?;
+    )?
+    .execute(params![workspace_id, block_id])?;
     Ok(())
 }
 
@@ -1535,20 +1574,30 @@ fn update_page_plain_text_in_tx(
     page_id: &str,
     plain: &str,
 ) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE pages SET plain_text = ?1, synced_at = ?2 WHERE workspace_id = ?3 AND id = ?4",
-        params![plain, chrono::Utc::now().to_rfc3339(), workspace_id, page_id],
-    )?;
-    let row: Option<(String, String, i64)> = tx
-        .query_row(
-            "SELECT title, properties_summary, archived FROM pages WHERE workspace_id = ?1 AND id = ?2",
-            params![workspace_id, page_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
+    )?
+    .execute(params![plain, chrono::Utc::now().to_rfc3339(), workspace_id, page_id])?;
+    let row: Option<(i64, String, String, i64)> = tx
+        .prepare_cached(
+            "SELECT rowid, title, properties_summary, archived FROM pages WHERE workspace_id = ?1 AND id = ?2",
+        )?
+        .query_row(params![workspace_id, page_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
         .optional()?;
-    if let Some((title, props_summary, archived)) = row {
+    if let Some((page_rowid, title, props_summary, archived)) = row {
         if archived == 0 {
-            refresh_fts_row(tx, page_id, workspace_id, "page", &title, plain, &props_summary)?;
+            refresh_fts_row(
+                tx,
+                page_fts_rowid(page_rowid),
+                page_id,
+                workspace_id,
+                "page",
+                &title,
+                plain,
+                &props_summary,
+            )?;
         }
     }
     Ok(())
@@ -1571,32 +1620,32 @@ fn insert_blocks_recursive(
         }
         let content_json = serde_json::to_string(&flat).unwrap_or_else(|_| "{}".into());
         let plain = flat.plain_text();
-        tx.execute(
+        tx.prepare_cached(
             "INSERT OR REPLACE INTO blocks
              (id, page_id, parent_block_id, workspace_id, position, block_type, content_json, plain_text, has_children)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                blk.id,
-                page_id,
-                parent_block_id,
-                workspace_id,
-                *position,
-                blk.block_type,
-                content_json,
-                plain,
-                i64::from(blk.has_children || !blk.children.is_empty()),
-            ],
-        )?;
+        )?
+        .execute(params![
+            blk.id,
+            page_id,
+            parent_block_id,
+            workspace_id,
+            *position,
+            blk.block_type,
+            content_json,
+            plain,
+            i64::from(blk.has_children || !blk.children.is_empty()),
+        ])?;
         *position += 1;
         if !blk.children.is_empty() {
             insert_blocks_recursive(tx, workspace_id, page_id, Some(&blk.id), &blk.children, position)?;
             mark_children_fetched(tx, workspace_id, &blk.id)?;
         } else if blk.has_children && !matches!(blk.block_type.as_str(), "child_page" | "child_database") {
             // A depth-limited snapshot indicates children that it did not cache.
-            tx.execute(
+            tx.prepare_cached(
                 "DELETE FROM block_children_fetched WHERE workspace_id = ?1 AND parent_id = ?2",
-                params![workspace_id, blk.id],
-            )?;
+            )?
+            .execute(params![workspace_id, blk.id])?;
         }
     }
     Ok(())
@@ -1622,8 +1671,10 @@ fn rebuild_block_tree(flat: Vec<(String, Option<String>, NotionBlock)>, root: Op
     attach(root, &mut children_map)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_fts_row(
     tx: &Connection,
+    fts_rowid: i64,
     page_id: &str,
     workspace_id: &str,
     item_type: &str,
@@ -1631,52 +1682,21 @@ fn refresh_fts_row(
     plain_text: &str,
     properties_summary: &str,
 ) -> Result<()> {
-    tx.execute(
-        "DELETE FROM pages_fts WHERE workspace_id = ?1 AND page_id = ?2",
-        params![workspace_id, page_id],
-    )?;
-    tx.execute(
-        "INSERT INTO pages_fts (page_id, workspace_id, item_type, title, plain_text, properties_summary)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![page_id, workspace_id, item_type, title, plain_text, properties_summary],
-    )?;
-    Ok(())
-}
-
-fn hydrate_search_hit(
-    conn: &Connection,
-    id: String,
-    workspace_id: String,
-    item_type: String,
-    title: String,
-    snippet: String,
-) -> Option<NotionSearchHit> {
-    let (icon, url, last_edited_time): (Option<String>, String, Option<String>) =
-        if item_type == "database" {
-            conn.query_row(
-                "SELECT icon, url, last_edited_time FROM databases WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .ok()?
-        } else {
-            conn.query_row(
-                "SELECT icon, url, last_edited_time FROM pages WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .ok()?
-        };
-    Some(NotionSearchHit {
-        id,
+    delete_fts_rowid(tx, fts_rowid)?;
+    tx.prepare_cached(
+        "INSERT INTO pages_fts (rowid, page_id, workspace_id, item_type, title, plain_text, properties_summary)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?
+    .execute(params![
+        fts_rowid,
+        page_id,
         workspace_id,
         item_type,
         title,
-        icon,
-        snippet: snippet.replace('\n', " "),
-        url,
-        last_edited_time,
-    })
+        plain_text,
+        properties_summary
+    ])?;
+    Ok(())
 }
 
 fn map_page_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NotionPage> {

@@ -152,24 +152,42 @@ pub async fn op_list_blocks(
     require_limit(limit)?;
     let ws_id = client.auth().active_workspace_id().await;
     let trimmed_target = block_or_page.trim();
-    let id = if storage.has_cached_block(&ws_id, trimmed_target) {
+    let has_cached = {
+        let ws_c = ws_id.clone();
+        let target_c = trimmed_target.to_string();
+        storage
+            .blocking(move |st| Ok(st.has_cached_block(&ws_c, &target_c)))
+            .await
+            .unwrap_or(false)
+    };
+    let id = if has_cached {
         trimmed_target.to_string()
     } else {
         resolver::resolve_page_id(storage, (!offline).then_some(client), &ws_id, block_or_page)
             .await?
     };
     if offline {
-        let cached = storage.load_cached_children(&ws_id, &id)?.ok_or_else(|| {
-            coded(
-                "not_cached",
-                format!("Children of '{block_or_page}' not found in offline cache (not fetched)"),
-            )
-        })?;
+        let ws_c = ws_id.clone();
+        let id_c = id.clone();
+        let cached = storage
+            .blocking(move |st| st.load_cached_children(&ws_c, &id_c))
+            .await?
+            .ok_or_else(|| {
+                coded(
+                    "not_cached",
+                    format!("Children of '{block_or_page}' not found in offline cache (not fetched)"),
+                )
+            })?;
         return offset_page(cached, limit, cursor);
     }
     let (blocks, has_more, next_cursor) = client.fetch_block_tree_page(&id, limit, cursor).await?;
     if cursor.is_none() && !has_more {
-        let _ = storage.replace_page_blocks(&ws_id, &id, &blocks);
+        let ws_c = ws_id.clone();
+        let id_c = id.clone();
+        let blocks_c = blocks.clone();
+        let _ = storage
+            .blocking(move |st| st.replace_page_blocks(&ws_c, &id_c, &blocks_c))
+            .await;
     }
     Ok(ListPage {
         items: blocks,
@@ -187,7 +205,15 @@ pub async fn op_append_blocks(
 ) -> Result<Vec<NotionBlock>> {
     let ws_id = client.auth().active_workspace_id().await;
     let trimmed_target = page_or_block.trim();
-    let id = if storage.has_cached_block(&ws_id, trimmed_target) {
+    let has_cached = {
+        let ws_c = ws_id.clone();
+        let target_c = trimmed_target.to_string();
+        storage
+            .blocking(move |st| Ok(st.has_cached_block(&ws_c, &target_c)))
+            .await
+            .unwrap_or(false)
+    };
+    let id = if has_cached {
         trimmed_target.to_string()
     } else {
         resolver::resolve_page_id_for_write(storage, client, &ws_id, page_or_block, false).await?
@@ -202,13 +228,26 @@ pub async fn op_append_blocks(
             if blocks.iter().any(|b| b.has_children) {
                 let _ = client.hydrate_block_subtrees(&mut blocks, &id).await;
             }
-            let _ = storage.append_cached_blocks(&ws_id, &id, &blocks);
+            let ws_c = ws_id.clone();
+            let id_c = id.clone();
+            let blocks_c = blocks.clone();
+            let _ = storage
+                .blocking(move |st| st.append_cached_blocks(&ws_c, &id_c, &blocks_c))
+                .await;
             Ok(blocks)
         }
         Err(err) => {
-            let _ = storage.invalidate_page_detail(&ws_id, &id);
+            let ws_c = ws_id.clone();
+            let id_c = id.clone();
+            let _ = storage
+                .blocking(move |st| st.invalidate_page_detail(&ws_c, &id_c))
+                .await;
             if let Ok(full_tree) = client.fetch_block_tree(&id, None).await {
-                let _ = storage.replace_page_blocks(&ws_id, &id, &full_tree);
+                let ws_c = ws_id.clone();
+                let id_c = id.clone();
+                let _ = storage
+                    .blocking(move |st| st.replace_page_blocks(&ws_c, &id_c, &full_tree))
+                    .await;
             }
             Err(err)
         }
@@ -267,7 +306,11 @@ pub(super) async fn apply_page_edit(
     if let Err(error) = plan.apply(client, &id).await {
         // Refresh the cache even on a mid-save failure. A subsequent save can match
         // already appended content at its actual position and reuse its server ID.
-        let _ = storage.invalidate_page_detail(&ws_id, &id);
+        let ws_c = ws_id.clone();
+        let id_c = id.clone();
+        let _ = storage
+            .blocking(move |st| st.invalidate_page_detail(&ws_c, &id_c))
+            .await;
         let recovered = sync::sync_page_detail_force(client, storage, &id).await;
         if let Ok(fresh) = recovered {
             if retry_stale
@@ -282,18 +325,30 @@ pub(super) async fn apply_page_edit(
                 }
                 let retry = crate::page_edit::PageEdit::plan(&id, &fresh.blocks, edited_markdown)?;
                 if let Err(error) = retry.apply(client, &id).await {
-                    let _ = storage.invalidate_page_detail(&ws_id, &id);
+                    let ws_c = ws_id.clone();
+                    let id_c = id.clone();
+                    let _ = storage
+                        .blocking(move |st| st.invalidate_page_detail(&ws_c, &id_c))
+                        .await;
                     let _ = sync::sync_page_detail_force(client, storage, &id).await;
                     return Err(error);
                 }
                 return sync::sync_page_detail_force(client, storage, &id).await;
             }
         } else if let Ok(blocks) = client.fetch_block_tree(&id, None).await {
-            let _ = storage.replace_page_blocks(&ws_id, &id, &blocks);
+            let ws_c = ws_id.clone();
+            let id_c = id.clone();
+            let _ = storage
+                .blocking(move |st| st.replace_page_blocks(&ws_c, &id_c, &blocks))
+                .await;
         }
         return Err(error);
     }
-    let _ = storage.invalidate_page_detail(&ws_id, &id);
+    let ws_c = ws_id.clone();
+    let id_c = id.clone();
+    let _ = storage
+        .blocking(move |st| st.invalidate_page_detail(&ws_c, &id_c))
+        .await;
     sync::sync_page_detail_force(client, storage, &id).await
 }
 
@@ -341,7 +396,12 @@ pub async fn op_update_block_text(
     let mut updated = client
         .update_block(&norm_id, "", Value::Object(payload))
         .await?;
-    if let Ok(Some((pid, _))) = storage.apply_updated_block(&ws_id, &updated) {
+    let ws_c = ws_id.clone();
+    let updated_c = updated.clone();
+    if let Ok(Some((pid, _))) = storage
+        .blocking(move |st| st.apply_updated_block(&ws_c, &updated_c))
+        .await
+    {
         if updated.page_id.trim().is_empty() {
             updated.page_id = pid;
         }
@@ -368,7 +428,12 @@ pub async fn op_toggle_todo(
         }
     };
     let mut updated = client.set_todo_checked(&norm_id, "", target_checked).await?;
-    if let Ok(Some((pid, _))) = storage.apply_updated_block(&ws_id, &updated) {
+    let ws_c = ws_id.clone();
+    let updated_c = updated.clone();
+    if let Ok(Some((pid, _))) = storage
+        .blocking(move |st| st.apply_updated_block(&ws_c, &updated_c))
+        .await
+    {
         if updated.page_id.trim().is_empty() {
             updated.page_id = pid;
         }
@@ -384,12 +449,21 @@ pub async fn op_delete_block(
     let ws_id = client.auth().active_workspace_id().await;
     let norm_id = normalize_notion_id(block_id);
     let resp = client.delete_block(&norm_id).await?;
-    let deleted_page = storage.delete_cached_block(&ws_id, &norm_id).ok().flatten();
+    let ws_c = ws_id.clone();
+    let norm_c = norm_id.clone();
+    let deleted_page = storage
+        .blocking(move |st| st.delete_cached_block(&ws_c, &norm_c))
+        .await
+        .ok()
+        .flatten();
     if deleted_page.is_none() {
         let (ptype, pid) = parse_parent(resp.get("parent"));
         if ptype == "page_id" {
             if let Some(page_id) = pid {
-                let _ = storage.invalidate_page_detail(&ws_id, &page_id);
+                let ws_c = ws_id.clone();
+                let _ = storage
+                    .blocking(move |st| st.invalidate_page_detail(&ws_c, &page_id))
+                    .await;
             }
         }
     }

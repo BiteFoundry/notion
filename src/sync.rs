@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
@@ -409,40 +410,40 @@ where
 
         let mut confirmed_pages: Vec<NotionPage> = Vec::new();
         let mut not_found_pages: Vec<String> = Vec::new();
-        for chunk in missing_page_ids.chunks(3) {
-            let futs = chunk.iter().map(|pid| async move {
-                let res = client.get_page(pid).await;
-                (pid.clone(), res)
-            });
-            for (pid, probe_res) in futures_util::future::join_all(futs).await {
-                match probe_res {
-                    Ok(page) => confirmed_pages.push(page),
-                    Err(err) if NotionClient::is_authoritative_not_found(&err) => {
-                        not_found_pages.push(pid);
-                    }
-                    Err(_) => {
-                        // Preserve cached entry & FTS on transient 5xx / 429 / ambiguous errors.
-                    }
+        let mut page_probes =
+            futures_util::stream::iter(missing_page_ids.into_iter().map(|pid| async move {
+                let res = client.get_page(&pid).await;
+                (pid, res)
+            }))
+            .buffer_unordered(3);
+        while let Some((pid, probe_res)) = page_probes.next().await {
+            match probe_res {
+                Ok(page) => confirmed_pages.push(page),
+                Err(err) if NotionClient::is_authoritative_not_found(&err) => {
+                    not_found_pages.push(pid);
+                }
+                Err(_) => {
+                    // Preserve cached entry & FTS on transient 5xx / 429 / ambiguous errors.
                 }
             }
         }
 
         let mut confirmed_dbs: Vec<NotionDatabase> = Vec::new();
         let mut not_found_dbs: Vec<String> = Vec::new();
-        for chunk in missing_db_ids.chunks(3) {
-            let futs = chunk.iter().map(|did| async move {
-                let res = client.get_database(did).await;
-                (did.clone(), res)
-            });
-            for (did, probe_res) in futures_util::future::join_all(futs).await {
-                match probe_res {
-                    Ok(db) => confirmed_dbs.push(db),
-                    Err(err) if NotionClient::is_authoritative_not_found(&err) => {
-                        not_found_dbs.push(did);
-                    }
-                    Err(_) => {
-                        // Preserve cached entry & FTS on transient 5xx / 429 / ambiguous errors.
-                    }
+        let mut db_probes =
+            futures_util::stream::iter(missing_db_ids.into_iter().map(|did| async move {
+                let res = client.get_database(&did).await;
+                (did, res)
+            }))
+            .buffer_unordered(3);
+        while let Some((did, probe_res)) = db_probes.next().await {
+            match probe_res {
+                Ok(db) => confirmed_dbs.push(db),
+                Err(err) if NotionClient::is_authoritative_not_found(&err) => {
+                    not_found_dbs.push(did);
+                }
+                Err(_) => {
+                    // Preserve cached entry & FTS on transient 5xx / 429 / ambiguous errors.
                 }
             }
         }
@@ -506,64 +507,82 @@ where
     }
 
     if !unresolved_blocks.is_empty() {
-        let mut resolved_map = existing_owners;
-        let mut newly_resolved: Vec<(String, String)> = Vec::new();
+        let resolved_map = std::sync::Mutex::new(existing_owners);
+        let newly_resolved = std::sync::Mutex::new(Vec::<(String, String)>::new());
 
-        // Resolve container blocks in bounded parallel chunks of 3 (matching Notion's ~3 req/s
-        // rate limit) while sharing resolved ancestors across chunks.
-        for chunk in unresolved_blocks.chunks(3) {
-            let pending: Vec<String> = chunk
-                .iter()
-                .filter(|bid| !resolved_map.contains_key(bid.as_str()))
-                .cloned()
-                .collect();
-            if pending.is_empty() {
-                continue;
-            }
-            let known_snapshot = &resolved_map;
-            let futs = pending.into_iter().map(|orig_bid| async move {
-                let mut cur_id = orig_bid;
-                let mut visited_hops: Vec<String> = vec![cur_id.clone()];
-                let mut found_owner: Option<String> = None;
+        // Resolve container blocks via a bounded `buffer_unordered(3)` stream (matching Notion's
+        // ~3 req/s rate limit) while sharing resolved ancestors immediately without chunk barriers.
+        let mut block_stream =
+            futures_util::stream::iter(unresolved_blocks.into_iter().map(|orig_bid| {
+                let resolved_ref = &resolved_map;
+                let newly_ref = &newly_resolved;
+                async move {
+                    if resolved_ref
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .contains_key(&orig_bid)
+                    {
+                        return;
+                    }
+                    let mut cur_id = orig_bid;
+                    let mut visited_hops: Vec<String> = vec![cur_id.clone()];
+                    let mut found_owner: Option<String> = None;
 
-                for _ in 0..6 {
-                    let Ok((ptype, pid)) = client.get_block_parent_raw(&cur_id).await else {
-                        break;
-                    };
-                    match (ptype.as_str(), pid) {
-                        ("page_id", Some(owner_page_id)) if !owner_page_id.trim().is_empty() => {
-                            found_owner = Some(owner_page_id);
+                    for _ in 0..6 {
+                        let Ok((ptype, pid)) = client.get_block_parent_raw(&cur_id).await else {
                             break;
-                        }
-                        ("block_id", Some(next_bid))
-                            if !next_bid.trim().is_empty()
-                                && !visited_hops.iter().any(|h| h == &next_bid) =>
-                        {
-                            if let Some(cached_owner) = known_snapshot.get(&next_bid).cloned() {
-                                found_owner = Some(cached_owner);
+                        };
+                        match (ptype.as_str(), pid) {
+                            ("page_id", Some(owner_page_id))
+                                if !owner_page_id.trim().is_empty() =>
+                            {
+                                found_owner = Some(owner_page_id);
                                 break;
                             }
-                            visited_hops.push(next_bid.clone());
-                            cur_id = next_bid;
+                            ("block_id", Some(next_bid))
+                                if !next_bid.trim().is_empty()
+                                    && !visited_hops.iter().any(|h| h == &next_bid) =>
+                            {
+                                let cached = resolved_ref
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .get(&next_bid)
+                                    .cloned();
+                                if let Some(cached_owner) = cached {
+                                    found_owner = Some(cached_owner);
+                                    break;
+                                }
+                                visited_hops.push(next_bid.clone());
+                                cur_id = next_bid;
+                            }
+                            _ => break,
                         }
-                        _ => break,
+                    }
+
+                    if let Some(owner_page_id) = found_owner {
+                        let mut map = resolved_ref
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mut added = newly_ref
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        for hop_id in visited_hops {
+                            if !map.contains_key(&hop_id) {
+                                map.insert(hop_id.clone(), owner_page_id.clone());
+                                added.push((hop_id, owner_page_id.clone()));
+                            }
+                        }
                     }
                 }
-                (visited_hops, found_owner)
-            });
+            }))
+            .buffer_unordered(3);
 
-            for (visited_hops, found_owner) in futures_util::future::join_all(futs).await {
-                if let Some(owner_page_id) = found_owner {
-                    for hop_id in visited_hops {
-                        if !resolved_map.contains_key(&hop_id) {
-                            resolved_map.insert(hop_id.clone(), owner_page_id.clone());
-                            newly_resolved.push((hop_id, owner_page_id.clone()));
-                        }
-                    }
-                }
-            }
-        }
+        while block_stream.next().await.is_some() {}
+        drop(block_stream);
 
+        let newly_resolved = newly_resolved
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !newly_resolved.is_empty() {
             let st_owners = storage.clone();
             let ws_owners = workspace_id.clone();

@@ -52,7 +52,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         return;
     }
 
-    let items = app.build_sidebar_items(ui);
+    let items = app.sidebar_items_cached(ui);
     if items.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled("  (Syncing workspace...)", theme.muted_style()))

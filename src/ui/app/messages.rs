@@ -61,6 +61,8 @@ impl AppState {
                 self.workspace_id = workspace_id;
                 self.pages = pages;
                 self.databases = databases;
+                self.bump_pages_gen();
+                self.bump_dbs_gen();
                 self.reload_page_parent_hints();
                 self.snap_sidebar_selection(ui);
                 ui.success(toast);
@@ -71,6 +73,7 @@ impl AppState {
                 if let Some(ref mut detail) = self.active_page_detail {
                     if detail.page.id == page_id {
                         detail.comments.push(comment);
+                        self.bump_blocks_gen();
                     }
                 }
                 ui.success("Comment posted");
@@ -190,6 +193,7 @@ impl AppState {
             && !editing_this_page
         {
             self.active_page_detail = Some(*detail);
+            self.bump_blocks_gen();
             self.clamp_canvas_selection(ui);
         }
         self.reload_page_parent_hints();
@@ -214,6 +218,7 @@ impl AppState {
                 set_todo_in_tree(&mut detail.blocks, block_id, revert_checked);
                 detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
                 detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
+                self.bump_blocks_gen();
             }
         }
         ui.error(format!("todo failed: {error}"));
@@ -297,6 +302,7 @@ impl AppState {
             } else if !still_dirty {
                 if self.active_page_id.as_deref() == Some(page_id.as_str()) {
                     self.active_page_detail = Some(synced_detail);
+                    self.bump_blocks_gen();
                 }
                 ui.success("Saved to Notion");
             } else {
@@ -323,6 +329,7 @@ impl AppState {
                         &synced_detail.blocks,
                         ui.block_editor.as_mut(),
                     );
+                    self.bump_blocks_gen();
                 }
             }
             ui.success("Saved to Notion");
@@ -340,6 +347,7 @@ impl AppState {
             ui.pending_page_sync.remove(&page_id);
             if self.active_page_id.as_deref() == Some(page_id.as_str()) {
                 self.active_page_detail = Some(synced_detail);
+                self.bump_blocks_gen();
             }
             ui.success("Saved to Notion");
         }
@@ -362,6 +370,7 @@ impl AppState {
         if let Some(ref actual) = cached {
             if self.active_page_id.as_deref() == Some(page_id.as_str()) {
                 self.active_page_detail = Some(actual.clone());
+                self.bump_blocks_gen();
             }
         }
         if let Some(ed) = ui.inline_editor.as_mut().filter(|ed| ed.page_id == page_id) {
@@ -404,6 +413,7 @@ impl AppState {
                         }
                     }
                     update_block_media_url_in_tree(&mut detail.blocks, &block_id, &url);
+                    self.bump_blocks_gen();
                 }
             }
             for ov in &mut ui.overlays {
@@ -425,6 +435,7 @@ impl AppState {
         if self.active_page_id.as_deref() == Some(page_id) {
             if let Ok(Some(cached)) = self.storage.load_page_detail(&self.workspace_id, page_id) {
                 self.active_page_detail = Some(cached);
+                self.bump_blocks_gen();
                 self.clamp_canvas_selection(ui);
             }
         }
@@ -451,6 +462,7 @@ impl AppState {
         } else {
             self.pages.insert(0, summary);
         }
+        self.bump_pages_gen();
         if page.parent_type == "database_id" {
             let target_db_id = page
                 .parent_id
@@ -475,6 +487,7 @@ impl AppState {
             if let Some(preview) = preview_detail {
                 if self.active_page_id.as_deref() == Some(id.as_str()) {
                     self.active_page_detail = Some(*preview);
+                    self.bump_blocks_gen();
                     self.clamp_canvas_selection(ui);
                 }
             }
@@ -487,6 +500,7 @@ impl AppState {
         ui.tasks.finish("archive", None);
         if let Some(p) = self.pages.iter_mut().find(|p| p.id == id) {
             p.archived = true;
+            self.bump_pages_gen();
         }
         for row in &mut self.active_database_rows {
             if row.id == id {
@@ -496,6 +510,7 @@ impl AppState {
         if let Some(ref mut detail) = self.active_page_detail {
             if detail.page.id == id {
                 detail.page.archived = true;
+                self.bump_blocks_gen();
             }
         }
         if ui.inline_editor.as_ref().is_some_and(|ed| ed.page_id == id) {
@@ -665,6 +680,7 @@ impl AppState {
         detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
         detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
         detail.media = crate::parser::collect_media_refs(&detail.blocks);
+        self.bump_blocks_gen();
         self.clamp_canvas_selection(ui);
         true
     }

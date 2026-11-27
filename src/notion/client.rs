@@ -97,6 +97,11 @@ impl NotionClient {
     pub fn new(config: &AppConfig, auth: AuthManager) -> Result<Self> {
         let http = crate::http::client_builder()?
             .timeout(Duration::from_secs(45))
+            .connect_timeout(Duration::from_secs(15))
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(8)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(60))
             .user_agent(format!("notion-cli/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .context("Failed to initialize Notion HTTP client")?;

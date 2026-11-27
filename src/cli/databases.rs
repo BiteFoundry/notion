@@ -217,14 +217,25 @@ pub async fn op_list_databases(
     let _ = parse_offset_cursor(cursor)?;
     let ws_id = client.auth().active_workspace_id().await;
     let all = if !offline {
-        if refresh || !sync::workspace_cache_complete(storage, &ws_id) {
+        let ws_c = ws_id.clone();
+        let complete = if refresh {
+            false
+        } else {
+            storage
+                .blocking(move |st| Ok(sync::workspace_cache_complete(st, &ws_c)))
+                .await
+                .unwrap_or(false)
+        };
+        if refresh || !complete {
             let (_, _, dbs) = sync::sync_workspace_tree(client, storage).await?;
             dbs
         } else {
-            storage.list_databases(&ws_id)?
+            let ws_c = ws_id.clone();
+            storage.blocking(move |st| st.list_databases(&ws_c)).await?
         }
     } else {
-        storage.list_databases(&ws_id)?
+        let ws_c = ws_id.clone();
+        storage.blocking(move |st| st.list_databases(&ws_c)).await?
     };
     offset_page(all, limit, cursor)
 }
@@ -240,23 +251,33 @@ pub async fn op_get_database(
         resolver::resolve_database_id(storage, (!offline).then_some(client), &ws_id, database)
             .await?;
     if offline {
-        return storage.get_database(&ws_id, &id)?.ok_or_else(|| {
-            coded(
-                "not_cached",
-                format!("Database '{database}' not found in local cache"),
-            )
-        });
+        let ws_c = ws_id.clone();
+        let id_c = id.clone();
+        return storage
+            .blocking(move |st| st.get_database(&ws_c, &id_c))
+            .await?
+            .ok_or_else(|| {
+                coded(
+                    "not_cached",
+                    format!("Database '{database}' not found in local cache"),
+                )
+            });
     }
     let db = match client.get_database(&id).await {
         Ok(d) => d,
         Err(err) => {
             if NotionClient::is_authoritative_not_found(&err) {
-                let _ = storage.mark_database_archived(&ws_id, &id);
+                let ws_c = ws_id.clone();
+                let id_c = id.clone();
+                let _ = storage
+                    .blocking(move |st| st.mark_database_archived(&ws_c, &id_c))
+                    .await;
             }
             return Err(err);
         }
     };
-    let _ = storage.upsert_database(&db);
+    let db_c = db.clone();
+    let _ = storage.blocking(move |st| st.upsert_database(&db_c)).await;
     Ok(db)
 }
 
@@ -283,18 +304,31 @@ pub async fn op_query_database(
         resolver::resolve_database_id(storage, (!offline).then_some(client), &ws_id, database)
             .await?;
     if offline {
-        let rows = storage.list_database_rows(&ws_id, &id)?;
+        let ws_c = ws_id.clone();
+        let id_c = id.clone();
+        let rows = storage
+            .blocking(move |st| st.list_database_rows(&ws_c, &id_c))
+            .await?;
         return offset_page(rows, limit, cursor);
     }
     let unfiltered = filter.is_none();
     let (rows, has_more, next_cursor) = client
         .query_database_all_with_meta(&id, filter, sorts, limit, cursor)
         .await?;
-    let _ = storage.upsert_pages(&rows);
-    if unfiltered && cursor.is_none() && !has_more {
-        let active_row_ids: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
-        let _ = storage.reconcile_database_rows_archived(&ws_id, &id, &active_row_ids);
-    }
+    let rows_c = rows.clone();
+    let ws_c = ws_id.clone();
+    let id_c = id.clone();
+    let should_reconcile = unfiltered && cursor.is_none() && !has_more;
+    let _ = storage
+        .blocking(move |st| {
+            let _ = st.upsert_pages(&rows_c);
+            if should_reconcile {
+                let active_row_ids: HashSet<String> = rows_c.iter().map(|r| r.id.clone()).collect();
+                let _ = st.reconcile_database_rows_archived(&ws_c, &id_c, &active_row_ids);
+            }
+            Ok(())
+        })
+        .await;
     Ok(ListPage {
         items: rows,
         has_more,
@@ -405,10 +439,15 @@ pub async fn op_create_database_item(
     let ws_id = client.auth().active_workspace_id().await;
     let db_id = resolver::resolve_database_id_for_write(storage, client, &ws_id, database).await?;
     let mut used_cached_schema = false;
-    let props = if let Some(cached_db) = storage
-        .get_database(&ws_id, &db_id)?
-        .filter(|db| !db.schema.is_empty())
-    {
+    let cached_db = {
+        let ws_c = ws_id.clone();
+        let db_id_c = db_id.clone();
+        storage
+            .blocking(move |st| st.get_database(&ws_c, &db_id_c))
+            .await?
+            .filter(|db| !db.schema.is_empty())
+    };
+    let props = if let Some(cached_db) = cached_db {
         let cols = cached_db
             .schema
             .iter()
@@ -486,8 +525,12 @@ pub async fn op_update_database_item(
     let status = status.map(str::trim).filter(|s| !s.is_empty());
     let mut used_cached_meta = false;
     let props = if title.is_some() || status.is_some() {
-        let cached_props = storage
-            .get_page(&ws_id, &id)?
+        let cached_page = {
+            let ws_c = ws_id.clone();
+            let id_c = id.clone();
+            storage.blocking(move |st| st.get_page(&ws_c, &id_c)).await?
+        };
+        let cached_props = cached_page
             .filter(|p| !p.properties.is_empty())
             .and_then(|page| {
                 let cols = page_property_columns(&page);
@@ -499,7 +542,8 @@ pub async fn op_update_database_item(
             p
         } else {
             let page = client.get_page(&id).await?;
-            let _ = storage.upsert_page(&page);
+            let page_c = page.clone();
+            let _ = storage.blocking(move |st| st.upsert_page(&page_c)).await;
             let cols = page_property_columns(&page);
             database_item_properties(cols.into_iter(), title, status, extra_properties.clone())?
         }
@@ -516,7 +560,8 @@ pub async fn op_update_database_item(
         Ok(u) => u,
         Err(err) if used_cached_meta && is_notion_validation_error(&err) => {
             let page = client.get_page(&id).await?;
-            let _ = storage.upsert_page(&page);
+            let page_c = page.clone();
+            let _ = storage.blocking(move |st| st.upsert_page(&page_c)).await;
             let cols = page_property_columns(&page);
             let fresh_props =
                 database_item_properties(cols.into_iter(), title, status, extra_properties)?;
@@ -526,7 +571,8 @@ pub async fn op_update_database_item(
         }
         Err(err) => return Err(err),
     };
-    let _ = storage.upsert_page(&updated);
+    let updated_c = updated.clone();
+    let _ = storage.blocking(move |st| st.upsert_page(&updated_c)).await;
     Ok(updated)
 }
 

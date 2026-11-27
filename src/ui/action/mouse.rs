@@ -254,11 +254,14 @@ pub(super) fn handle_mouse_click(
         }
         HitTarget::SidebarToggle(idx) => {
             ui.focus = Focus::Sidebar;
-            let items = app.build_sidebar_items(ui);
+            let items = app.sidebar_items_cached(ui);
             if let Some(item) = items.get(idx) {
                 ui.sidebar_selected = idx;
-                if item.collapsible && !ui.collapsed_nodes.remove(&item.id) {
-                    ui.collapsed_nodes.insert(item.id.clone());
+                if item.collapsible {
+                    if !ui.collapsed_nodes.remove(&item.id) {
+                        ui.collapsed_nodes.insert(item.id.clone());
+                    }
+                    ui.collapsed_gen = ui.collapsed_gen.wrapping_add(1);
                 }
             }
         }

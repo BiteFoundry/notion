@@ -1,6 +1,9 @@
 //! Core TUI application state (`AppState`), presentation state (`UiState`), and navigation.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 
 use bitefoundry_html::NativeHtmlServer;
 use ratatui::layout::Rect;
@@ -238,6 +241,7 @@ pub struct UiState {
     pub preview_request_seq: u64,
     pub sidebar_selected: usize,
     pub collapsed_nodes: HashSet<String>,
+    pub collapsed_gen: u64,
     pub expanded_toggles: HashSet<String>,
     /// Blocks whose unloaded children are being fetched on demand (toggle expanded past the
     /// recursive tree-fetch depth cap).
@@ -245,6 +249,7 @@ pub struct UiState {
     pub selected_block: usize,
     pub canvas_scroll: u16,
     pub canvas_follow_selected: bool,
+    pub(crate) canvas_scene_cache: Option<crate::ui::notion_view::PageCanvasSceneCache>,
     pub comments_drawer_open: bool,
     pub comments_scroll: u16,
     pub comment_reply_input: String,
@@ -307,11 +312,13 @@ impl UiState {
             preview_request_seq: 0,
             sidebar_selected: 0,
             collapsed_nodes: HashSet::new(),
+            collapsed_gen: 0,
             expanded_toggles: HashSet::new(),
             hydrating_blocks: HashSet::new(),
             selected_block: 0,
             canvas_scroll: 0,
             canvas_follow_selected: false,
+            canvas_scene_cache: None,
             comments_drawer_open: false,
             comments_scroll: 0,
             comment_reply_input: String::new(),
@@ -399,7 +406,11 @@ pub struct AppState {
     pub workspace_name: String,
     pub current_user: Option<NotionUser>,
     pub pages: Vec<NotionPageSummary>,
+    pub pages_gen: u64,
     pub databases: Vec<NotionDatabase>,
+    pub dbs_gen: u64,
+    pub blocks_gen: u64,
+    pub(super) sidebar_cache: Mutex<Option<super::views::CachedSidebarItems>>,
     pub block_owner_pages: HashMap<String, String>,
     pub child_page_positions: HashMap<String, i64>,
     pub active_view: CanvasView,
@@ -449,7 +460,11 @@ impl AppState {
             workspace_name,
             current_user: None,
             pages: Vec::new(),
+            pages_gen: 0,
             databases: Vec::new(),
+            dbs_gen: 0,
+            blocks_gen: 0,
+            sidebar_cache: Mutex::new(None),
             block_owner_pages: HashMap::new(),
             child_page_positions: HashMap::new(),
             active_view: CanvasView::Page,
@@ -473,19 +488,34 @@ impl AppState {
         self.image_cache_bytes = 0;
     }
 
+    pub fn bump_pages_gen(&mut self) {
+        self.pages_gen = self.pages_gen.wrapping_add(1);
+    }
+
+    pub fn bump_dbs_gen(&mut self) {
+        self.dbs_gen = self.dbs_gen.wrapping_add(1);
+    }
+
+    pub fn bump_blocks_gen(&mut self) {
+        self.blocks_gen = self.blocks_gen.wrapping_add(1);
+    }
+
     pub fn reload_page_parent_hints(&mut self) {
         if let Ok((owners, positions)) = self.storage.load_page_parent_hints(&self.workspace_id) {
             self.block_owner_pages = owners;
             self.child_page_positions = positions;
+            self.bump_pages_gen();
         }
     }
 
     pub fn load_cached_initial(&mut self) {
         if let Ok(pages) = self.storage.list_page_summaries(&self.workspace_id) {
             self.pages = pages;
+            self.bump_pages_gen();
         }
         if let Ok(dbs) = self.storage.list_databases(&self.workspace_id) {
             self.databases = dbs;
+            self.bump_dbs_gen();
         }
         self.reload_page_parent_hints();
         if self.active_page_id.is_none() && self.active_database_id.is_none() {
@@ -497,6 +527,7 @@ impl AppState {
                     .load_page_detail(&self.workspace_id, &first_page.id)
                     .ok()
                     .flatten();
+                self.bump_blocks_gen();
                 self.sync_ctrl.set_focus(FocusTarget {
                     page_id: Some(first_page.id),
                     database_id: None,
@@ -544,6 +575,9 @@ impl AppState {
             summary.is_favorite |= existing.is_favorite;
             let changed = *existing != summary;
             *existing = summary;
+            if changed {
+                self.bump_pages_gen();
+            }
             changed
         } else {
             false
@@ -594,6 +628,7 @@ impl AppState {
         } else {
             self.active_page_detail = None;
         }
+        self.bump_blocks_gen();
         self.clamp_canvas_selection(ui);
         self.sync_ctrl.set_focus(FocusTarget {
             page_id: Some(page_id.to_string()),
@@ -654,7 +689,7 @@ impl AppState {
     }
 
     pub fn snap_sidebar_selection(&self, ui: &mut UiState) {
-        let items = self.build_sidebar_items(ui);
+        let items = self.sidebar_items_cached(ui);
         if items.is_empty() {
             ui.sidebar_selected = 0;
             return;
@@ -674,7 +709,7 @@ impl AppState {
     }
 
     pub fn clamp_db_selection(&self, ui: &mut UiState) {
-        let rows_len = self.filtered_sorted_db_rows(ui).len();
+        let rows_len = self.filtered_sorted_db_row_refs(ui).len();
         ui.db_selected_row = ui.db_selected_row.min(rows_len.saturating_sub(1));
         let cols = self.build_board_columns(ui);
         ui.db_board_col = ui.db_board_col.min(cols.len().saturating_sub(1));

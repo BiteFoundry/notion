@@ -151,6 +151,7 @@ impl AppState {
                 && !crate::page_edit::contains_column_marker(edited_markdown)
             {
                 apply_optimistic_markdown_to_detail(detail, edited_markdown);
+                self.bump_blocks_gen();
             }
         }
     }
@@ -173,6 +174,7 @@ impl AppState {
                 detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
                 detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
                 detail.media = crate::parser::collect_media_refs(&detail.blocks);
+                self.bump_blocks_gen();
                 self.clamp_canvas_selection(ui);
                 return true;
             }
@@ -313,6 +315,7 @@ impl AppState {
         if let Some(saved_detail) = ed.last_synced_detail {
             if self.active_page_id.as_deref() == Some(ed.page_id.as_str()) {
                 self.active_page_detail = Some(saved_detail);
+                self.bump_blocks_gen();
             }
         }
         ui.canvas_scroll = ed.scroll_y;
@@ -490,6 +493,7 @@ impl AppState {
             {
                 detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
                 detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
+                self.bump_blocks_gen();
             }
         }
     }
@@ -709,6 +713,7 @@ impl AppState {
                 }
                 detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
                 detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
+                self.bump_blocks_gen();
             }
         } else {
             return false;
@@ -1033,6 +1038,7 @@ impl AppState {
             set_todo_in_tree(&mut detail.blocks, block_id, next_checked);
             detail.page.plain_text = crate::parser::blocks_to_plain_text(&detail.blocks);
             detail.markdown = crate::parser::blocks_to_markdown(&detail.blocks);
+            self.bump_blocks_gen();
         }
         let client = self.client.clone();
         let storage = self.storage.clone();

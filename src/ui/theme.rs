@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 
 use crate::{config::ThemePreset, models::NotionColor};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
     pub no_color: bool,
     pub ansi16_only: bool,

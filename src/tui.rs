@@ -550,6 +550,8 @@ impl Drop for TerminalEventReader {
 #[derive(Debug, Default)]
 struct PasteBurstDetector {
     keys: Vec<KeyEvent>,
+    has_enter: bool,
+    has_char: bool,
 }
 
 impl PasteBurstDetector {
@@ -570,6 +572,11 @@ impl PasteBurstDetector {
     }
 
     fn push(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
+            self.has_enter = true;
+        } else if matches!(key.code, KeyCode::Char(_)) {
+            self.has_char = true;
+        }
         self.keys.push(key);
     }
 
@@ -577,16 +584,12 @@ impl PasteBurstDetector {
         self.keys.len()
     }
 
+    fn has_enter(&self) -> bool {
+        self.has_enter
+    }
+
     fn into_paste_or_keys(mut self) -> std::result::Result<String, Vec<KeyEvent>> {
-        let has_enter = self
-            .keys
-            .iter()
-            .any(|k| k.code == KeyCode::Enter && k.modifiers == KeyModifiers::NONE);
-        let has_char = self
-            .keys
-            .iter()
-            .any(|k| matches!(k.code, KeyCode::Char(_)));
-        if self.keys.len() >= 2 && has_enter && has_char {
+        if self.keys.len() >= 2 && self.has_enter && self.has_char {
             let mut out = String::with_capacity(self.keys.len());
             for k in self.keys.drain(..) {
                 match k.code {
@@ -636,10 +639,7 @@ async fn process_terminal_event_with_burst(
     let mut stream_ended = false;
 
     while detector.len() < MAX_PASTE_BURST_EVENTS {
-        let has_enter = detector
-            .keys
-            .iter()
-            .any(|k| k.code == KeyCode::Enter && k.modifiers == KeyModifiers::NONE);
+        let has_enter = detector.has_enter();
         let next_ev = match events.try_recv() {
             Ok(ev) => Some(ev),
             Err(mpsc::error::TryRecvError::Disconnected) => {

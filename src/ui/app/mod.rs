@@ -24,3 +24,4 @@ pub use self::{
     },
     views::{build_created_page_preview, build_optimistic_append_blocks},
 };
+pub(crate) use self::views::hash_string_set;

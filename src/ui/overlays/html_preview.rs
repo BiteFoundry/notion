@@ -449,35 +449,41 @@ impl HtmlPreviewOverlay {
         let footer_y = inner.y + inner.height.saturating_sub(1);
         let html_theme = Self::html_theme_from(&theme);
 
-        // First render using full width minus 1 when scrollbar might appear.
-        let probe_w = inner.width.saturating_sub(1).max(12);
-        let total_lines = self
-            .session
-            .render(probe_w, &html_theme, ui.show_inline_hrefs)
-            .lines
-            .len();
-        let show_scrollbar = total_lines > body_h as usize && inner.width > 3;
-        let content_w = if show_scrollbar {
+        // Reserve 1 column for a potential scrollbar upfront so `HtmlViewSession`'s 1-slot
+        // layout cache hits on every frame without 2-pass width thrashing.
+        let content_w = if inner.width > 3 {
             inner.width.saturating_sub(1)
         } else {
             inner.width
         };
 
-        let (mut rendered_lines, controls_len, graphics) = {
+        let (total_rows, controls_len, graphics, sy, visible_lines) = {
+            let cur_scroll = self.session.scroll_y;
             let rendered = self
                 .session
                 .render(content_w, &html_theme, ui.show_inline_hrefs);
+            let total_rows = rendered.lines.len();
+            let max_scroll = total_rows
+                .saturating_sub(body_h as usize)
+                .min(u16::MAX as usize) as u16;
+            let sy = cur_scroll.min(max_scroll);
+            let view_start = sy as usize;
+            let view_end = view_start.saturating_add(body_h as usize).min(total_rows);
             (
-                rendered.lines.clone(),
+                total_rows,
                 rendered.controls.len(),
                 rendered.graphics.clone(),
+                sy,
+                rendered.lines[view_start..view_end].to_vec(),
             )
         };
-        let total_rows = rendered_lines.len();
+        let show_scrollbar = total_rows > body_h as usize && inner.width > 3;
         let max_scroll = total_rows.saturating_sub(body_h as usize).min(u16::MAX as usize) as u16;
         self.last_max_scroll = max_scroll;
-        self.session.scroll_y = self.session.scroll_y.min(max_scroll);
-        let sy = self.session.scroll_y;
+        self.session.scroll_y = sy;
+        let view_start = sy as usize;
+        let view_end = view_start.saturating_add(body_h as usize).min(total_rows);
+        let mut visible_lines = visible_lines;
 
         self.body_rect = Rect::new(inner.x, inner.y, content_w, body_h);
 
@@ -490,9 +496,6 @@ impl HtmlPreviewOverlay {
                 self.graphic_cache.clear();
                 self.last_graphic_env = Some(env_sig);
             }
-
-            let view_start = sy as usize;
-            let view_end = view_start.saturating_add(body_h as usize);
 
             for g in &graphics {
                 if g.line_count == 0 {
@@ -543,14 +546,17 @@ impl HtmlPreviewOverlay {
                 };
 
                 if proto == TerminalImageProtocol::Halfblock {
-                    let slot_end = g_end.min(rendered_lines.len());
-                    let slot_len = slot_end.saturating_sub(g_start);
-                    for row_off in 0..slot_len {
-                        let dst = g_start + row_off;
-                        if let Some(hb_line) = cached.rendered.lines.get(row_off) {
-                            rendered_lines[dst] = hb_line.clone();
-                        } else {
-                            rendered_lines[dst] = Line::default();
+                    let vis_start = g_start.max(view_start);
+                    let vis_end = g_end.min(view_end);
+                    for doc_row in vis_start..vis_end {
+                        let row_off = doc_row - g_start;
+                        let vis_idx = doc_row - view_start;
+                        if let Some(slot) = visible_lines.get_mut(vis_idx) {
+                            if let Some(hb_line) = cached.rendered.lines.get(row_off) {
+                                *slot = hb_line.clone();
+                            } else {
+                                *slot = Line::default();
+                            }
                         }
                     }
                 } else {
@@ -605,9 +611,8 @@ impl HtmlPreviewOverlay {
         }
 
         frame.render_widget(
-            Paragraph::new(rendered_lines)
-                .style(Style::default().bg(theme.bg_elevated).fg(theme.fg_primary))
-                .scroll((sy, 0)),
+            Paragraph::new(visible_lines)
+                .style(Style::default().bg(theme.bg_elevated).fg(theme.fg_primary)),
             self.body_rect,
         );
 
