@@ -30,7 +30,9 @@ use crate::{
         blocks_to_markdown, incomplete_block_ids, notion::rich_text_to_markdown,
         parse_notion_block, parse_parent, parse_rich_text_array, parse_slash_command_blocks,
     },
-    resolver, serve,
+    resolver,
+    safe_text::{sanitize_terminal_inline, sanitize_terminal_text},
+    serve,
     storage::{notion::CachedComments, Storage},
     sync, tui, updater,
 };
@@ -961,7 +963,8 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 } else {
                     println!(
                         "Connected via OAuth to workspace '{}' (profile: {})",
-                        cred.workspace_name, cred.workspace_profile
+                        sanitize_terminal_inline(&cred.workspace_name),
+                        sanitize_terminal_inline(&cred.workspace_profile)
                     );
                 }
             } else {
@@ -991,7 +994,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 } else {
                     println!(
                         "Authenticated as '{}' in workspace '{}' (profile: {})",
-                        me.name, cred.workspace_name, cred.workspace_profile
+                        sanitize_terminal_inline(&me.name),
+                        sanitize_terminal_inline(&cred.workspace_name),
+                        sanitize_terminal_inline(&cred.workspace_profile)
                     );
                 }
             }
@@ -1015,11 +1020,11 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             } else {
                 println!(
                     "Workspace: {} ({})\nUser/Bot:  {} ({})\nAuth Mode: {}",
-                    val["workspace_name"].as_str().unwrap_or("default"),
-                    val["workspace_profile"].as_str().unwrap_or("default"),
-                    val["user"]["name"].as_str().unwrap_or("Unknown"),
-                    val["user"]["user_type"].as_str().unwrap_or("bot"),
-                    val["auth_mode"].as_str().unwrap_or("unknown"),
+                    sanitize_terminal_inline(val["workspace_name"].as_str().unwrap_or("default")),
+                    sanitize_terminal_inline(val["workspace_profile"].as_str().unwrap_or("default")),
+                    sanitize_terminal_inline(val["user"]["name"].as_str().unwrap_or("Unknown")),
+                    sanitize_terminal_inline(val["user"]["user_type"].as_str().unwrap_or("bot")),
+                    sanitize_terminal_inline(val["auth_mode"].as_str().unwrap_or("unknown")),
                 );
             }
             Ok(())
@@ -1037,7 +1042,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             if as_json {
                 print_json(&json!({ "ok": true, "count": hits.len(), "results": hits }))?;
             } else if hits.is_empty() {
-                println!("No matching Notion pages or databases for '{query}'.");
+                println!(
+                    "No matching Notion pages or databases for '{}'.",
+                    sanitize_terminal_inline(&query)
+                );
             } else {
                 for h in hits {
                     let icon = h.icon.as_deref().unwrap_or(if h.item_type == "database" {
@@ -1045,9 +1053,15 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     } else {
                         "📄"
                     });
-                    println!("{} [{}] {} ({})", icon, h.item_type, h.title, h.id);
+                    println!(
+                        "{} [{}] {} ({})",
+                        sanitize_terminal_inline(icon),
+                        sanitize_terminal_inline(&h.item_type),
+                        sanitize_terminal_inline(&h.title),
+                        sanitize_terminal_inline(&h.id)
+                    );
                     if !h.snippet.trim().is_empty() {
-                        println!("    {}", h.snippet.trim());
+                        println!("    {}", sanitize_terminal_inline(h.snippet.trim()));
                     }
                 }
             }
@@ -1086,7 +1100,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             } else {
                 println!(
                     "Downloaded {} ({} bytes, {}) -> {}",
-                    res.file_name, res.size_bytes, res.mime_type, res.path
+                    sanitize_terminal_inline(&res.file_name),
+                    res.size_bytes,
+                    sanitize_terminal_inline(&res.mime_type),
+                    sanitize_terminal_inline(&res.path)
                 );
             }
             Ok(())
@@ -1262,8 +1279,12 @@ async fn handle_workspaces_cmd(mut config: AppConfig, action: WorkspacesCommand)
                     };
                     let icon = ws.workspace_icon.as_deref().unwrap_or("🏢");
                     println!(
-                        "{mark} {icon} {} — {} [{}] ({})",
-                        ws.name, ws.workspace_name, ws.auth_mode, ws.workspace_id
+                        "{mark} {} {} — {} [{}] ({})",
+                        sanitize_terminal_inline(icon),
+                        sanitize_terminal_inline(&ws.name),
+                        sanitize_terminal_inline(&ws.workspace_name),
+                        sanitize_terminal_inline(&ws.auth_mode),
+                        sanitize_terminal_inline(&ws.workspace_id)
                     );
                 }
             }
@@ -1281,7 +1302,11 @@ async fn handle_workspaces_cmd(mut config: AppConfig, action: WorkspacesCommand)
             if as_json {
                 print_json(&json!({ "ok": true, "active_workspace": found.name, "profile": found }))?;
             } else {
-                println!("Switched active workspace to '{}' ({}).", found.name, found.workspace_name);
+                println!(
+                    "Switched active workspace to '{}' ({}).",
+                    sanitize_terminal_inline(&found.name),
+                    sanitize_terminal_inline(&found.workspace_name)
+                );
             }
             Ok(())
         }
@@ -1297,7 +1322,9 @@ async fn handle_workspaces_cmd(mut config: AppConfig, action: WorkspacesCommand)
             } else {
                 println!(
                     "Added workspace '{}' ({}) authenticated as '{}'.",
-                    cred.workspace_profile, cred.workspace_name, user.name
+                    sanitize_terminal_inline(&cred.workspace_profile),
+                    sanitize_terminal_inline(&cred.workspace_name),
+                    sanitize_terminal_inline(&user.name)
                 );
             }
             Ok(())
@@ -1347,7 +1374,12 @@ async fn handle_pages_cmd(
             } else {
                 for p in &list.items {
                     let fav = if p.is_favorite { "★ " } else { "" };
-                    println!("{fav}{} {} ({})", p.display_icon(), p.display_title(), p.id);
+                    println!(
+                        "{fav}{} {} ({})",
+                        sanitize_terminal_inline(p.display_icon()),
+                        sanitize_terminal_inline(p.display_title()),
+                        sanitize_terminal_inline(&p.id)
+                    );
                 }
                 warn_more_results(&list);
             }
@@ -1385,11 +1417,15 @@ async fn handle_pages_cmd(
                     eprintln!("Could not load comments: {error}");
                 }
                 match format.as_str() {
-                    "plain" => println!("{}", detail.page.plain_text),
+                    "plain" => println!("{}", sanitize_terminal_text(&detail.page.plain_text)),
                     "blocks" => print_json(&detail.blocks)?,
                     _ => {
-                        println!("# {} {}\n", detail.page.display_icon(), detail.page.display_title());
-                        println!("{}", detail.markdown);
+                        println!(
+                            "# {} {}\n",
+                            sanitize_terminal_inline(detail.page.display_icon()),
+                            sanitize_terminal_inline(detail.page.display_title())
+                        );
+                        println!("{}", sanitize_terminal_text(&detail.markdown));
                     }
                 }
                 warn_incomplete_blocks(&detail.blocks);
@@ -1420,7 +1456,12 @@ async fn handle_pages_cmd(
             if as_json {
                 print_json(&created)?;
             } else {
-                println!("Created page '{}' ({}) -> {}", created.title, created.id, created.url);
+                println!(
+                    "Created page '{}' ({}) -> {}",
+                    sanitize_terminal_inline(&created.title),
+                    sanitize_terminal_inline(&created.id),
+                    sanitize_terminal_inline(&created.url)
+                );
             }
             Ok(())
         }
@@ -1520,7 +1561,11 @@ async fn handle_pages_cmd(
             if as_json {
                 print_json(&updated)?;
             } else {
-                println!("Updated page '{}' ({}).", updated.title, updated.id);
+                println!(
+                    "Updated page '{}' ({}).",
+                    sanitize_terminal_inline(&updated.title),
+                    sanitize_terminal_inline(&updated.id)
+                );
             }
             Ok(())
         }
@@ -1558,9 +1603,13 @@ async fn handle_pages_cmd(
                 }
             } else {
                 if let Some(path) = out {
-                    println!("Exported '{}' -> {}", detail.page.title, path.display());
+                    println!(
+                        "Exported '{}' -> {}",
+                        sanitize_terminal_inline(&detail.page.title),
+                        path.display()
+                    );
                 } else {
-                    print!("{full_md}");
+                    print!("{}", sanitize_terminal_text(&full_md));
                 }
                 warn_incomplete_blocks(&detail.blocks);
             }
@@ -1576,7 +1625,11 @@ async fn handle_pages_cmd(
                 print_json(&updated)?;
             } else {
                 let verb = if unarchive { "Restored" } else { "Archived" };
-                println!("{verb} page '{}' ({}).", updated.title, updated.id);
+                println!(
+                    "{verb} page '{}' ({}).",
+                    sanitize_terminal_inline(&updated.title),
+                    sanitize_terminal_inline(&updated.id)
+                );
             }
             Ok(())
         }
@@ -1616,7 +1669,7 @@ async fn handle_blocks_cmd(
                 }
                 print_json(&val)?;
             } else {
-                println!("{}", blocks_to_markdown(&list.items));
+                println!("{}", sanitize_terminal_text(&blocks_to_markdown(&list.items)));
                 warn_incomplete_blocks(&list.items);
                 warn_more_results(&list);
             }
@@ -1676,7 +1729,11 @@ async fn handle_blocks_cmd(
                     }
                     _ => "[?]",
                 };
-                println!("{state} {} ({})", blk.plain_text(), blk.id);
+                println!(
+                    "{state} {} ({})",
+                    sanitize_terminal_inline(&blk.plain_text()),
+                    sanitize_terminal_inline(&blk.id)
+                );
             }
             Ok(())
         }
@@ -1722,7 +1779,12 @@ async fn handle_db_cmd(
                 print_json(&list_envelope("databases", &list))?;
             } else {
                 for db in &list.items {
-                    println!("{} {} ({})", db.display_icon(), db.display_title(), db.id);
+                    println!(
+                        "{} {} ({})",
+                        sanitize_terminal_inline(db.display_icon()),
+                        sanitize_terminal_inline(db.display_title()),
+                        sanitize_terminal_inline(&db.id)
+                    );
                 }
                 warn_more_results(&list);
             }
@@ -1737,9 +1799,18 @@ async fn handle_db_cmd(
             if as_json {
                 print_json(&db)?;
             } else {
-                println!("{} {} ({})", db.display_icon(), db.display_title(), db.id);
+                println!(
+                    "{} {} ({})",
+                    sanitize_terminal_inline(db.display_icon()),
+                    sanitize_terminal_inline(db.display_title()),
+                    sanitize_terminal_inline(&db.id)
+                );
                 for (name, prop) in &db.schema {
-                    println!("  - {name}: {}", prop.prop_type);
+                    println!(
+                        "  - {}: {}",
+                        sanitize_terminal_inline(name),
+                        sanitize_terminal_inline(&prop.prop_type)
+                    );
                 }
             }
             Ok(())
@@ -1784,9 +1855,9 @@ async fn handle_db_cmd(
                 for row in &list.items {
                     println!(
                         "{} {}  [{}]",
-                        row.display_icon(),
-                        row.display_title(),
-                        row.properties_summary()
+                        sanitize_terminal_inline(row.display_icon()),
+                        sanitize_terminal_inline(row.display_title()),
+                        sanitize_terminal_inline(&row.properties_summary())
                     );
                 }
                 warn_more_results(&list);
@@ -1819,7 +1890,11 @@ async fn handle_db_cmd(
             if as_json {
                 print_json(&created)?;
             } else {
-                println!("Created DB item '{}' ({}).", created.title, created.id);
+                println!(
+                    "Created DB item '{}' ({}).",
+                    sanitize_terminal_inline(&created.title),
+                    sanitize_terminal_inline(&created.id)
+                );
             }
             Ok(())
         }
@@ -1847,7 +1922,11 @@ async fn handle_db_cmd(
             if as_json {
                 print_json(&updated)?;
             } else {
-                println!("Updated DB item '{}' ({}).", updated.title, updated.id);
+                println!(
+                    "Updated DB item '{}' ({}).",
+                    sanitize_terminal_inline(&updated.title),
+                    sanitize_terminal_inline(&updated.id)
+                );
             }
             Ok(())
         }
@@ -1884,7 +1963,12 @@ async fn handle_comments_cmd(
                 warn_more_results(&list);
             } else {
                 for c in &list.items {
-                    println!("[{}] {}: {}", c.created_time, c.author, c.body);
+                    println!(
+                        "[{}] {}: {}",
+                        sanitize_terminal_inline(&c.created_time),
+                        sanitize_terminal_inline(&c.author),
+                        sanitize_terminal_text(&c.body)
+                    );
                 }
                 warn_more_results(&list);
             }
@@ -1901,7 +1985,11 @@ async fn handle_comments_cmd(
             if as_json {
                 print_json(&comment)?;
             } else {
-                println!("Added comment ({}) by {}.", comment.id, comment.author);
+                println!(
+                    "Added comment ({}) by {}.",
+                    sanitize_terminal_inline(&comment.id),
+                    sanitize_terminal_inline(&comment.author)
+                );
             }
             Ok(())
         }
@@ -1922,9 +2010,18 @@ async fn handle_users_cmd(client: &NotionClient, action: UsersCommand) -> Result
             } else {
                 for u in &list.items {
                     if let Some(email) = u.email.as_deref().filter(|s| !s.trim().is_empty()) {
-                        println!("{} <{}> ({})", u.name, email, u.id);
+                        println!(
+                            "{} <{}> ({})",
+                            sanitize_terminal_inline(&u.name),
+                            sanitize_terminal_inline(email),
+                            sanitize_terminal_inline(&u.id)
+                        );
                     } else {
-                        println!("{} ({})", u.name, u.id);
+                        println!(
+                            "{} ({})",
+                            sanitize_terminal_inline(&u.name),
+                            sanitize_terminal_inline(&u.id)
+                        );
                     }
                 }
                 warn_more_results(&list);
@@ -2037,7 +2134,11 @@ async fn handle_doctor_cmd(
         println!("@bitefoundry/notion v{}", env!("CARGO_PKG_VERSION"));
         println!("  Config:         {}", config::config_file_path().display());
         println!("  SQLite DB:      {} (ok: {})", db_file.display(), storage_ok);
-        println!("  Workspace:      {} ({})", ws_name, ws_id);
+        println!(
+            "  Workspace:      {} ({})",
+            sanitize_terminal_inline(&ws_name),
+            sanitize_terminal_inline(&ws_id)
+        );
         println!("  Authenticated:  {}", cred.is_some());
         println!("  Image Protocol: {}", caps.protocol.label());
         for ca in extra_ca {

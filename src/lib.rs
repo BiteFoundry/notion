@@ -10,6 +10,7 @@ pub mod notion;
 mod page_edit;
 pub mod parser;
 pub mod resolver;
+pub mod safe_text;
 pub mod serve;
 pub mod storage;
 pub mod sync;
