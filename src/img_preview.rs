@@ -1348,6 +1348,7 @@ fn ensure_not_html_bytes(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "svg-graphics")]
 fn svg_raster_bounds(fit: FitBox, cell_px: (u16, u16)) -> (u32, u32) {
     let max_dim = bitefoundry_html::graphics::MAX_RASTER_DIM_PX;
     let zoom = fit.zoom_pct.clamp(25, 300) as u32;
@@ -1375,18 +1376,26 @@ fn prepare_image_bytes(
 ) -> Result<(std::borrow::Cow<'_, [u8]>, Option<&'static str>)> {
     ensure_not_html_bytes(bytes)?;
     if looks_like_svg_bytes(bytes) {
-        let (max_px_w, max_px_h) = svg_raster_bounds(fit, cell_px);
-        let raster = bitefoundry_html::graphics::rasterize_svg_to_png(
-            bytes,
-            max_px_w,
-            max_px_h,
-            None,
-        )
-        .context("Failed to rasterize SVG image")?;
-        return Ok((
-            std::borrow::Cow::Owned(raster.png_bytes.to_vec()),
-            Some("SVG"),
-        ));
+        #[cfg(feature = "svg-graphics")]
+        {
+            let (max_px_w, max_px_h) = svg_raster_bounds(fit, cell_px);
+            let raster = bitefoundry_html::graphics::rasterize_svg_to_png(
+                bytes,
+                max_px_w,
+                max_px_h,
+                None,
+            )
+            .context("Failed to rasterize SVG image")?;
+            return Ok((
+                std::borrow::Cow::Owned(raster.png_bytes.to_vec()),
+                Some("SVG"),
+            ));
+        }
+        #[cfg(not(feature = "svg-graphics"))]
+        {
+            let _ = (fit, cell_px);
+            bail!("SVG image preview requires the `svg-graphics` feature");
+        }
     }
     Ok((std::borrow::Cow::Borrowed(bytes), None))
 }
@@ -3531,25 +3540,43 @@ mod tests {
         assert!(looks_like_svg_bytes(svg_bytes));
         assert!(decode_and_render_halfblocks(html_bytes, 40, 20, (0, 0, 0)).is_err());
 
-        let svg_half = decode_and_render_halfblocks(svg_bytes, 40, 20, (0, 0, 0)).unwrap();
-        assert_eq!(svg_half.format_label, "SVG");
-        assert_eq!(svg_half.width_px, 40);
-        assert_eq!(svg_half.height_px, 20);
-        assert!(!svg_half.lines.is_empty());
-        assert!(svg_half
-            .lines
-            .iter()
-            .any(|l| l.spans.iter().any(|s| s.content.contains('▀'))));
+        #[cfg(feature = "svg-graphics")]
+        {
+            let svg_half = decode_and_render_halfblocks(svg_bytes, 40, 20, (0, 0, 0)).unwrap();
+            assert_eq!(svg_half.format_label, "SVG");
+            assert_eq!(svg_half.width_px, 40);
+            assert_eq!(svg_half.height_px, 20);
+            assert!(!svg_half.lines.is_empty());
+            assert!(svg_half
+                .lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.content.contains('▀'))));
 
-        let kitty_caps = TerminalGraphicsCaps {
-            protocol: TerminalImageProtocol::Kitty,
-            cell_px: (8, 16),
-            cell_px_exact: true,
-        };
-        let svg_kitty =
-            decode_and_render_for_protocol(svg_bytes, FitBox::fixed(40, 20), (0, 0, 0), kitty_caps)
-                .unwrap();
-        assert_eq!(svg_kitty.format_label, "SVG");
-        assert!(svg_kitty.pixel_payload.as_deref().is_some_and(|p| p.starts_with("\x1b_G")));
+            let kitty_caps = TerminalGraphicsCaps {
+                protocol: TerminalImageProtocol::Kitty,
+                cell_px: (8, 16),
+                cell_px_exact: true,
+            };
+            let svg_kitty =
+                decode_and_render_for_protocol(svg_bytes, FitBox::fixed(40, 20), (0, 0, 0), kitty_caps)
+                    .unwrap();
+            assert_eq!(svg_kitty.format_label, "SVG");
+            assert!(svg_kitty.pixel_payload.as_deref().is_some_and(|p| p.starts_with("\x1b_G")));
+        }
+
+        #[cfg(not(feature = "svg-graphics"))]
+        {
+            let err = decode_and_render_halfblocks(svg_bytes, 40, 20, (0, 0, 0)).unwrap_err();
+            assert!(err.to_string().contains("svg-graphics"));
+            let kitty_caps = TerminalGraphicsCaps {
+                protocol: TerminalImageProtocol::Kitty,
+                cell_px: (8, 16),
+                cell_px_exact: true,
+            };
+            let err_kitty =
+                decode_and_render_for_protocol(svg_bytes, FitBox::fixed(40, 20), (0, 0, 0), kitty_caps)
+                    .unwrap_err();
+            assert!(err_kitty.to_string().contains("svg-graphics"));
+        }
     }
 }

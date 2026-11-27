@@ -660,6 +660,7 @@ impl HtmlPreviewOverlay {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "html-js")]
     use ratatui::{backend::TestBackend, Terminal};
     use tokio::sync::{mpsc, watch};
 
@@ -686,6 +687,7 @@ mod tests {
         (app, ui)
     }
 
+    #[cfg(feature = "html-js")]
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         terminal
             .backend()
@@ -696,6 +698,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "html-js")]
     #[test]
     fn test_html_preview_onclick_js_dom_mutation_mouse_click_at_and_raw_toggle() {
         let html = r#"<!DOCTYPE html>
@@ -858,6 +861,7 @@ mod tests {
         assert!(joined.contains("Hidden detail text"));
     }
 
+    #[cfg(all(feature = "svg-graphics", feature = "html-js"))]
     #[test]
     fn test_html_preview_inline_svg_renders_halfblock_and_preserves_button_click_coordinates() {
         let html = r##"<!DOCTYPE html>

@@ -14,7 +14,7 @@
 
 <br />
 
-![Notion TUI Demo](https://raw.githubusercontent.com/BiteFoundry/notion/master/assets/demo.gif)
+![Notion TUI Demo](https://bitefoundry.dev/assets/demos/notion.gif)
 
 </div>
 

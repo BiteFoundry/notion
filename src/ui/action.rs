@@ -4258,31 +4258,56 @@ mod tests {
         }
 
         // Now verify LoadPreviewImage on genuine SVG renders natively via ImagePreviewOverlay (no <div> HTML wrapping!)
+        // or returns a clean feature-gated error when compiled without `svg-graphics`.
         if let Some(Overlay::ImagePreview(ref mut ov)) = ui.overlays.last_mut() {
             ov.index = 1; // diagram.svg
         }
         dispatch(Action::LoadPreviewImage, &mut app, &mut ui);
-        let mut got_svg_rendered = false;
-        for _ in 0..4 {
-            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
-                .await
-                .expect("timed out waiting for SVG ImageRendered")
-                .expect("ui_rx closed");
-            if let UiMsg::ImageRendered { ref rendered, .. } = msg {
-                assert_eq!(rendered.format_label, "SVG");
-                assert_eq!(rendered.width_px, 24);
-                assert_eq!(rendered.height_px, 24);
-                assert!(!rendered.lines.is_empty() || rendered.pixel_payload.is_some());
-                got_svg_rendered = true;
+        #[cfg(feature = "svg-graphics")]
+        {
+            let mut got_svg_rendered = false;
+            for _ in 0..4 {
+                let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+                    .await
+                    .expect("timed out waiting for SVG ImageRendered")
+                    .expect("ui_rx closed");
+                if let UiMsg::ImageRendered { ref rendered, .. } = msg {
+                    assert_eq!(rendered.format_label, "SVG");
+                    assert_eq!(rendered.width_px, 24);
+                    assert_eq!(rendered.height_px, 24);
+                    assert!(!rendered.lines.is_empty() || rendered.pixel_payload.is_some());
+                    got_svg_rendered = true;
+                    app.handle_ui_msg(&mut ui, msg);
+                    break;
+                }
                 app.handle_ui_msg(&mut ui, msg);
-                break;
             }
-            app.handle_ui_msg(&mut ui, msg);
+            assert!(
+                got_svg_rendered,
+                "expected SVG to render natively via ImageRendered"
+            );
         }
-        assert!(
-            got_svg_rendered,
-            "expected SVG to render natively via ImageRendered"
-        );
+        #[cfg(not(feature = "svg-graphics"))]
+        {
+            let mut got_svg_err = false;
+            for _ in 0..4 {
+                let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+                    .await
+                    .expect("timed out waiting for SVG ImagePreviewFailed")
+                    .expect("ui_rx closed");
+                if let UiMsg::ImagePreviewFailed { ref error, .. } = msg {
+                    assert!(error.contains("svg-graphics"), "unexpected error: {error}");
+                    got_svg_err = true;
+                    app.handle_ui_msg(&mut ui, msg);
+                    break;
+                }
+                app.handle_ui_msg(&mut ui, msg);
+            }
+            assert!(
+                got_svg_err,
+                "expected SVG preview to return a clean svg-graphics feature error"
+            );
+        }
         assert!(matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))));
 
         server_handle.abort();
