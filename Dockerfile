@@ -5,7 +5,7 @@
 # seconds and match the published release artifact.
 FROM debian:bookworm-slim
 
-ARG NOTION_VERSION=0.4.10
+ARG NOTION_VERSION=0.4.11
 ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="notion" \
